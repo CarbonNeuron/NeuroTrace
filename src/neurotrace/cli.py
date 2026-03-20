@@ -3308,3 +3308,240 @@ def probe(
         )
 
     console.print(f"\n[green]Results saved to {output}/[/green]")
+
+
+@cli.command()
+@click.option("--db", required=True, help="Path to DuckDB database file.")
+@click.option("--model", required=True, help="HuggingFace model name or path.")
+@click.option(
+    "--probe-dir", required=True,
+    help="Path to probe output directory (contains mean_direction.npy).",
+)
+@click.option("--layer", default=None, type=int, help="MLP layer to decompose (default: auto from probe metadata).")
+@click.option("--top-k", default=30, type=int, help="Number of top tokens to show.")
+@click.option("--reverse-tokens", default=None, help="Comma-separated tokens to trace backwards through MLP.")
+@click.option("--compare-prompt", multiple=True, help="Compare MLP behavior on a specific prompt vs the direction.")
+@click.option("--seed", default=42, type=int, help="Random seed.")
+@click.option("--output", default=None, help="Output directory.")
+@click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
+def circuit(
+    db,
+    model,
+    probe_dir,
+    layer,
+    top_k,
+    reverse_tokens,
+    compare_prompt,
+    seed,
+    output,
+    adapter,
+    output_json,
+):
+    """Trace computational circuit from probe direction through MLP to token outputs."""
+    from neurotrace.circuit import (
+        detect_layer_from_probe,
+        run_circuit,
+        save_circuit_outputs,
+    )
+
+    # Auto-detect layer if not specified
+    if layer is None:
+        layer = detect_layer_from_probe(probe_dir)
+        if layer is None:
+            raise click.ClickException(
+                "Could not auto-detect layer from probe. Specify --layer manually."
+            )
+        err_console.print(f"Auto-detected layer: {layer}")
+
+    # Parse reverse tokens
+    reverse_list = None
+    if reverse_tokens:
+        reverse_list = [t.strip() for t in reverse_tokens.split(",") if t.strip()]
+
+    # Parse compare prompts
+    compare_list = list(compare_prompt) if compare_prompt else None
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task("Loading model...", total=None)
+        from neurotrace.models import load_model
+
+        model_obj, tokenizer = load_model(model)
+        model_obj = _maybe_load_adapter(model_obj, adapter)
+        progress.update(task, description="Model loaded.")
+
+        progress.update(task, description="Running circuit analysis...")
+        result = run_circuit(
+            model_obj,
+            tokenizer,
+            probe_dir,
+            layer=layer,
+            top_k=top_k,
+            reverse_tokens=reverse_list,
+            compare_prompts=compare_list,
+            seed=seed,
+        )
+
+        # Determine output directory
+        if output is None:
+            import os
+            from datetime import datetime
+
+            probe_name = os.path.basename(probe_dir.rstrip("/"))
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            output = f"circuits/{probe_name}-{timestamp}"
+
+        progress.update(task, description="Saving outputs...")
+        save_circuit_outputs(result, output)
+
+        # Save to DB
+        import uuid
+
+        circuit_id = str(uuid.uuid4())
+        db_conn = TraceDB(db)
+        db_conn.save_circuit(circuit_id, result)
+        db_conn.close()
+
+        progress.update(task, description="Done.")
+
+    if output_json:
+        forward_data = {
+            "circuit_id": circuit_id,
+            "model": result.model_name,
+            "layer": result.layer,
+            "top_boosted": result.forward.top_boosted,
+            "top_suppressed": result.forward.top_suppressed,
+            "pre_mlp_top": result.forward.pre_mlp_top,
+            "output_dir": output,
+        }
+        if result.reverse:
+            forward_data["reverse"] = [
+                {"token": r.token, "cosine_sim": r.cosine_sim_with_probe}
+                for r in result.reverse
+            ]
+        if result.comparisons:
+            forward_data["comparisons"] = [
+                {
+                    "prompt": c.prompt,
+                    "activation_norm": c.activation_norm,
+                    "cosine_sim_with_direction": c.cosine_sim_with_direction,
+                    "top_boosted": c.top_boosted[:10],
+                    "top_suppressed": c.top_suppressed[:10],
+                }
+                for c in result.comparisons
+            ]
+        if result.real_comparison:
+            rc = result.real_comparison
+            forward_data["real_comparison"] = {
+                "prompts": [
+                    {
+                        "text": p.prompt,
+                        "mlp_output_norm": p.mlp_output_norm,
+                        "sabotage_projection": p.sabotage_projection,
+                        "top_boosted": p.top_boosted[:10],
+                        "top_suppressed": p.top_suppressed[:10],
+                    }
+                    for p in rc.prompts
+                ],
+                "pairwise": [
+                    {
+                        "prompt_a": pw.prompt_a,
+                        "prompt_b": pw.prompt_b,
+                        "cosine_similarity": pw.cosine_similarity,
+                        "norm_ratio": pw.norm_ratio,
+                        "diff_boosted": pw.diff_boosted[:10],
+                        "diff_suppressed": pw.diff_suppressed[:10],
+                    }
+                    for pw in rc.pairwise
+                ],
+            }
+        click.echo(json.dumps(forward_data, indent=2))
+        return
+
+    # Rich output
+    console.print(f"\n[bold]Circuit Analysis:[/bold] Layer {result.layer} MLP")
+    console.print(f"Probe: {probe_dir}")
+
+    # Forward analysis
+    console.print("\n[bold]Tokens BOOSTED by MLP:[/bold]")
+    boost_table = Table()
+    boost_table.add_column("Rank", justify="right")
+    boost_table.add_column("Token")
+    boost_table.add_column("Logit", justify="right")
+    for i, t in enumerate(result.forward.top_boosted[:15], 1):
+        boost_table.add_row(str(i), t["token"], f"{t['logit']:+.4f}")
+    console.print(boost_table)
+
+    console.print("\n[bold]Tokens SUPPRESSED by MLP:[/bold]")
+    suppress_table = Table()
+    suppress_table.add_column("Rank", justify="right")
+    suppress_table.add_column("Token")
+    suppress_table.add_column("Logit", justify="right")
+    for i, t in enumerate(result.forward.top_suppressed[:15], 1):
+        suppress_table.add_row(str(i), t["token"], f"{t['logit']:+.4f}")
+    console.print(suppress_table)
+
+    console.print("\n[bold]Pre-MLP Prediction (logit lens):[/bold]")
+    pre_table = Table()
+    pre_table.add_column("Rank", justify="right")
+    pre_table.add_column("Token")
+    pre_table.add_column("Logit", justify="right")
+    for i, t in enumerate(result.forward.pre_mlp_top[:15], 1):
+        pre_table.add_row(str(i), t["token"], f"{t['logit']:+.4f}")
+    console.print(pre_table)
+
+    # Reverse analysis
+    if result.reverse:
+        console.print("\n[bold]Reverse Circuit (Token -> Input Direction):[/bold]")
+        rev_table = Table()
+        rev_table.add_column("Token")
+        rev_table.add_column("Cosine Sim", justify="right")
+        for r in result.reverse:
+            style = "green" if abs(r.cosine_sim_with_probe) > 0.3 else None
+            rev_table.add_row(r.token, f"{r.cosine_sim_with_probe:.4f}", style=style)
+        console.print(rev_table)
+
+    # Prompt comparisons
+    if result.comparisons:
+        for comp in result.comparisons:
+            console.print(f"\n[bold]Prompt:[/bold] \"{comp.prompt}\"")
+            console.print(
+                f"  Activation norm: {comp.activation_norm:.4f} | "
+                f"Cosine sim with direction: {comp.cosine_sim_with_direction:.4f}"
+            )
+            top_tokens = ", ".join(
+                f"{t['token']}({t['logit']:+.2f})" for t in comp.top_boosted[:5]
+            )
+            console.print(f"  Top boosted: {top_tokens}")
+
+    # Real MLP comparison
+    if result.real_comparison:
+        rc = result.real_comparison
+        console.print("\n[bold cyan]Real MLP Comparison:[/bold cyan]")
+        for p in rc.prompts:
+            console.print(f"\n[bold]Prompt:[/bold] \"{p.prompt}\"")
+            console.print(
+                f"  MLP output norm: {p.mlp_output_norm:.2f} | "
+                f"Sabotage projection: {p.sabotage_projection:.4f}"
+            )
+            real_top = ", ".join(
+                f"{t['token']}({t['logit']:+.2f})" for t in p.top_boosted[:5]
+            )
+            console.print(f"  Top MLP-boosted: {real_top}")
+
+        for pw in rc.pairwise:
+            console.print(f"\n[bold]Diff:[/bold] \"{pw.prompt_a}\" vs \"{pw.prompt_b}\"")
+            console.print(
+                f"  Cosine sim: {pw.cosine_similarity:.4f} | "
+                f"Norm ratio: {pw.norm_ratio:.4f}"
+            )
+            diff_tokens = ", ".join(
+                f"{t['token']}({t['logit']:+.2f})" for t in pw.diff_boosted[:5]
+            )
+            console.print(f"  More boosted for first: {diff_tokens}")
+
+    console.print(f"\n[green]Results saved to {output}/[/green]")
