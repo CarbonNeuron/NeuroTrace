@@ -1,0 +1,44 @@
+[project]
+name = "neurotrace"
+version = "0.1.0"
+description = "Interpretability toolkit for tracing inference through transformer models"
+requires-python = ">=3.12"
+dependencies = [
+    "torch>=2.0",
+    "transformers>=4.30",
+    "huggingface_hub>=0.20",
+    "click>=8.0",
+    "duckdb>=1.0",
+    "rich>=13.0",
+    "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+    "pyright>=1.1",
+]
+
+[project.scripts]
+neurotrace = "neurotrace.cli:cli"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/neurotrace"]
+
+[tool.ruff]
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "W"]
+
+[tool.pytest.ini_options]
+markers = [
+    "model_download: marks tests that download HF models (deselect with '-m \"not model_download\"')",
+]
+testpaths = ["tests"]
