@@ -416,6 +416,38 @@ class TraceDB:
         """)
 
         self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS repair_runs (
+                id TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                dataset TEXT,
+                model_name TEXT NOT NULL,
+                prompt_count INTEGER NOT NULL
+            )
+        """)
+        self._conn.execute(
+            "CREATE SEQUENCE IF NOT EXISTS repair_seq START 1"
+        )
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS repair_results (
+                id INTEGER DEFAULT nextval('repair_seq'),
+                run_id TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                competitor TEXT NOT NULL,
+                target_layer INTEGER NOT NULL,
+                target_component TEXT NOT NULL,
+                before_margin REAL,
+                after_margin REAL,
+                before_prob REAL,
+                after_prob REAL,
+                edit_norm REAL,
+                regressions_checked INTEGER,
+                regressions_found INTEGER,
+                status TEXT NOT NULL
+            )
+        """)
+
+        self._conn.execute("""
             CREATE TABLE IF NOT EXISTS decompose_runs (
                 run_id TEXT PRIMARY KEY,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1624,6 +1656,66 @@ class TraceDB:
             "run_id", "created_at", "dataset",
             "model_name", "prompt_count",
         ]
+        return [dict(zip(cols, r)) for r in rows]
+
+    def write_repair_run(
+        self,
+        run_id: str,
+        dataset: str | None,
+        model_name: str,
+        prompt_count: int,
+    ) -> None:
+        """Write a repair run to the database."""
+        self._conn.execute(
+            "INSERT INTO repair_runs VALUES"
+            " (?, CURRENT_TIMESTAMP, ?, ?, ?)",
+            [run_id, dataset, model_name, prompt_count],
+        )
+
+    def write_repair_result(
+        self,
+        run_id: str,
+        prompt: str,
+        answer: str,
+        competitor: str,
+        target_layer: int,
+        target_component: str,
+        before_margin: float,
+        after_margin: float,
+        before_prob: float,
+        after_prob: float,
+        edit_norm: float,
+        regressions_checked: int,
+        regressions_found: int,
+        status: str,
+    ) -> None:
+        """Write a single repair result to the database."""
+        self._conn.execute(
+            "INSERT INTO repair_results"
+            " (run_id, prompt, answer, competitor,"
+            "  target_layer, target_component,"
+            "  before_margin, after_margin,"
+            "  before_prob, after_prob,"
+            "  edit_norm, regressions_checked,"
+            "  regressions_found, status)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                run_id, prompt, answer, competitor,
+                target_layer, target_component,
+                before_margin, after_margin,
+                before_prob, after_prob,
+                edit_norm, regressions_checked,
+                regressions_found, status,
+            ],
+        )
+
+    def list_repair_runs(self) -> list[dict]:
+        """List all repair runs."""
+        rows = self._conn.execute(
+            "SELECT id, created_at, dataset, model_name, prompt_count"
+            " FROM repair_runs ORDER BY created_at DESC"
+        ).fetchall()
+        cols = ["id", "created_at", "dataset", "model_name", "prompt_count"]
         return [dict(zip(cols, r)) for r in rows]
 
     def close(self) -> None:

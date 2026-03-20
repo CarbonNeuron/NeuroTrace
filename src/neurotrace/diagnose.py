@@ -37,7 +37,7 @@ class SuppressionAnalysis:
 class Verdict:
     signal_strength: str  # "strong" | "moderate" | "weak" | "absent"
     vulnerability: str  # "robust" | "moderate" | "vulnerable" | "absent"
-    confidence: str  # "high" | "low"
+    confidence: str  # "high" | "medium" | "low"
     reason: str
 
 
@@ -164,12 +164,25 @@ def compute_verdict(
     else:
         vulnerability = "moderate"
 
-    # Confidence: high if circuit_type matches vulnerability prediction
-    confident = (
-        (circuit.circuit_type == "concentrated" and vulnerability == "vulnerable")
-        or (circuit.circuit_type == "distributed" and vulnerability == "robust")
-    )
-    confidence = "high" if confident else "low"
+    # Confidence logic:
+    # - Strong signal → High confidence robust (regardless of circuit type)
+    # - Absent signal → High confidence absent (regardless of circuit type)
+    # - Weak signal + concentrated circuit → High confidence vulnerable
+    # - Moderate signal + concentrated → Medium confidence (could go either way)
+    # - Moderate signal + distributed → Medium confidence robust
+    # - Weak signal + distributed → Medium confidence (unusual pattern)
+    if signal_strength in ("strong", "absent"):
+        confidence = "high"
+    elif signal_strength == "weak" and circuit.circuit_type == "concentrated":
+        confidence = "high"
+    elif signal_strength == "moderate" and circuit.circuit_type == "concentrated":
+        confidence = "medium"
+    elif signal_strength == "moderate" and circuit.circuit_type == "distributed":
+        confidence = "medium"
+    elif signal_strength == "weak" and circuit.circuit_type == "distributed":
+        confidence = "medium"
+    else:
+        confidence = "low"
 
     reason = f"{signal_strength.capitalize()} signal ({total:.2f})"
     if circuit.circuit_type != "mixed":

@@ -7350,3 +7350,438 @@ def _decompose_remote(remote_url, prompts, competitor_list, seed):
         progress.update(task, description="Done.", completed=len(prompts))
 
     return all_results
+
+
+# ---------------------------------------------------------------------------
+# repair command
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option("--model", default=None, help="HuggingFace model name (local mode).")
+@click.option("--db", required=True, help="Path to DuckDB database file.")
+@click.option("--prompt", default=None, help="Single prompt to repair.")
+@click.option("--answer", default=None, help="Expected answer token.")
+@click.option(
+    "--competitor", default=None,
+    help="Competitor token (auto-detected if omitted).",
+)
+@click.option(
+    "--target-layer", default=None, type=int,
+    help="Target layer (auto-detected if omitted).",
+)
+@click.option(
+    "--target-component", default="mlp",
+    type=click.Choice(["mlp", "attention"]),
+    help="Target component.",
+)
+@click.option(
+    "--target-margin", default=0.0, type=float,
+    help="Target margin for component (default: 0.0 = neutralize).",
+)
+@click.option(
+    "--dataset-builtin", default=None,
+    help="Built-in dataset name for batch repair.",
+)
+@click.option(
+    "--dataset", "dataset_path", default=None,
+    type=click.Path(exists=True),
+    help="Custom JSONL dataset path for batch repair.",
+)
+@click.option(
+    "--verify-dataset", default=None,
+    help="Built-in dataset for regression checking.",
+)
+@click.option("--undo", is_flag=True, help="Undo last edit on remote worker.")
+@click.option("--save", "save_path", default=None, help="Save edited model to path.")
+@click.option(
+    "--remote", default=None,
+    help="GPU worker URL (e.g., http://172.30.0.1:8877).",
+)
+@click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
+@click.option("--html", "html_path", default=None, help="HTML report output path.")
+@click.option("--json", "output_json", is_flag=True, help="JSON output.")
+@click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option("--seed", default=42, type=int, help="Random seed.")
+def repair(
+    model,
+    db,
+    prompt,
+    answer,
+    competitor,
+    target_layer,
+    target_component,
+    target_margin,
+    dataset_builtin,
+    dataset_path,
+    verify_dataset,
+    undo,
+    save_path,
+    remote,
+    device,
+    html_path,
+    output_json,
+    adapter,
+    seed,
+):
+    """ROME rank-one weight repair using Logit Prism decomposition."""
+    import uuid
+    from datetime import datetime, timezone
+
+    from neurotrace.repair import (
+        RepairRun,
+        generate_repair_html,
+        repair_run_to_dict,
+    )
+
+    # Handle --undo
+    if undo:
+        if remote is None:
+            raise click.UsageError("--undo requires --remote.")
+        from neurotrace.remote import RemoteWorker
+
+        worker = RemoteWorker(remote)
+        result = worker.repair_undo()
+        console.print(f"[green]Undo: {result}[/green]")
+        return
+
+    # Handle --save
+    if save_path is not None:
+        if remote is None:
+            raise click.UsageError("--save requires --remote.")
+        from neurotrace.remote import RemoteWorker
+
+        worker = RemoteWorker(remote)
+        result = worker.repair_save(save_path)
+        console.print(f"[green]Saved: {result}[/green]")
+        return
+
+    # Validate inputs
+    has_dataset = dataset_path is not None or dataset_builtin is not None
+    has_single = prompt is not None
+    if not has_dataset and not has_single:
+        raise click.UsageError(
+            "Must provide --prompt/--answer or --dataset/--dataset-builtin."
+        )
+    if has_dataset and has_single:
+        raise click.UsageError(
+            "Cannot provide both dataset and --prompt/--answer."
+        )
+    if has_single and answer is None:
+        raise click.UsageError("--answer is required with --prompt.")
+    if remote is None and model is None:
+        raise click.UsageError("Must provide --model (local mode) or --remote.")
+
+    # Build prompt list
+    if has_single:
+        prompts = [{"prompt": prompt, "answer": answer}]
+        dataset_name = None
+    else:
+        from neurotrace.datasets import get_builtin_dataset, load_dataset
+
+        if dataset_builtin is not None:
+            dataset = get_builtin_dataset(dataset_builtin)
+            dataset_name = dataset_builtin
+        else:
+            dataset = load_dataset(dataset_path)
+            dataset_name = dataset_path
+        prompts = [{"prompt": d["prompt"], "answer": d["answer"]} for d in dataset]
+
+    # Build verify prompts
+    verify_prompts = None
+    if verify_dataset:
+        from neurotrace.datasets import get_builtin_dataset
+
+        verify_prompts = [
+            {"prompt": d["prompt"], "answer": d["answer"]}
+            for d in get_builtin_dataset(verify_dataset)
+        ]
+
+    run_id = str(uuid.uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
+    all_results = []
+
+    if remote is not None:
+        all_results = _repair_remote(
+            remote, prompts, competitor, target_layer, target_component,
+            target_margin, verify_prompts, seed,
+        )
+        from neurotrace.remote import RemoteWorker
+
+        worker = RemoteWorker(remote)
+        health = worker.health()
+        model_name = health["model"]
+    else:
+        from neurotrace.models import load_model
+        from neurotrace.repair import run_repair_local
+
+        device = _resolve_device(device)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=err_console,
+        ) as progress:
+            task = progress.add_task("Loading model...", total=None)
+            model_obj, tokenizer = load_model(model, device=device)
+            model_obj = _maybe_load_adapter(model_obj, adapter)
+            model_name = model
+
+            progress.update(
+                task,
+                description=f"Repairing {len(prompts)} prompts...",
+                total=len(prompts),
+            )
+
+            for p_idx, entry in enumerate(prompts):
+                progress.update(
+                    task,
+                    completed=p_idx,
+                    description=f"Repair {p_idx + 1}/{len(prompts)}",
+                )
+                result = run_repair_local(
+                    model_obj,
+                    tokenizer,
+                    entry["prompt"],
+                    entry["answer"],
+                    competitor=competitor,
+                    target_layer=target_layer,
+                    target_component=target_component,
+                    target_margin=target_margin,
+                    verify_prompts=verify_prompts,
+                    seed=seed,
+                )
+                all_results.append(result)
+
+            progress.update(task, description="Done.", completed=len(prompts))
+
+    run = RepairRun(
+        run_id=run_id,
+        dataset=dataset_name,
+        model_name=model_name,
+        prompt_count=len(all_results),
+        results=all_results,
+        created_at=created_at,
+    )
+
+    # Save to DB
+    db_conn = TraceDB(db)
+    db_conn.write_repair_run(
+        run_id=run_id,
+        dataset=dataset_name,
+        model_name=model_name,
+        prompt_count=len(all_results),
+    )
+    for r in all_results:
+        regressions_found = sum(
+            1 for reg in r.regressions
+            if reg.status == "regression"
+        )
+        db_conn.write_repair_result(
+            run_id=run_id,
+            prompt=r.prompt,
+            answer=r.answer,
+            competitor=r.competitor,
+            target_layer=r.target_layer,
+            target_component=r.target_component,
+            before_margin=r.before.margin,
+            after_margin=r.after.margin,
+            before_prob=r.before.answer_prob,
+            after_prob=r.after.answer_prob,
+            edit_norm=r.edit.norm,
+            regressions_checked=len(r.regressions),
+            regressions_found=regressions_found,
+            status=r.status,
+        )
+    db_conn.close()
+
+    run_dict = repair_run_to_dict(run)
+
+    # HTML output
+    if html_path:
+        import os
+
+        os.makedirs(os.path.dirname(html_path) or ".", exist_ok=True)
+        html = generate_repair_html(run)
+        with open(html_path, "w") as f:
+            f.write(html)
+        err_console.print(f"[green]Report saved to {html_path}[/green]")
+
+    # JSON output
+    if output_json:
+        click.echo(json.dumps(run_dict, indent=2))
+        return
+
+    # Console output
+    repaired = sum(1 for r in all_results if r.status == "repaired")
+    skipped = sum(1 for r in all_results if r.status == "skipped")
+    regressed = sum(1 for r in all_results if r.status == "regression")
+
+    if len(all_results) == 1:
+        r = all_results[0]
+        console.print(
+            f'\n[bold]Repair:[/bold] "{r.prompt}" → {r.answer}\n'
+        )
+        console.print("[bold] Before[/bold]")
+        b = r.before
+        console.print(
+            f"  {r.answer} logit: {b.answer_logit:.2f}"
+            f" | Prob: {b.answer_prob:.2f}"
+        )
+        console.print(
+            f'  Competitor ("{r.competitor}"):'
+            f" {b.competitor_logit:.2f}"
+        )
+        console.print(f"  Margin: {b.margin:+.2f}")
+        comp = r.target_component.upper()
+        console.print(
+            f"  Worst component: L{r.target_layer} {comp}"
+            f" (margin: {b.component_margin:+.2f})"
+        )
+        console.print("\n[bold] Edit[/bold]")
+        console.print(
+            f"  Target: L{r.edit.layer} {r.edit.matrix}"
+            f" (rank-{r.edit.rank} update,"
+            f" norm: {r.edit.norm:.3f})"
+        )
+        console.print("\n[bold] After[/bold]")
+        a = r.after
+        console.print(
+            f"  {r.answer} logit: {a.answer_logit:.2f}"
+            f" | Prob: {a.answer_prob:.2f}"
+        )
+        console.print(
+            f'  Competitor ("{r.competitor}"):'
+            f" {a.competitor_logit:.2f}"
+        )
+        console.print(f"  Margin: {a.margin:+.2f}")
+        console.print(
+            f"  L{r.target_layer} {comp} margin:"
+            f" {b.component_margin:+.2f}"
+            f" → {a.component_margin:+.2f}"
+        )
+
+        if r.regressions:
+            n_reg = sum(
+                1 for reg in r.regressions
+                if reg.status == "regression"
+            )
+            n_total = len(r.regressions)
+            console.print(
+                f"\n[bold] Regression check"
+                f" ({n_total} prompts)[/bold]"
+            )
+            if n_reg == 0:
+                max_change = max(
+                    (
+                        abs(reg.after_prob - reg.before_prob)
+                        for reg in r.regressions
+                    ),
+                    default=0,
+                )
+                console.print(
+                    f"  [green]✓[/green] 0 regressions"
+                    f" (max prob change:"
+                    f" {max_change:+.2f})"
+                )
+            else:
+                console.print(
+                    f"  [red]✗[/red] {n_reg} regressions"
+                )
+                for reg in r.regressions:
+                    if reg.status == "regression":
+                        console.print(
+                            f"    {reg.prompt[:40]}:"
+                            f" {reg.before_prob:.2f}"
+                            f" → {reg.after_prob:.2f}"
+                        )
+        console.print()
+    else:
+        console.print(
+            f"\n[bold]Repair Summary:[/bold] {dataset_name or 'batch'} "
+            f"({len(all_results)} prompts)"
+        )
+        console.print(f"  Repaired: {repaired}")
+        console.print(f"  Skipped: {skipped}")
+        console.print(f"  Regressions caught: {regressed}")
+
+        table = Table()
+        table.add_column("Prompt", max_width=40)
+        table.add_column("Answer")
+        table.add_column("Before", justify="right")
+        table.add_column("After", justify="right")
+        table.add_column("Status")
+        for r in all_results:
+            style_map = {
+                "repaired": "green",
+                "skipped": "yellow",
+                "regression": "red",
+            }
+            s_style = style_map.get(r.status, "")
+            table.add_row(
+                r.prompt[:40],
+                r.answer,
+                f"{r.before.margin:+.2f}",
+                f"{r.after.margin:+.2f}",
+                f"[{s_style}]{r.status.upper()}[/{s_style}]",
+            )
+        console.print(table)
+        console.print()
+
+
+def _repair_remote(remote_url, prompts, competitor, target_layer, target_component,
+                   target_margin, verify_prompts, seed):
+    """Run repair via remote GPU worker."""
+    from neurotrace.remote import RemoteWorker
+    from neurotrace.repair import build_repair_result_from_remote
+
+    worker = RemoteWorker(remote_url)
+    health = worker.health()
+    device_name = health.get("device_name", health.get("device", "unknown"))
+
+    err_console.print(f"GPU: {device_name} via {remote_url}")
+
+    all_results = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task(
+            "Repairing...", total=len(prompts),
+        )
+
+        for p_idx, entry in enumerate(prompts):
+            progress.update(
+                task,
+                completed=p_idx,
+                description=f"Repair {p_idx + 1}/{len(prompts)}",
+            )
+
+            remote_data = None
+            for event in worker.repair_stream(
+                prompt=entry["prompt"],
+                answer=entry["answer"],
+                competitor=competitor,
+                target_layer=target_layer,
+                target_component=target_component,
+                target_margin=target_margin,
+                verify_prompts=verify_prompts,
+                seed=seed,
+            ):
+                etype = event.get("type")
+                if etype == "progress":
+                    progress.update(
+                        task,
+                        description=f"Repair {p_idx + 1}: {event.get('status', '')}",
+                    )
+                elif etype == "result":
+                    remote_data = event
+
+            if remote_data:
+                result = build_repair_result_from_remote(remote_data)
+                all_results.append(result)
+
+        progress.update(task, description="Done.", completed=len(prompts))
+
+    return all_results

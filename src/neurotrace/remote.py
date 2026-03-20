@@ -242,6 +242,57 @@ class RemoteWorker:
                 if line.startswith("data: "):
                     yield json.loads(line[6:])
 
+    def repair_stream(
+        self,
+        prompt: str,
+        answer: str,
+        competitor: str | None = None,
+        target_layer: int | None = None,
+        target_component: str = "mlp",
+        target_margin: float = 0.0,
+        verify_prompts: list[dict] | None = None,
+        seed: int = 42,
+    ) -> Generator[dict, None, None]:
+        """Stream repair results via SSE."""
+        payload: dict = {
+            "prompt": prompt,
+            "answer": answer,
+            "target_margin": target_margin,
+            "seed": seed,
+        }
+        if competitor is not None:
+            payload["competitor"] = competitor
+        if target_layer is not None:
+            payload["target_layer"] = target_layer
+            payload["target_component"] = target_component
+        if verify_prompts:
+            payload["verify_prompts"] = verify_prompts
+
+        with self.client.stream(
+            "POST",
+            f"{self.base_url}/repair",
+            json=payload,
+            timeout=600.0,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line.startswith("data: "):
+                    yield json.loads(line[6:])
+
+    def repair_undo(self) -> dict:
+        """Undo the last repair edit on the worker."""
+        r = self.client.post(f"{self.base_url}/repair/undo")
+        r.raise_for_status()
+        return r.json()
+
+    def repair_save(self, path: str) -> dict:
+        """Save the edited model on the worker."""
+        r = self.client.post(
+            f"{self.base_url}/repair/save", json={"path": path},
+        )
+        r.raise_for_status()
+        return r.json()
+
     def download_adapter(self, adapter_id: str, output_path: str) -> None:
         """Download trained adapter weights to local path."""
         import io

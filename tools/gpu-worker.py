@@ -210,6 +210,8 @@ _model_name: str = ""
 _num_layers: int = 0
 # adapter_id -> path on disk
 _adapters: dict[str, Path] = {}
+# Stack of (layer, k_star, delta) for undo
+_edit_stack: list[tuple[int, Any, Any]] = []
 
 
 # ---------------------------------------------------------------------------
@@ -304,6 +306,26 @@ class FinetuneRequest(BaseModel):
     lr: float = 2e-4
     rank: int = 8
     batch_size: int = 4
+
+
+class VerifyPrompt(BaseModel):
+    prompt: str
+    answer: str
+
+
+class RepairRequest(BaseModel):
+    prompt: str
+    answer: str
+    competitor: str | None = None
+    target_layer: int | None = None
+    target_component: str = "mlp"
+    target_margin: float = 0.0
+    verify_prompts: list[VerifyPrompt] = Field(default_factory=list)
+    seed: int = 42
+
+
+class RepairSaveRequest(BaseModel):
+    path: str
 
 
 # ---------------------------------------------------------------------------
@@ -1374,6 +1396,411 @@ def decompose(req: DecomposeRequest) -> StreamingResponse:
     return StreamingResponse(
         _generate(), media_type="text/event-stream"
     )
+
+
+@app.post("/repair")
+def repair(req: RepairRequest) -> StreamingResponse:
+    """ROME rank-one weight repair with SSE progress."""
+    assert _model is not None and _tokenizer is not None and _device is not None
+
+    async def _generate():
+        torch.manual_seed(req.seed)
+        layers = _get_transformer_layers()
+        prompt = req.prompt
+        answer = req.answer
+        competitor = req.competitor
+
+        # Auto-detect competitor if not provided
+        if competitor is None:
+            input_ids = _tokenizer.encode(prompt, return_tensors="pt").to(_device)
+            with torch.no_grad():
+                outputs = _model(input_ids)
+            logits = outputs.logits[0, -1, :]
+            probs = _safe_softmax(logits)
+            top_probs, top_ids = _safe_topk(probs, 10)
+            answer_ids_sp = _tokenizer.encode(
+                " " + answer, add_special_tokens=False,
+            )
+            answer_ids_raw = _tokenizer.encode(
+                answer, add_special_tokens=False,
+            )
+            exclude = set(answer_ids_sp + answer_ids_raw)
+            for tid in top_ids.tolist():
+                if tid not in exclude:
+                    competitor = _tokenizer.decode([tid]).strip()
+                    if competitor:
+                        break
+            if not competitor:
+                competitor = "the"
+
+        yield _sse_line({"type": "progress", "status": "decomposing"})
+        await asyncio.sleep(0)
+
+        # Run decompose for answer and competitor
+        input_ids = _tokenizer.encode(prompt, return_tensors="pt").to(_device)
+
+        target_tokens = [answer, competitor]
+        target_ids = []
+        for t in target_tokens:
+            ids = _tokenizer.encode(t, add_special_tokens=False)
+            if not ids:
+                ids = _tokenizer.encode(" " + t, add_special_tokens=False)
+            target_ids.append(ids[0] if ids else 0)
+
+        # Hook attention and MLP outputs
+        components: dict[int, dict[str, Any]] = {}
+        hooks_list: list[torch.utils.hooks.RemovableHandle] = []
+
+        def make_attn_hook(layer_idx):
+            def hook(module, inp, output):
+                components[layer_idx]["attn"] = output[0][0, -1, :].detach()
+            return hook
+
+        def make_mlp_hook(layer_idx):
+            def hook(module, inp, output):
+                out = output[0, -1, :] if output.dim() == 3 else output[-1, :]
+                components[layer_idx]["mlp"] = out.detach()
+            return hook
+
+        for i, layer in enumerate(layers):
+            components[i] = {}
+            hooks_list.append(
+                layer.self_attn.register_forward_hook(make_attn_hook(i)),
+            )
+            hooks_list.append(
+                layer.mlp.register_forward_hook(make_mlp_hook(i)),
+            )
+
+        try:
+            with torch.no_grad():
+                outputs = _model(input_ids)
+        finally:
+            for h in hooks_list:
+                h.remove()
+
+        embed = _model.model.embed_tokens(input_ids)[0, -1, :].detach()
+        ln_weight = _model.model.norm.weight.detach()
+        residual = embed.clone()
+        for i in range(len(layers)):
+            residual = residual + components[i]["attn"] + components[i]["mlp"]
+        variance = residual.pow(2).mean(-1, keepdim=False)
+        s = torch.sqrt(variance + _model.model.norm.variance_epsilon)
+        w_unembed = _model.lm_head.weight
+
+        # Compute before decomposition
+        decompositions = {}
+        for token_str, token_id in zip(target_tokens, target_ids):
+            unembed_vec = w_unembed[token_id]
+            proj = (unembed_vec * ln_weight) / s
+            embed_c = (proj * embed).sum().item()
+            layer_contribs = []
+            for i in range(len(layers)):
+                attn_c = (proj * components[i]["attn"]).sum().item()
+                mlp_c = (proj * components[i]["mlp"]).sum().item()
+                layer_contribs.append({
+                    "layer": i, "attention": attn_c, "mlp": mlp_c,
+                })
+            actual = outputs.logits[0, -1, token_id].item()
+            decompositions[token_str] = {
+                "final_logit": actual,
+                "embedding": embed_c,
+                "layers": layer_contribs,
+            }
+
+        # Compute component margins
+        a_dec = decompositions[answer]
+        c_dec = decompositions[competitor]
+        component_margins = []
+        for al, cl in zip(a_dec["layers"], c_dec["layers"]):
+            component_margins.append({
+                "layer": al["layer"],
+                "attn_margin": al["attention"] - cl["attention"],
+                "mlp_margin": al["mlp"] - cl["mlp"],
+            })
+
+        # Select target layer
+        target_layer = req.target_layer
+        target_component = req.target_component
+        if target_layer is None:
+            worst_margin = float("inf")
+            for cm in component_margins:
+                total_cm = cm["attn_margin"] + cm["mlp_margin"]
+                if total_cm < worst_margin:
+                    worst_margin = total_cm
+                    target_layer = cm["layer"]
+                    target_component = (
+                        "mlp" if cm["mlp_margin"] < cm["attn_margin"]
+                        else "attention"
+                    )
+            if target_layer is None:
+                target_layer = 0
+
+        current_comp_margin = 0.0
+        for cm in component_margins:
+            if cm["layer"] == target_layer:
+                current_comp_margin = (
+                    cm["mlp_margin"] if target_component == "mlp"
+                    else cm["attn_margin"]
+                )
+                break
+
+        before_logits = outputs.logits[0, -1, :]
+        before_probs = _safe_softmax(before_logits)
+        before_prob = before_probs[target_ids[0]].item()
+
+        before_data = {
+            "answer_logit": a_dec["final_logit"],
+            "competitor_logit": c_dec["final_logit"],
+            "margin": a_dec["final_logit"] - c_dec["final_logit"],
+            "component_margin": current_comp_margin,
+            "answer_prob": before_prob,
+        }
+
+        yield _sse_line({
+            "type": "progress",
+            "status": "computing_key_vector",
+            "layer": target_layer,
+        })
+        await asyncio.sleep(0)
+
+        # Extract key vector k*
+        k_star_holder: dict[str, Any] = {}
+
+        def kstar_hook(module, args):
+            inp = args[0] if isinstance(args, tuple) else args
+            if inp.dim() == 3:
+                k_star_holder["value"] = inp[0, -1, :].detach().clone()
+            elif inp.dim() == 2:
+                k_star_holder["value"] = inp[-1, :].detach().clone()
+            else:
+                k_star_holder["value"] = inp.detach().clone()
+
+        handle = layers[target_layer].mlp.down_proj.register_forward_pre_hook(
+            kstar_hook,
+        )
+        try:
+            with torch.no_grad():
+                _model(input_ids)
+        finally:
+            handle.remove()
+
+        k_star = k_star_holder["value"]
+
+        # Compute correction delta
+        deficit = req.target_margin - current_comp_margin
+        yield _sse_line({
+            "type": "progress",
+            "status": "computing_correction",
+            "margin_deficit": deficit,
+        })
+        await asyncio.sleep(0)
+
+        p_answer = w_unembed[target_ids[0]] * ln_weight
+        p_comp = w_unembed[target_ids[1]] * ln_weight
+        p_margin = p_answer - p_comp
+        dot = (p_margin @ p_margin).item()
+        if dot < 1e-10:
+            delta = torch.zeros_like(p_margin)
+        else:
+            delta = (deficit / dot) * p_margin
+
+        # Apply rank-one edit
+        yield _sse_line({"type": "progress", "status": "applying_edit"})
+        await asyncio.sleep(0)
+
+        down_proj = layers[target_layer].mlp.down_proj
+        k_dot = (k_star @ k_star).item()
+        edit_norm = 0.0
+        if k_dot >= 1e-10:
+            update = torch.outer(delta, k_star) / k_dot
+            edit_norm = update.norm().item()
+            down_proj.weight.data += update
+
+        _edit_stack.append((target_layer, k_star, delta))
+
+        # Verify
+        yield _sse_line({"type": "progress", "status": "verifying_target"})
+        await asyncio.sleep(0)
+
+        with torch.no_grad():
+            outputs_after = _model(input_ids)
+
+        after_logits = outputs_after.logits[0, -1, :]
+        after_probs = _safe_softmax(after_logits)
+        after_prob = after_probs[target_ids[0]].item()
+
+        # Re-decompose after edit
+        hooks_list2: list[torch.utils.hooks.RemovableHandle] = []
+        components2: dict[int, dict[str, Any]] = {}
+        for i, layer in enumerate(layers):
+            components2[i] = {}
+            hooks_list2.append(
+                layer.self_attn.register_forward_hook(make_attn_hook(i)),
+            )
+
+            def make_mlp_hook2(layer_idx):
+                def hook(module, inp, output):
+                    out = (
+                        output[0, -1, :]
+                        if output.dim() == 3
+                        else output[-1, :]
+                    )
+                    components2[layer_idx]["mlp"] = out.detach()
+                return hook
+
+            hooks_list2.append(
+                layer.mlp.register_forward_hook(make_mlp_hook2(i)),
+            )
+
+        def make_attn_hook2(layer_idx):
+            def hook(module, inp, output):
+                components2[layer_idx]["attn"] = output[0][0, -1, :].detach()
+            return hook
+
+        # Re-register hooks correctly
+        for h in hooks_list2:
+            h.remove()
+        hooks_list2.clear()
+        for i, layer in enumerate(layers):
+            components2[i] = {}
+            hooks_list2.append(
+                layer.self_attn.register_forward_hook(make_attn_hook2(i)),
+            )
+            hooks_list2.append(
+                layer.mlp.register_forward_hook(make_mlp_hook(i)),
+            )
+
+        try:
+            with torch.no_grad():
+                outputs_after2 = _model(input_ids)
+        finally:
+            for h in hooks_list2:
+                h.remove()
+
+        embed2 = _model.model.embed_tokens(input_ids)[0, -1, :].detach()
+        residual2 = embed2.clone()
+        for i in range(len(layers)):
+            residual2 = (
+                residual2 + components2[i]["attn"] + components[i]["mlp"]
+            )
+        variance2 = residual2.pow(2).mean(-1, keepdim=False)
+        s2 = torch.sqrt(variance2 + _model.model.norm.variance_epsilon)
+
+        after_comp_margin = 0.0
+        for i in range(len(layers)):
+            if i == target_layer:
+                a_proj = (w_unembed[target_ids[0]] * ln_weight) / s2
+                c_proj = (w_unembed[target_ids[1]] * ln_weight) / s2
+                a_mlp = (a_proj * components[i]["mlp"]).sum().item()
+                c_mlp = (c_proj * components[i]["mlp"]).sum().item()
+                after_comp_margin = a_mlp - c_mlp
+
+        after_a_logit = outputs_after2.logits[0, -1, target_ids[0]].item()
+        after_c_logit = outputs_after2.logits[0, -1, target_ids[1]].item()
+
+        after_data = {
+            "answer_logit": after_a_logit,
+            "competitor_logit": after_c_logit,
+            "margin": after_a_logit - after_c_logit,
+            "component_margin": after_comp_margin,
+            "answer_prob": after_prob,
+        }
+
+        # Check regressions
+        regressions = []
+        for vp in req.verify_prompts:
+            vp_ids = _tokenizer.encode(vp.prompt, return_tensors="pt").to(
+                _device,
+            )
+            vp_answer_ids = _tokenizer.encode(
+                " " + vp.answer, add_special_tokens=False,
+            )
+            if not vp_answer_ids:
+                vp_answer_ids = _tokenizer.encode(
+                    vp.answer, add_special_tokens=False,
+                )
+            vp_aid = vp_answer_ids[0] if vp_answer_ids else 0
+
+            with torch.no_grad():
+                vp_out = _model(vp_ids)
+            vp_probs = _safe_softmax(vp_out.logits[0, -1, :])
+            vp_after_prob = vp_probs[vp_aid].item()
+
+            # Undo, check, re-apply
+            if k_dot >= 1e-10:
+                down_proj.weight.data -= torch.outer(delta, k_star) / k_dot
+            with torch.no_grad():
+                vp_out_before = _model(vp_ids)
+            vp_before_probs = _safe_softmax(vp_out_before.logits[0, -1, :])
+            vp_before_prob = vp_before_probs[vp_aid].item()
+            if k_dot >= 1e-10:
+                down_proj.weight.data += torch.outer(delta, k_star) / k_dot
+
+            status = (
+                "ok" if vp_after_prob >= vp_before_prob - 0.05
+                else "regression"
+            )
+            regressions.append({
+                "prompt": vp.prompt,
+                "answer": vp.answer,
+                "before_prob": round(vp_before_prob, 4),
+                "after_prob": round(vp_after_prob, 4),
+                "status": status,
+            })
+
+        yield _sse_line({
+            "type": "result",
+            "prompt": prompt,
+            "answer": answer,
+            "competitor": competitor,
+            "target_layer": target_layer,
+            "target_component": target_component,
+            "before": before_data,
+            "after": after_data,
+            "edit": {
+                "matrix": "down_proj",
+                "layer": target_layer,
+                "rank": 1,
+                "norm": round(edit_norm, 6),
+            },
+            "regressions": regressions,
+            "status": "repaired",
+        })
+        await asyncio.sleep(0)
+        yield _sse_line({"type": "done"})
+
+    return StreamingResponse(
+        _generate(), media_type="text/event-stream",
+    )
+
+
+@app.post("/repair/undo")
+def repair_undo() -> dict[str, Any]:
+    """Undo the last repair edit."""
+    assert _model is not None
+    if not _edit_stack:
+        raise HTTPException(status_code=400, detail="No edits to undo")
+
+    target_layer, k_star, delta = _edit_stack.pop()
+    layers = _get_transformer_layers()
+    down_proj = layers[target_layer].mlp.down_proj
+    k_dot = (k_star @ k_star).item()
+    if k_dot >= 1e-10:
+        update = torch.outer(delta, k_star) / k_dot
+        down_proj.weight.data -= update
+
+    return {"status": "undone", "layer": target_layer, "edits_remaining": len(_edit_stack)}
+
+
+@app.post("/repair/save")
+def repair_save(req: RepairSaveRequest) -> dict[str, Any]:
+    """Save the current edited model state."""
+    assert _model is not None and _tokenizer is not None
+    save_path = Path(req.path)
+    save_path.mkdir(parents=True, exist_ok=True)
+    _model.save_pretrained(str(save_path))
+    _tokenizer.save_pretrained(str(save_path))
+    return {"status": "saved", "path": str(save_path)}
 
 
 def main() -> None:
