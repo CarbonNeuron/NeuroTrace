@@ -143,6 +143,80 @@ def test_label_from_heatmap_excludes_baseline_wrong():
     assert not info[0]["baseline_correct"]
 
 
+def test_label_from_heatmap_layer_range_filters_breaks():
+    """Breaks outside the layer range should not count."""
+    cells = [
+        {
+            "prompt_index": 0,
+            "prompt": "p0",
+            "expected_answer": "a0",
+            "layer": 2,
+            "baseline_token": "a0",
+            "baseline_prob": 0.8,
+            "baseline_correct": True,
+            "ablated_token": "wrong",
+            "ablated_prob": 0.3,
+            "ablated_correct": False,
+            "delta_correct_prob": -0.5,
+            "flipped": True,
+            "flip_direction": "broke",
+        },
+        {
+            "prompt_index": 0,
+            "prompt": "p0",
+            "expected_answer": "a0",
+            "layer": 18,
+            "baseline_token": "a0",
+            "baseline_prob": 0.8,
+            "baseline_correct": True,
+            "ablated_token": "a0",
+            "ablated_prob": 0.7,
+            "ablated_correct": True,
+            "delta_correct_prob": 0.0,
+            "flipped": False,
+            "flip_direction": "none",
+        },
+    ]
+    cells_json = json.dumps(cells)
+
+    # Without layer_range: break at layer 2 counts
+    info_all = label_from_heatmap(cells_json)
+    assert info_all[0]["has_break"] is True
+
+    # With layer_range 14-21: layer 2 break is excluded
+    info_filtered = label_from_heatmap(cells_json, layer_range=(14, 21))
+    assert info_filtered[0]["has_break"] is False
+
+    # With layer_range 0-5: layer 2 break is included
+    info_low = label_from_heatmap(cells_json, layer_range=(0, 5))
+    assert info_low[0]["has_break"] is True
+
+
+def test_label_from_heatmap_layer_range_keeps_in_range_breaks():
+    """Breaks inside the layer range should still count."""
+    cells = [
+        {
+            "prompt_index": 0,
+            "prompt": "p0",
+            "expected_answer": "a0",
+            "layer": 18,
+            "baseline_token": "a0",
+            "baseline_prob": 0.8,
+            "baseline_correct": True,
+            "ablated_token": "wrong",
+            "ablated_prob": 0.3,
+            "ablated_correct": False,
+            "delta_correct_prob": -0.5,
+            "flipped": True,
+            "flip_direction": "broke",
+        },
+    ]
+    info = label_from_heatmap(
+        json.dumps(cells), layer_range=(14, 21),
+    )
+    assert info[0]["has_break"] is True
+
+
 # --- build_labels_from_heatmap_runs tests ---
 
 
@@ -159,6 +233,25 @@ def test_build_labels_vulnerable_count():
     run = _make_heatmap_run(n_prompts=10, n_baseline_wrong=2, n_vulnerable=3)
     prompts, labels, domains = build_labels_from_heatmap_runs([run])
     assert int(labels.sum()) == 3  # 3 vulnerable
+
+
+def test_build_labels_layer_range_filters_vulnerable():
+    """With layer_range excluding the break layer, no vulnerable."""
+    # _make_heatmap_run puts breaks at layer 18
+    run = _make_heatmap_run(
+        n_prompts=10, n_baseline_wrong=2, n_vulnerable=3,
+    )
+    # Layer range 0-10 excludes layer 18 breaks
+    _, labels_filtered, _ = build_labels_from_heatmap_runs(
+        [run], layer_range=(0, 10),
+    )
+    assert int(labels_filtered.sum()) == 0  # no vulnerable
+
+    # Layer range 14-21 includes layer 18 breaks
+    _, labels_included, _ = build_labels_from_heatmap_runs(
+        [run], layer_range=(14, 21),
+    )
+    assert int(labels_included.sum()) == 3  # 3 vulnerable
 
 
 def test_build_labels_combines_runs():
@@ -430,3 +523,87 @@ def test_probe_universal_cli_invalid_layer_range():
         ["probe-universal", "--db", "test.db", "--layer-range", "bad"],
     )
     assert result.exit_code != 0
+
+
+# --- Remote client tests ---
+
+
+def test_remote_extract_activations_builds_request():
+    """Verify extract_activations_stream sends correct request."""
+    from unittest.mock import MagicMock, patch
+
+    with patch("httpx.Client") as mock_cls:
+        mock_client = mock_cls.return_value
+        mock_response = MagicMock()
+        mock_response.__enter__ = MagicMock(
+            return_value=mock_response,
+        )
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_response.iter_lines.return_value = []
+        mock_client.stream.return_value = mock_response
+
+        from neurotrace.remote import RemoteWorker
+
+        worker = RemoteWorker("http://localhost:8877")
+        list(worker.extract_activations_stream(
+            ["prompt A", "prompt B"],
+            layer_start=14,
+            layer_end=21,
+            seed=42,
+        ))
+
+        mock_client.stream.assert_called_once()
+        call_args = mock_client.stream.call_args
+        assert call_args[0][0] == "POST"
+        url = call_args[0][1]
+        assert url.endswith("/extract-activations")
+
+        body = call_args[1]["json"]
+        assert body["prompts"] == ["prompt A", "prompt B"]
+        assert body["layer_start"] == 14
+        assert body["layer_end"] == 21
+        assert body["seed"] == 42
+
+
+def test_remote_extract_activations_parses_sse():
+    """Verify SSE events are parsed correctly."""
+    import base64
+    from unittest.mock import MagicMock, patch
+
+    # Build a fake activation payload
+    fake_act = np.zeros(16, dtype=np.float32)
+    encoded = base64.b64encode(fake_act.tobytes()).decode("ascii")
+
+    with patch("httpx.Client") as mock_cls:
+        mock_client = mock_cls.return_value
+        mock_response = MagicMock()
+        mock_response.__enter__ = MagicMock(
+            return_value=mock_response,
+        )
+        mock_response.__exit__ = MagicMock(return_value=False)
+        mock_response.iter_lines.return_value = [
+            'data: {"type":"progress","index":0,"total":1}',
+            (
+                f'data: {{"type":"activations","index":0,'
+                f'"shape":[16],"dtype":"float32",'
+                f'"data":"{encoded}"}}'
+            ),
+            'data: {"type":"done","total":1}',
+        ]
+        mock_client.stream.return_value = mock_response
+
+        from neurotrace.remote import RemoteWorker
+
+        worker = RemoteWorker("http://localhost:8877")
+        events = list(worker.extract_activations_stream(
+            ["test"], 14, 21,
+        ))
+
+        assert len(events) == 3
+        assert events[0]["type"] == "progress"
+        assert events[1]["type"] == "activations"
+        assert events[1]["shape"] == [16]
+        raw = base64.b64decode(events[1]["data"])
+        arr = np.frombuffer(raw, dtype=np.float32)
+        assert arr.shape == (16,)
+        assert events[2]["type"] == "done"

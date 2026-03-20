@@ -55,6 +55,33 @@ class RemoteWorker:
                 if line.startswith("data: "):
                     yield json.loads(line[6:])
 
+    def extract_activations_stream(
+        self,
+        prompts: list[str],
+        layer_start: int,
+        layer_end: int,
+        seed: int = 42,
+    ) -> Generator[dict, None, None]:
+        """Stream activation extraction results via SSE.
+
+        Yields parsed event dicts with types: progress, activations, done.
+        """
+        with self.client.stream(
+            "POST",
+            f"{self.base_url}/extract-activations",
+            json={
+                "prompts": prompts,
+                "layer_start": layer_start,
+                "layer_end": layer_end,
+                "seed": seed,
+            },
+            timeout=600.0,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line.startswith("data: "):
+                    yield json.loads(line[6:])
+
     def finetune_stream(self, config: dict) -> Generator[dict, None, None]:
         """Stream finetune progress via SSE. Yields parsed event dicts."""
         with self.client.stream(

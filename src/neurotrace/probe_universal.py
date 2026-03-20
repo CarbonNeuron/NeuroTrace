@@ -32,8 +32,16 @@ class UniversalProbeResult:
     projection_scores: np.ndarray  # (n_samples,)
 
 
-def label_from_heatmap(cells_json: str) -> dict[int, dict]:
-    """Extract per-prompt vulnerability labels from heatmap cells JSON.
+def label_from_heatmap(
+    cells_json: str,
+    layer_range: tuple[int, int] | None = None,
+) -> dict[int, dict]:
+    """Extract per-prompt vulnerability labels from heatmap cells.
+
+    Args:
+        cells_json: JSON string of heatmap cells.
+        layer_range: Optional (start, end) inclusive. Only count
+            breaks within this range.
 
     Returns dict keyed by prompt_index with:
         prompt, expected_answer, baseline_correct, has_break
@@ -50,16 +58,26 @@ def label_from_heatmap(cells_json: str) -> dict[int, dict]:
                 "has_break": False,
             }
         if c["flip_direction"] == "broke":
+            if layer_range is not None:
+                layer = c["layer"]
+                if layer < layer_range[0] or layer > layer_range[1]:
+                    continue
             prompts[idx]["has_break"] = True
     return prompts
 
 
 def build_labels_from_heatmap_runs(
     heatmap_runs: list[dict],
+    layer_range: tuple[int, int] | None = None,
 ) -> tuple[list[str], np.ndarray, list[str]]:
-    """Build prompts, labels, and domain names from multiple heatmap runs.
+    """Build prompts, labels, and domain names from heatmap runs.
 
-    Returns (prompts, labels, domains) excluding baseline-wrong facts.
+    Args:
+        heatmap_runs: List of heatmap run dicts with "cells" JSON.
+        layer_range: Optional (start, end) inclusive. Only count
+            breaks within this range for vulnerability labeling.
+
+    Returns (prompts, labels, domains) excluding baseline-wrong.
     """
     all_prompts: list[str] = []
     all_labels: list[bool] = []
@@ -68,11 +86,11 @@ def build_labels_from_heatmap_runs(
     for run in heatmap_runs:
         cells_json = run["cells"]
         dataset_name = run["dataset_name"]
-        prompt_info = label_from_heatmap(cells_json)
+        prompt_info = label_from_heatmap(cells_json, layer_range)
 
         for _idx, info in sorted(prompt_info.items()):
             if not info["baseline_correct"]:
-                continue  # exclude baseline-wrong
+                continue
             all_prompts.append(info["prompt"])
             all_labels.append(info["has_break"])
             all_domains.append(dataset_name)

@@ -4069,7 +4069,7 @@ def _heatmap_remote(remote_url, prompts, seed):
 @click.option(
     "--heatmap-run",
     default="latest",
-    help="Heatmap run ID, or 'latest' (default), or 'all' to combine all runs.",
+    help="Heatmap run ID, or 'latest' (default), or 'all'.",
 )
 @click.option(
     "--layer-range",
@@ -4082,7 +4082,14 @@ def _heatmap_remote(remote_url, prompts, seed):
     "--model", default=None,
     help="HuggingFace model name (auto from heatmap if omitted).",
 )
-@click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
+@click.option(
+    "--remote", default=None,
+    help="GPU worker URL (e.g., http://172.30.0.1:8877).",
+)
+@click.option(
+    "--device", default="cpu",
+    help="Device: cpu, cuda, directml, auto.",
+)
 @click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
 @click.option("--seed", default=42, type=int, help="Random seed.")
 def probe_universal(
@@ -4094,15 +4101,16 @@ def probe_universal(
     model,
     device,
     adapter,
+    remote,
     seed,
 ):
-    """Train a universal vulnerability probe across all domains using heatmap data."""
+    """Train a universal vulnerability probe using heatmap data."""
     import uuid
     from datetime import datetime
 
     from neurotrace.probe_universal import (
         build_labels_from_heatmap_runs,
-        extract_multilayer_activations,
+        label_from_heatmap,
         save_universal_probe,
         train_universal_probe,
     )
@@ -4117,13 +4125,19 @@ def probe_universal(
             "Use 'START-END'."
         )
 
+    if remote is None and model is None:
+        # Will auto-detect from heatmap run below
+        pass
+
     db_conn = TraceDB(db)
 
     # Resolve heatmap runs
     if heatmap_run == "all":
         runs = db_conn.get_all_heatmap_runs()
         if not runs:
-            raise click.ClickException("No heatmap runs found in database.")
+            raise click.ClickException(
+                "No heatmap runs found in database."
+            )
     elif heatmap_run == "latest":
         run_id = db_conn.get_latest_heatmap_run_id()
         runs = [db_conn.read_heatmap_run(run_id)]
@@ -4138,15 +4152,20 @@ def probe_universal(
         TextColumn("[progress.description]{task.description}"),
         console=err_console,
     ) as progress:
-        task = progress.add_task("Building labels from heatmap data...", total=None)
+        task = progress.add_task(
+            "Building labels from heatmap data...", total=None,
+        )
 
-        # Build labels
-        from neurotrace.probe_universal import label_from_heatmap
-
-        prompts, labels, domains = build_labels_from_heatmap_runs(runs)
+        # Build labels (filter breaks to layer range)
+        lr = (layer_start, layer_end)
+        prompts, labels, domains = build_labels_from_heatmap_runs(
+            runs, layer_range=lr,
+        )
         n_excluded = sum(
             1 for r in runs
-            for info in label_from_heatmap(r["cells"]).values()
+            for info in label_from_heatmap(
+                r["cells"], layer_range=lr,
+            ).values()
             if not info["baseline_correct"]
         )
 
@@ -4160,33 +4179,50 @@ def probe_universal(
 
         if n_vuln < 2 or n_robust < 2:
             raise click.ClickException(
-                f"Need at least 2 vulnerable and 2 robust samples. "
-                f"Got {n_vuln} vulnerable, {n_robust} robust."
+                f"Need at least 2 vulnerable and 2 robust "
+                f"samples. Got {n_vuln} vulnerable, "
+                f"{n_robust} robust."
             )
 
-        # Load model
-        progress.update(task, description="Loading model...")
-        from neurotrace.models import load_model
+        # Extract activations — remote or local
+        if remote is not None:
+            activations = _probe_universal_remote(
+                remote, prompts, layer_start, layer_end,
+                seed, progress, task,
+            )
+        else:
+            from neurotrace.probe_universal import (
+                extract_multilayer_activations,
+            )
 
-        device = _resolve_device(device)
-        model_obj, tokenizer = load_model(model_name, device=device)
-        model_obj = _maybe_load_adapter(model_obj, adapter)
+            progress.update(
+                task, description="Loading model...",
+            )
+            from neurotrace.models import load_model
 
-        # Extract activations
-        progress.update(
-            task,
-            description=(
-                f"Extracting activations "
-                f"(layers {layer_start}-{layer_end}, "
-                f"{len(prompts)} prompts)..."
-            ),
-        )
-        activations = extract_multilayer_activations(
-            model_obj, tokenizer, prompts, layer_start, layer_end, seed=seed
-        )
+            device = _resolve_device(device)
+            model_obj, tokenizer = load_model(
+                model_name, device=device,
+            )
+            model_obj = _maybe_load_adapter(model_obj, adapter)
+
+            progress.update(
+                task,
+                description=(
+                    f"Extracting activations "
+                    f"(layers {layer_start}-{layer_end}, "
+                    f"{len(prompts)} prompts)..."
+                ),
+            )
+            activations = extract_multilayer_activations(
+                model_obj, tokenizer, prompts,
+                layer_start, layer_end, seed=seed,
+            )
 
         # Train probe
-        progress.update(task, description="Training universal probe (LOO CV)...")
+        progress.update(
+            task, description="Training universal probe (LOO CV)...",
+        )
         result = train_universal_probe(activations, labels, domains)
 
         # Fill in metadata
@@ -4236,10 +4272,14 @@ def probe_universal(
     console.print("\n[bold]Universal Vulnerability Probe[/bold]")
     console.print(
         f"Layers {layer_start}-{layer_end} | "
-        f"{result.n_vulnerable} vulnerable, {result.n_robust} robust, "
+        f"{result.n_vulnerable} vulnerable, "
+        f"{result.n_robust} robust, "
         f"{result.n_excluded} excluded"
     )
-    console.print(f"Heatmap runs: {len(run_ids)} | Domains: {len(set(domains))}\n")
+    console.print(
+        f"Heatmap runs: {len(run_ids)} | "
+        f"Domains: {len(set(domains))}\n"
+    )
 
     console.print("[bold]Overall Metrics:[/bold]")
     console.print(f"  AUC-ROC:   {result.auc_roc:.4f}")
@@ -4257,7 +4297,10 @@ def probe_universal(
         table.add_column("Domain")
         table.add_column("AUC-ROC", justify="right")
         for domain, auc in sorted(result.per_domain_auc.items()):
-            style = "green" if auc >= 0.8 else ("yellow" if auc >= 0.6 else "red")
+            style = (
+                "green" if auc >= 0.8
+                else ("yellow" if auc >= 0.6 else "red")
+            )
             table.add_row(domain, f"{auc:.4f}", style=style)
         console.print(table)
 
@@ -4266,7 +4309,59 @@ def probe_universal(
     feat_table.add_column("Feature Index", justify="right")
     feat_table.add_column("Importance", justify="right")
     for feat in result.top_features[:10]:
-        feat_table.add_row(str(feat["feature_index"]), f"{feat['importance']:.4f}")
+        feat_table.add_row(
+            str(feat["feature_index"]),
+            f"{feat['importance']:.4f}",
+        )
     console.print(feat_table)
 
     console.print(f"\n[green]Probe saved to {output}/[/green]")
+
+
+def _probe_universal_remote(
+    remote_url, prompts, layer_start, layer_end,
+    seed, progress, task,
+):
+    """Extract activations via remote GPU worker."""
+    import base64
+
+    import numpy as np
+
+    from neurotrace.remote import RemoteWorker
+
+    worker = RemoteWorker(remote_url)
+    health = worker.health()
+    device_name = health.get(
+        "device_name", health.get("device", "unknown"),
+    )
+    err_console.print(f"GPU: {device_name} via {remote_url}")
+
+    progress.update(
+        task,
+        description=(
+            f"Extracting activations remotely "
+            f"(layers {layer_start}-{layer_end}, "
+            f"{len(prompts)} prompts)..."
+        ),
+    )
+
+    rows = []
+    for event in worker.extract_activations_stream(
+        prompts, layer_start, layer_end, seed=seed,
+    ):
+        etype = event.get("type")
+        if etype == "progress":
+            idx = event["index"]
+            total = event["total"]
+            progress.update(
+                task,
+                description=(
+                    f"Extracting {idx + 1}/{total}..."
+                ),
+            )
+        elif etype == "activations":
+            raw = base64.b64decode(event["data"])
+            arr = np.frombuffer(raw, dtype=np.float32).copy()
+            rows.append(arr)
+
+    return np.stack(rows)

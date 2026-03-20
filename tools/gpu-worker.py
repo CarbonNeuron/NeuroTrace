@@ -252,6 +252,13 @@ class BatchAblateRequest(BaseModel):
     top_k: int = 1
 
 
+class ExtractActivationsRequest(BaseModel):
+    prompts: list[str]
+    layer_start: int
+    layer_end: int
+    seed: int = 42
+
+
 class DatasetEntry(BaseModel):
     prompt: str
     answer: str
@@ -452,6 +459,83 @@ def batch_ablate(req: BatchAblateRequest) -> StreamingResponse:
         yield _sse_line({"type": "done", "total_results": total})
 
     return StreamingResponse(_generate(), media_type="text/event-stream")
+
+
+@app.post("/extract-activations")
+def extract_activations(req: ExtractActivationsRequest) -> StreamingResponse:
+    """Extract layer output activations for multiple prompts via SSE."""
+    assert _model is not None and _tokenizer is not None and _device is not None
+
+    import base64
+
+    import numpy as np
+
+    async def _generate():
+        layers = _get_transformer_layers()
+        total = len(req.prompts)
+
+        for idx, prompt in enumerate(req.prompts):
+            yield _sse_line({
+                "type": "progress",
+                "index": idx,
+                "total": total,
+            })
+
+            torch.manual_seed(req.seed)
+            inputs = _tokenizer(prompt, return_tensors="pt").to(_device)
+
+            captured: dict[int, torch.Tensor] = {}
+            hooks: list[torch.utils.hooks.RemovableHandle] = []
+
+            for layer_idx in range(req.layer_start, req.layer_end + 1):
+                def _make_hook(li: int):
+                    def hook_fn(
+                        module: torch.nn.Module,
+                        input: Any,
+                        output: Any,
+                    ) -> None:
+                        out = output[0] if isinstance(output, tuple) else output
+                        captured[li] = out.detach()
+                    return hook_fn
+
+                if layer_idx < len(layers):
+                    h = layers[layer_idx].register_forward_hook(
+                        _make_hook(layer_idx)
+                    )
+                    hooks.append(h)
+
+            try:
+                with torch.no_grad():
+                    _model(**inputs)
+            finally:
+                for h in hooks:
+                    h.remove()
+
+            # Concatenate last-token activations from each layer
+            layer_acts = []
+            for li in range(req.layer_start, req.layer_end + 1):
+                if li in captured:
+                    act = captured[li][0, -1, :].cpu().float().numpy()
+                    layer_acts.append(act)
+
+            concat = np.concatenate(layer_acts).astype(np.float32)
+            encoded = base64.b64encode(concat.tobytes()).decode("ascii")
+
+            yield _sse_line({
+                "type": "activations",
+                "index": idx,
+                "shape": list(concat.shape),
+                "dtype": "float32",
+                "data": encoded,
+            })
+
+            await asyncio.sleep(0)
+
+        yield _sse_line({"type": "done", "total": total})
+
+    return StreamingResponse(
+        _generate(), media_type="text/event-stream"
+    )
 
 
 @app.post("/finetune")
