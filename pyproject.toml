@@ -15,6 +15,11 @@ dependencies = [
 
 [project.optional-dependencies]
 upload = ["carbonfiles-client>=0.5.0"]
+finetune = [
+    "peft>=0.14.0",
+    "datasets>=3.0.0",
+    "accelerate>=1.0.0",
+]
 dev = [
     "pytest>=8.0",
     "ruff>=0.4",

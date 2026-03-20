@@ -67,8 +67,12 @@ def test_detect_sabotage_no_issues():
     ranks = [5, 3, 1, 1, 1, 1]
     probs = [0.01, 0.05, 0.4, 0.5, 0.6, 0.7]
     result = detect_sabotage(
-        ranks, probs, final_rank=1, final_prob=0.7,
-        sabotage_threshold=0.5, final_threshold=0.3,
+        ranks,
+        probs,
+        final_rank=1,
+        final_prob=0.7,
+        sabotage_threshold=0.5,
+        final_threshold=0.3,
     )
     assert result.flags == []
     assert result.status == "correct"
@@ -79,8 +83,12 @@ def test_detect_sabotage_wrong_answer():
     ranks = [10, 8, 5, 3, 2, 4]
     probs = [0.01, 0.02, 0.05, 0.1, 0.15, 0.08]
     result = detect_sabotage(
-        ranks, probs, final_rank=4, final_prob=0.08,
-        sabotage_threshold=0.5, final_threshold=0.3,
+        ranks,
+        probs,
+        final_rank=4,
+        final_prob=0.08,
+        sabotage_threshold=0.5,
+        final_threshold=0.3,
     )
     assert "wrong" in [f.split("@")[0] for f in result.flags]
     assert result.status == "wrong"
@@ -91,8 +99,12 @@ def test_detect_sabotage_weak_final():
     ranks = [5, 3, 1, 1, 1, 1]
     probs = [0.01, 0.05, 0.15, 0.18, 0.20, 0.22]
     result = detect_sabotage(
-        ranks, probs, final_rank=1, final_prob=0.22,
-        sabotage_threshold=0.5, final_threshold=0.3,
+        ranks,
+        probs,
+        final_rank=1,
+        final_prob=0.22,
+        sabotage_threshold=0.5,
+        final_threshold=0.3,
     )
     assert "weak_final" in result.flags
     assert result.status == "weak"
@@ -103,12 +115,14 @@ def test_detect_sabotage_rank_drop():
     ranks = [10, 5, 1, 1, 15, 1, 1]
     probs = [0.01, 0.05, 0.44, 0.40, 0.02, 0.36, 0.40]
     result = detect_sabotage(
-        ranks, probs, final_rank=1, final_prob=0.40,
-        sabotage_threshold=0.5, final_threshold=0.3,
+        ranks,
+        probs,
+        final_rank=1,
+        final_prob=0.40,
+        sabotage_threshold=0.5,
+        final_threshold=0.3,
     )
-    rank_flags = [
-        f for f in result.flags if f.startswith("rank_drop")
-    ]
+    rank_flags = [f for f in result.flags if f.startswith("rank_drop")]
     assert len(rank_flags) >= 1
     assert result.status == "sabotaged"
 
@@ -118,12 +132,14 @@ def test_detect_sabotage_prob_drop():
     ranks = [5, 3, 1, 1, 3, 1, 1]
     probs = [0.01, 0.05, 0.44, 0.44, 0.19, 0.36, 0.40]
     result = detect_sabotage(
-        ranks, probs, final_rank=1, final_prob=0.40,
-        sabotage_threshold=0.5, final_threshold=0.3,
+        ranks,
+        probs,
+        final_rank=1,
+        final_prob=0.40,
+        sabotage_threshold=0.5,
+        final_threshold=0.3,
     )
-    prob_flags = [
-        f for f in result.flags if f.startswith("prob_drop")
-    ]
+    prob_flags = [f for f in result.flags if f.startswith("prob_drop")]
     assert len(prob_flags) >= 1
 
 
@@ -132,8 +148,12 @@ def test_detect_sabotage_result_fields():
     ranks = [5, 3, 1, 1, 1, 1]
     probs = [0.01, 0.05, 0.4, 0.5, 0.6, 0.7]
     result = detect_sabotage(
-        ranks, probs, final_rank=1, final_prob=0.7,
-        sabotage_threshold=0.5, final_threshold=0.3,
+        ranks,
+        probs,
+        final_rank=1,
+        final_prob=0.7,
+        sabotage_threshold=0.5,
+        final_threshold=0.3,
     )
     assert hasattr(result, "flags")
     assert hasattr(result, "status")
@@ -170,20 +190,64 @@ def test_prompt_result_fields():
 def test_scan_result_summary():
     results = [
         PromptResult(
-            "p1", "a1", "a1", 0.5, 1, 0.8, 10, 8,
-            [], [], "correct", [], [],
+            "p1",
+            "a1",
+            "a1",
+            0.5,
+            1,
+            0.8,
+            10,
+            8,
+            [],
+            [],
+            "correct",
+            [],
+            [],
         ),
         PromptResult(
-            "p2", "a2", "a2", 0.2, 1, 0.4, 10, 8,
-            [], ["weak_final"], "weak", [], [],
+            "p2",
+            "a2",
+            "a2",
+            0.2,
+            1,
+            0.4,
+            10,
+            8,
+            [],
+            ["weak_final"],
+            "weak",
+            [],
+            [],
         ),
         PromptResult(
-            "p3", "a3", "x", 0.3, 5, 0.1, 10, None,
-            [], ["wrong"], "wrong", [], [],
+            "p3",
+            "a3",
+            "x",
+            0.3,
+            5,
+            0.1,
+            10,
+            None,
+            [],
+            ["wrong"],
+            "wrong",
+            [],
+            [],
         ),
         PromptResult(
-            "p4", "a4", "a4", 0.36, 1, 0.44, 19, 17,
-            [20], ["rank_drop@20"], "sabotaged", [], [],
+            "p4",
+            "a4",
+            "a4",
+            0.36,
+            1,
+            0.44,
+            19,
+            17,
+            [20],
+            ["rank_drop@20"],
+            "sabotaged",
+            [],
+            [],
         ),
     ]
     sr = ScanResult(
@@ -202,20 +266,36 @@ def test_scan_result_summary():
 
 def test_scan_cli_requires_dataset_or_builtin():
     runner = CliRunner()
-    result = runner.invoke(cli, [
-        "scan", "--db", "test.db", "--model", "test-model",
-    ])
+    result = runner.invoke(
+        cli,
+        [
+            "scan",
+            "--db",
+            "test.db",
+            "--model",
+            "test-model",
+        ],
+    )
     assert result.exit_code != 0
     assert (
-        "dataset" in result.output.lower()
-        or "dataset" in str(result.exception).lower()
+        "dataset" in result.output.lower() or "dataset" in str(result.exception).lower()
     )
 
 
 def test_scan_cli_rejects_both_dataset_flags():
     runner = CliRunner()
-    result = runner.invoke(cli, [
-        "scan", "--db", "test.db", "--model", "test-model",
-        "--dataset", "file.json", "--dataset-builtin", "capitals",
-    ])
+    result = runner.invoke(
+        cli,
+        [
+            "scan",
+            "--db",
+            "test.db",
+            "--model",
+            "test-model",
+            "--dataset",
+            "file.json",
+            "--dataset-builtin",
+            "capitals",
+        ],
+    )
     assert result.exit_code != 0

@@ -140,9 +140,7 @@ def test_neuron_profiles_table_created(tmp_path):
     db_path = str(tmp_path / "test.db")
     db = TraceDB(db_path)
     # Table should exist
-    row = db._conn.execute(
-        "SELECT count(*) FROM neuron_profiles"
-    ).fetchone()
+    row = db._conn.execute("SELECT count(*) FROM neuron_profiles").fetchone()
     assert row[0] == 0
     db.close()
 
@@ -168,8 +166,16 @@ def test_neurons_ablate_requires_neurons_or_profile(tmp_path):
     result = runner.invoke(
         cli,
         [
-            "neurons", "--db", db_path, "--model", "nonexistent",
-            "--prompt", "hello", "--layer", "20", "--ablate",
+            "neurons",
+            "--db",
+            db_path,
+            "--model",
+            "nonexistent",
+            "--prompt",
+            "hello",
+            "--layer",
+            "20",
+            "--ablate",
         ],
     )
     assert result.exit_code != 0
@@ -184,9 +190,18 @@ def test_neurons_ablate_from_missing_profile(tmp_path):
     result = runner.invoke(
         cli,
         [
-            "neurons", "--db", db_path, "--model", "nonexistent",
-            "--prompt", "hello", "--layer", "20", "--ablate",
-            "--from-profile", "nonexistent",
+            "neurons",
+            "--db",
+            db_path,
+            "--model",
+            "nonexistent",
+            "--prompt",
+            "hello",
+            "--layer",
+            "20",
+            "--ablate",
+            "--from-profile",
+            "nonexistent",
         ],
     )
     # Should fail at model loading or profile not found
@@ -203,9 +218,11 @@ def test_profile_returns_correct_top_n(tinyllama_model):
     from neurotrace.neurons import profile_neurons
 
     profile = profile_neurons(
-        model, tokenizer,
+        model,
+        tokenizer,
         prompt="The capital of France is",
-        layer=20, top_n=15,
+        layer=20,
+        top_n=15,
     )
     assert len(profile.neuron_indices) == 15
     assert len(profile.target_activations) == 15
@@ -218,9 +235,11 @@ def test_profile_neuron_indices_valid(tinyllama_model):
     from neurotrace.neurons import profile_neurons
 
     profile = profile_neurons(
-        model, tokenizer,
+        model,
+        tokenizer,
         prompt="The capital of France is",
-        layer=20, top_n=10,
+        layer=20,
+        top_n=10,
     )
     # TinyLlama intermediate_size is 5632
     for idx in profile.neuron_indices:
@@ -234,10 +253,12 @@ def test_profile_with_contrast(tinyllama_model):
     from neurotrace.neurons import profile_neurons
 
     profile = profile_neurons(
-        model, tokenizer,
+        model,
+        tokenizer,
         prompt="The capital of Germany is",
         contrast_prompt="The capital of France is",
-        layer=20, top_n=10,
+        layer=20,
+        top_n=10,
     )
     assert profile.contrast_activations is not None
     assert profile.diff_activations is not None
@@ -254,7 +275,8 @@ def test_ablate_zeros_neurons(tinyllama_model):
 
     # Ablate a batch of neurons
     _, results = ablate_neurons(
-        model, tokenizer,
+        model,
+        tokenizer,
         prompt="The capital of Germany is",
         layer=20,
         neuron_groups=[[0, 1, 2, 3, 4]],
@@ -272,9 +294,11 @@ def test_ablate_from_profile(tinyllama_model, tmp_path):
 
     # Create and save profile
     profile = profile_neurons(
-        model, tokenizer,
+        model,
+        tokenizer,
         prompt="The capital of Germany is",
-        layer=20, top_n=5,
+        layer=20,
+        top_n=5,
         label="test-profile",
     )
     db_path = str(tmp_path / "test.db")
@@ -288,7 +312,8 @@ def test_ablate_from_profile(tinyllama_model, tmp_path):
     # Ablate using profile neurons
     neuron_groups = [[n] for n in loaded.neuron_indices[:3]]
     _, results = ablate_neurons(
-        model, tokenizer,
+        model,
+        tokenizer,
         prompt="The capital of Germany is",
         layer=20,
         neuron_groups=neuron_groups,
@@ -304,12 +329,13 @@ def test_ablate_group_size(tinyllama_model):
     from neurotrace.neurons import ablate_neurons
 
     indices = list(range(10))
-    groups = [indices[i:i + 3] for i in range(0, len(indices), 3)]
+    groups = [indices[i : i + 3] for i in range(0, len(indices), 3)]
     # Should be [0,1,2], [3,4,5], [6,7,8], [9]
     assert len(groups) == 4
 
     _, results = ablate_neurons(
-        model, tokenizer,
+        model,
+        tokenizer,
         prompt="The capital of Germany is",
         layer=20,
         neuron_groups=groups,
@@ -327,10 +353,18 @@ def test_neurons_cli_profile_json(tinyllama_model, tmp_path):
     result = runner.invoke(
         cli,
         [
-            "neurons", "--db", db_path,
-            "--model", TINYLLAMA,
-            "--prompt", "The capital of France is",
-            "--layer", "20", "--top-n", "5", "--json",
+            "neurons",
+            "--db",
+            db_path,
+            "--model",
+            TINYLLAMA,
+            "--prompt",
+            "The capital of France is",
+            "--layer",
+            "20",
+            "--top-n",
+            "5",
+            "--json",
         ],
     )
     assert result.exit_code == 0
@@ -347,11 +381,19 @@ def test_neurons_cli_ablate_json(tinyllama_model, tmp_path):
     result = runner.invoke(
         cli,
         [
-            "neurons", "--db", db_path,
-            "--model", TINYLLAMA,
-            "--prompt", "The capital of France is",
-            "--layer", "20", "--ablate",
-            "--neurons", "100,200,300", "--json",
+            "neurons",
+            "--db",
+            db_path,
+            "--model",
+            TINYLLAMA,
+            "--prompt",
+            "The capital of France is",
+            "--layer",
+            "20",
+            "--ablate",
+            "--neurons",
+            "100,200,300",
+            "--json",
         ],
     )
     assert result.exit_code == 0

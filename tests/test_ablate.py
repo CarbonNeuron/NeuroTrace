@@ -1,7 +1,6 @@
 """Tests for the ablation engine."""
 
 import json
-from unittest.mock import MagicMock, patch
 
 import numpy as np
 import pytest
@@ -227,8 +226,13 @@ def test_ablate_requires_intervention(tmp_path):
     result = runner.invoke(
         cli,
         [
-            "ablate", "--db", db_path, "--model", "test",
-            "--prompt", "hello",
+            "ablate",
+            "--db",
+            db_path,
+            "--model",
+            "test",
+            "--prompt",
+            "hello",
         ],
     )
     assert result.exit_code != 0
@@ -236,14 +240,21 @@ def test_ablate_requires_intervention(tmp_path):
 
 
 def test_ablate_zero_mlp_accepted(tmp_path):
-    """CLI should accept --zero-mlp as a valid intervention (fails at model loading, not validation)."""
+    """CLI accepts --zero-mlp (fails at model loading, not validation)."""
     db_path = str(tmp_path / "test.db")
     runner = CliRunner()
     result = runner.invoke(
         cli,
         [
-            "ablate", "--db", db_path, "--model", "nonexistent",
-            "--prompt", "hello", "--zero-mlp", "20",
+            "ablate",
+            "--db",
+            db_path,
+            "--model",
+            "nonexistent",
+            "--prompt",
+            "hello",
+            "--zero-mlp",
+            "20",
         ],
     )
     # Should fail at model loading, not at "At least one intervention"
@@ -257,8 +268,15 @@ def test_ablate_scale_mlp_accepted(tmp_path):
     result = runner.invoke(
         cli,
         [
-            "ablate", "--db", db_path, "--model", "nonexistent",
-            "--prompt", "hello", "--scale-mlp", "20:0.5",
+            "ablate",
+            "--db",
+            db_path,
+            "--model",
+            "nonexistent",
+            "--prompt",
+            "hello",
+            "--scale-mlp",
+            "20:0.5",
         ],
     )
     assert "At least one intervention" not in (result.output or "")
@@ -271,8 +289,17 @@ def test_ablate_conflict_zero_and_scale_mlp(tmp_path):
     result = runner.invoke(
         cli,
         [
-            "ablate", "--db", db_path, "--model", "nonexistent",
-            "--prompt", "hello", "--zero-mlp", "20", "--scale-mlp", "20:0.5",
+            "ablate",
+            "--db",
+            db_path,
+            "--model",
+            "nonexistent",
+            "--prompt",
+            "hello",
+            "--zero-mlp",
+            "20",
+            "--scale-mlp",
+            "20:0.5",
         ],
     )
     assert result.exit_code != 0
@@ -292,9 +319,17 @@ def test_ablate_baseline_resolve(tmp_path):
     result = runner.invoke(
         cli,
         [
-            "ablate", "--db", db_path, "--model", "nonexistent",
-            "--prompt", "hello", "--zero-layers", "0",
-            "--baseline", "baseline",
+            "ablate",
+            "--db",
+            db_path,
+            "--model",
+            "nonexistent",
+            "--prompt",
+            "hello",
+            "--zero-layers",
+            "0",
+            "--baseline",
+            "baseline",
         ],
     )
     # Should fail at model loading, not baseline resolution
@@ -328,7 +363,9 @@ def test_scale_mlp_hooks_registered_and_cleaned(tinyllama_model):
 
     arch = get_architecture(model.config.model_type)
     spec = AblationSpec(
-        zero_layers=[], zero_heads=[], scale_layers=[],
+        zero_layers=[],
+        zero_heads=[],
+        scale_layers=[],
         scale_mlp=[(0, 0.5), (5, 0.3)],
     )
 
@@ -347,7 +384,8 @@ def test_zero_mlp_changes_output(tinyllama_model):
 
     spec = AblationSpec(zero_layers=[], zero_heads=[], scale_layers=[], zero_mlp=[10])
     result = run_ablation(
-        model, tokenizer,
+        model,
+        tokenizer,
         prompt="The capital of France is",
         spec=spec,
         seed=42,
@@ -364,11 +402,14 @@ def test_scale_mlp_changes_output(tinyllama_model):
     from neurotrace.ablate import run_ablation
 
     spec = AblationSpec(
-        zero_layers=[], zero_heads=[], scale_layers=[],
+        zero_layers=[],
+        zero_heads=[],
+        scale_layers=[],
         scale_mlp=[(10, 0.1)],
     )
     result = run_ablation(
-        model, tokenizer,
+        model,
+        tokenizer,
         prompt="The capital of France is",
         spec=spec,
         seed=42,
@@ -402,7 +443,8 @@ def test_zero_layer_changes_output(tinyllama_model):
 
     spec = AblationSpec(zero_layers=[10], zero_heads=[], scale_layers=[])
     result = run_ablation(
-        model, tokenizer,
+        model,
+        tokenizer,
         prompt="The capital of France is",
         spec=spec,
         seed=42,
@@ -420,7 +462,8 @@ def test_scale_identity_same_output(tinyllama_model):
 
     spec = AblationSpec(zero_layers=[], zero_heads=[], scale_layers=[(10, 1.0)])
     result = run_ablation(
-        model, tokenizer,
+        model,
+        tokenizer,
         prompt="The capital of France is",
         spec=spec,
         seed=42,
@@ -441,16 +484,14 @@ def test_zero_head_changes_output(tinyllama_model):
 
     spec = AblationSpec(zero_layers=[], zero_heads=[(10, 0), (10, 1)], scale_layers=[])
     result = run_ablation(
-        model, tokenizer,
+        model,
+        tokenizer,
         prompt="The capital of France is",
         spec=spec,
         seed=42,
     )
     # Should see some difference in cosine similarity at/after layer 10
-    post_intervention = [
-        lc for lc in result.layer_comparisons
-        if lc.layer_index >= 10
-    ]
+    post_intervention = [lc for lc in result.layer_comparisons if lc.layer_index >= 10]
     has_change = any(lc.cosine_similarity < 0.9999 for lc in post_intervention)
     assert has_change
 
@@ -465,7 +506,8 @@ def test_ablated_trace_stored_with_interventions(tinyllama_model, tmp_path):
     spec = AblationSpec(zero_layers=[5], zero_heads=[], scale_layers=[])
 
     result = run_ablation(
-        model, tokenizer,
+        model,
+        tokenizer,
         prompt="Hello",
         spec=spec,
         seed=42,

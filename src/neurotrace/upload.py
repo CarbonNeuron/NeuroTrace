@@ -13,8 +13,7 @@ def upload_report(html_path: str, bucket_id: str | None = None) -> str:
         from carbonfiles import CarbonFiles
     except ImportError:
         raise click.ClickException(
-            "Upload requires the CarbonFiles SDK: "
-            "pip install 'neurotrace[upload]'"
+            "Upload requires the CarbonFiles SDK: pip install 'neurotrace[upload]'"
         )
 
     cf_url = os.environ.get("CF_URL")
@@ -28,9 +27,7 @@ def upload_report(html_path: str, bucket_id: str | None = None) -> str:
     cf = CarbonFiles(base_url=cf_url, api_key=cf_api_key)
 
     if bucket_id is None:
-        bucket = cf.buckets.create(
-            name="neurotrace-report", expires="7d"
-        )
+        bucket = cf.buckets.create(name="neurotrace-report", expires="7d")
         bucket_id = bucket.id
 
     cf.buckets[bucket_id].files.upload(html_path)

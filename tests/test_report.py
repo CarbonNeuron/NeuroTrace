@@ -1,7 +1,6 @@
 """Tests for HTML report generation."""
 
 import numpy as np
-import pytest
 from click.testing import CliRunner
 
 from neurotrace.cli import cli
@@ -211,9 +210,16 @@ def test_generate_comparison_report():
     token_lookup = {42: "the", 43: "a"}
 
     html = generate_comparison_report(
-        trace_a, trace_b, stats_a, stats_b,
-        preds_a, preds_b, tracks_a, tracks_b,
-        diff_result, token_lookup,
+        trace_a,
+        trace_b,
+        stats_a,
+        stats_b,
+        preds_a,
+        preds_b,
+        tracks_a,
+        tracks_b,
+        diff_result,
+        token_lookup,
     )
 
     assert "<!DOCTYPE html>" in html
@@ -284,9 +290,14 @@ def test_report_cli_single_trace(tmp_path):
     result = runner.invoke(
         cli,
         [
-            "report", "--db", db_path,
-            "--trace-id", "my-trace",
-            "-o", output, "--no-attention",
+            "report",
+            "--db",
+            db_path,
+            "--trace-id",
+            "my-trace",
+            "-o",
+            output,
+            "--no-attention",
         ],
     )
     assert result.exit_code == 0, result.output
@@ -308,9 +319,16 @@ def test_report_cli_comparison(tmp_path):
     result = runner.invoke(
         cli,
         [
-            "report", "--db", db_path,
-            "--trace-a", "trace-a", "--trace-b", "trace-b",
-            "-o", output, "--no-attention",
+            "report",
+            "--db",
+            db_path,
+            "--trace-a",
+            "trace-a",
+            "--trace-b",
+            "trace-b",
+            "-o",
+            output,
+            "--no-attention",
         ],
     )
     assert result.exit_code == 0, result.output
@@ -334,15 +352,21 @@ def test_report_cli_validation_errors(tmp_path):
     result = runner.invoke(
         cli,
         [
-            "report", "--db", db_path,
-            "--trace-id", "v-trace", "--trace-a", "v-trace",
+            "report",
+            "--db",
+            db_path,
+            "--trace-id",
+            "v-trace",
+            "--trace-a",
+            "v-trace",
         ],
     )
     assert result.exit_code != 0
 
     # Only --trace-a without --trace-b
     result = runner.invoke(
-        cli, ["report", "--db", db_path, "--trace-a", "v-trace"],
+        cli,
+        ["report", "--db", db_path, "--trace-a", "v-trace"],
     )
     assert result.exit_code != 0
 
@@ -359,9 +383,15 @@ def test_report_cli_open_flag(tmp_path):
     result = runner.invoke(
         cli,
         [
-            "report", "--db", db_path,
-            "--trace-id", "open-trace",
-            "-o", output, "--no-attention", "--open",
+            "report",
+            "--db",
+            db_path,
+            "--trace-id",
+            "open-trace",
+            "-o",
+            output,
+            "--no-attention",
+            "--open",
         ],
     )
     assert result.exit_code == 0

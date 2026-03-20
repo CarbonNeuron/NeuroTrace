@@ -9,6 +9,7 @@ from neurotrace.hooks import HookManager
 from neurotrace.models import (
     count_parameters,
     get_architecture,
+    get_lm_head_and_norm,
     get_model_revision,
 )
 from neurotrace.types import (
@@ -144,11 +145,7 @@ class Tracer:
         num_layers = self._model.config.num_hidden_layers
         snapshots = []
 
-        lm_head = self._model.lm_head
-        # Get the final layer norm if it exists
-        final_ln = None
-        if hasattr(self._model, "model") and hasattr(self._model.model, "norm"):
-            final_ln = self._model.model.norm
+        lm_head, final_ln = get_lm_head_and_norm(self._model)
 
         for i in range(num_layers):
             residual_data = captured.get((i, "residual"), {})

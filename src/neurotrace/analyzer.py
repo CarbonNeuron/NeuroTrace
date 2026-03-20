@@ -122,8 +122,7 @@ def compute_diff(
         ):
             num_heads = snap_a.attention_weights.shape[0]
             same_shape = (
-                snap_a.attention_weights.shape
-                == snap_b.attention_weights.shape
+                snap_a.attention_weights.shape == snap_b.attention_weights.shape
             )
             for h in range(num_heads):
                 if same_shape:
@@ -132,9 +131,7 @@ def compute_diff(
                     js = _js_divergence(a_head, b_head)
                 else:
                     js = 0.0
-                all_head_divergences.append(
-                    (snap_a.layer_index, h, js)
-                )
+                all_head_divergences.append((snap_a.layer_index, h, js))
 
     # Top critical heads by JS divergence
     all_head_divergences.sort(key=lambda x: x[2], reverse=True)

@@ -17,6 +17,10 @@ Reference document for AI agents writing prompts against this codebase.
 │   ├── storage.py           # DuckDB read/write/query
 │   ├── analyzer.py          # trace diff / divergence detection
 │   ├── ablate.py            # ablation engine (zero/scale interventions)
+│   ├── scan.py              # automated sabotage detection across datasets
+│   ├── datasets.py          # built-in evaluation datasets
+│   ├── neurons.py           # neuron-level MLP attribution (profile/ablate)
+│   ├── finetune.py          # LoRA fine-tuning engine
 │   ├── report.py            # self-contained HTML report generation
 │   ├── upload.py            # CarbonFiles upload
 │   └── cli.py               # Click CLI (all commands)
@@ -31,6 +35,9 @@ Reference document for AI agents writing prompts against this codebase.
 │   ├── test_ablate.py
 │   ├── test_report.py
 │   ├── test_upload.py
+│   ├── test_scan.py
+│   ├── test_neurons.py
+│   ├── test_finetune.py
 │   └── test_cli.py
 ├── .gitignore
 ├── Makefile
@@ -127,6 +134,8 @@ def get_architecture(model_type: str) -> ModelArchitecture
 def load_model(model_name: str, device: str = "cpu", dtype: torch.dtype = torch.float32) -> tuple[torch.nn.Module, AutoTokenizer]
 def get_model_revision(model_name: str) -> str
 def count_parameters(model: torch.nn.Module) -> int
+def get_lm_head_and_norm(model: torch.nn.Module) -> tuple[torch.nn.Module, torch.nn.Module | None]
+def get_final_prediction(token_predictions: list) -> tuple[str, float]
 ```
 
 **Key details:**
@@ -134,6 +143,8 @@ def count_parameters(model: torch.nn.Module) -> int
 - Only `"llama"` architecture is registered. Layer container is `model.model.layers`.
 - Llama attention module: `self_attn`. MLP module: `mlp`. Layer norms: `input_layernorm`, `post_attention_layernorm`.
 - Architecture detection uses `model.config.model_type` (e.g. TinyLlama reports `"llama"`).
+- `get_lm_head_and_norm()` extracts `model.lm_head` and `model.model.norm` — shared utility used by tracer, ablate, scan, and CLI.
+- `get_final_prediction()` gets the last-position top-1 prediction from token predictions — shared by ablate and neurons modules.
 
 ---
 

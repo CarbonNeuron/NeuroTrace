@@ -8,7 +8,12 @@ from dataclasses import dataclass
 import numpy as np
 import torch
 
-from neurotrace.models import ModelArchitecture, get_architecture
+from neurotrace.models import (
+    ModelArchitecture,
+    get_architecture,
+    get_final_prediction,
+    get_lm_head_and_norm,
+)
 from neurotrace.tracer import Tracer
 from neurotrace.types import TraceResult
 
@@ -30,13 +35,15 @@ class AblationSpec:
             self.scale_mlp = []
 
     def to_json(self) -> str:
-        return json.dumps({
-            "zero_layers": self.zero_layers,
-            "zero_heads": [[l, h] for l, h in self.zero_heads],
-            "scale_layers": [[l, f] for l, f in self.scale_layers],
-            "zero_mlp": self.zero_mlp,
-            "scale_mlp": [[ly, f] for ly, f in self.scale_mlp],
-        })
+        return json.dumps(
+            {
+                "zero_layers": self.zero_layers,
+                "zero_heads": [[ly, h] for ly, h in self.zero_heads],
+                "scale_layers": [[ly, f] for ly, f in self.scale_layers],
+                "zero_mlp": self.zero_mlp,
+                "scale_mlp": [[ly, f] for ly, f in self.scale_mlp],
+            }
+        )
 
     def describe(self) -> str:
         parts = []
@@ -44,20 +51,17 @@ class AblationSpec:
             parts.append(f"zero-layers={','.join(map(str, self.zero_layers))}")
         if self.zero_heads:
             parts.append(
-                "zero-heads="
-                + ",".join(f"{l}:{h}" for l, h in self.zero_heads)
+                "zero-heads=" + ",".join(f"{ly}:{h}" for ly, h in self.zero_heads)
             )
         if self.scale_layers:
             parts.append(
-                "scale-layers="
-                + ",".join(f"{l}:{f}" for l, f in self.scale_layers)
+                "scale-layers=" + ",".join(f"{ly}:{f}" for ly, f in self.scale_layers)
             )
         if self.zero_mlp:
             parts.append(f"zero-mlp={','.join(map(str, self.zero_mlp))}")
         if self.scale_mlp:
             parts.append(
-                "scale-mlp="
-                + ",".join(f"{ly}:{f}" for ly, f in self.scale_mlp)
+                "scale-mlp=" + ",".join(f"{ly}:{f}" for ly, f in self.scale_mlp)
             )
         return "; ".join(parts)
 
@@ -130,7 +134,7 @@ class AblationHookManager:
         self._model = model
         self._arch = architecture
         self._spec = spec
-        self._handles: list[torch.utils.hooks.RemovableHook] = []
+        self._handles: list[torch.utils.hooks.RemovableHandle] = []
         self._register_hooks()
 
     def _register_hooks(self) -> None:
@@ -149,9 +153,7 @@ class AblationHookManager:
             # Full layer zeroing or scaling
             if i in zero_layer_set or i in scale_layer_map:
                 factor = 0.0 if i in zero_layer_set else scale_layer_map.get(i, 1.0)
-                handle = layer.register_forward_hook(
-                    self._make_layer_hook(factor)
-                )
+                handle = layer.register_forward_hook(self._make_layer_hook(factor))
                 self._handles.append(handle)
 
             # Per-head zeroing
@@ -184,10 +186,11 @@ class AblationHookManager:
         We need to scale the hidden_states (first element) which represents
         the layer's contribution to the residual stream.
         """
+
         def hook(module, input, output):
             if isinstance(output, tuple):
                 inp = input[0] if isinstance(input, tuple) else input
-                # Scale the difference (layer contribution) rather than the absolute output
+                # Scale the layer contribution, not the absolute output
                 # layer_output = residual_input + layer_contribution
                 # We want: residual_input + factor * layer_contribution
                 contribution = output[0] - inp
@@ -205,6 +208,7 @@ class AblationHookManager:
         We reshape to (batch, seq_len, num_heads, head_dim), zero targeted
         heads, then reshape back.
         """
+
         def hook(module, input, output):
             attn_output = output[0]  # (batch, seq_len, hidden_size)
             num_heads = module.config.num_attention_heads
@@ -227,6 +231,7 @@ class AblationHookManager:
     @staticmethod
     def _make_mlp_zero_hook():
         """Hook that zeros the MLP sublayer output."""
+
         def hook(module, input, output):
             if isinstance(output, tuple):
                 return (torch.zeros_like(output[0]),) + output[1:]
@@ -237,6 +242,7 @@ class AblationHookManager:
     @staticmethod
     def _make_mlp_scale_hook(factor: float):
         """Hook that scales the MLP sublayer output."""
+
         def hook(module, input, output):
             if isinstance(output, tuple):
                 return (output[0] * factor,) + output[1:]
@@ -272,7 +278,8 @@ def run_ablation(
     # Run baseline if needed
     tracer = Tracer(model, tokenizer)
     if baseline is None:
-        baseline = tracer.trace(prompt, label=f"{label}-baseline" if label else None, seed=seed)
+        baseline_label = f"{label}-baseline" if label else None
+        baseline = tracer.trace(prompt, label=baseline_label, seed=seed)
 
     # Run ablated trace with intervention hooks
     # We need to do the trace manually with our ablation hooks active
@@ -282,8 +289,8 @@ def run_ablation(
     layer_comparisons = _compare_traces(baseline, ablated, model, tokenizer)
 
     # Final predictions
-    b_token, b_prob = _get_final_prediction(baseline)
-    a_token, a_prob = _get_final_prediction(ablated)
+    b_token, b_prob = get_final_prediction(baseline.token_predictions)
+    a_token, a_prob = get_final_prediction(ablated.token_predictions)
 
     return AblationResult(
         baseline_trace=baseline,
@@ -316,15 +323,6 @@ def _run_ablated_trace(
     return result
 
 
-def _get_final_prediction(trace: TraceResult) -> tuple[str, float]:
-    """Get the final (last position) top-1 prediction."""
-    if trace.token_predictions:
-        last = trace.token_predictions[-1]
-        if last.top_k_strings:
-            return last.top_k_strings[0], last.top_k_probs[0]
-    return "", 0.0
-
-
 def _compare_traces(
     baseline: TraceResult,
     ablated: TraceResult,
@@ -334,14 +332,9 @@ def _compare_traces(
     """Compare per-layer predictions and residual cosine similarity."""
     comparisons = []
 
-    lm_head = model.lm_head
-    final_ln = None
-    if hasattr(model, "model") and hasattr(model.model, "norm"):
-        final_ln = model.model.norm
+    lm_head, final_ln = get_lm_head_and_norm(model)
 
-    for snap_b, snap_a in zip(
-        baseline.layer_snapshots, ablated.layer_snapshots
-    ):
+    for snap_b, snap_a in zip(baseline.layer_snapshots, ablated.layer_snapshots):
         # Cosine similarity of residual streams
         cos_sim = 1.0
         if snap_b.residual_out is not None and snap_a.residual_out is not None:
@@ -356,15 +349,17 @@ def _compare_traces(
         b_tok, b_prob = _project_top1(snap_b.residual_out, lm_head, final_ln, tokenizer)
         a_tok, a_prob = _project_top1(snap_a.residual_out, lm_head, final_ln, tokenizer)
 
-        comparisons.append(LayerComparison(
-            layer_index=snap_b.layer_index,
-            baseline_top1=b_tok,
-            baseline_top1_prob=b_prob,
-            ablated_top1=a_tok,
-            ablated_top1_prob=a_prob,
-            cosine_similarity=cos_sim,
-            changed=b_tok != a_tok,
-        ))
+        comparisons.append(
+            LayerComparison(
+                layer_index=snap_b.layer_index,
+                baseline_top1=b_tok,
+                baseline_top1_prob=b_prob,
+                ablated_top1=a_tok,
+                ablated_top1_prob=a_prob,
+                cosine_similarity=cos_sim,
+                changed=b_tok != a_tok,
+            )
+        )
 
     return comparisons
 

@@ -18,6 +18,15 @@ def _resolve_trace_id(db: TraceDB, trace_id: str) -> str:
     return db.resolve_trace_id(trace_id)
 
 
+def _maybe_load_adapter(model, adapter_path: str | None):
+    """Load and merge a LoRA adapter if path is provided."""
+    if adapter_path is None:
+        return model
+    from neurotrace.finetune import load_adapter
+
+    return load_adapter(model, adapter_path)
+
+
 @click.group()
 def cli() -> None:
     """NeuroTrace: interpretability toolkit for tracing transformer inference."""
@@ -42,7 +51,18 @@ def cli() -> None:
     help="Capture mode.",
 )
 @click.option("--layer-stride", default=1, type=int, help="Layer stride for capture.")
-def trace(model, prompt, prompts_file, db, label, seed, capture_mode, layer_stride):
+@click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+def trace(
+    model,
+    prompt,
+    prompts_file,
+    db,
+    label,
+    seed,
+    capture_mode,
+    layer_stride,
+    adapter,
+):
     """Run a forward-pass trace and store results."""
     if prompt is None and prompts_file is None:
         raise click.UsageError("Must provide either --prompt or --prompts-file.")
@@ -66,6 +86,7 @@ def trace(model, prompt, prompts_file, db, label, seed, capture_mode, layer_stri
         from neurotrace.tracer import Tracer
 
         model_obj, tokenizer = load_model(model)
+        model_obj = _maybe_load_adapter(model_obj, adapter)
         progress.update(task, description="Model loaded.")
 
         tracer = Tracer(
@@ -382,18 +403,15 @@ def diff(
 @cli.command()
 @click.option("--db", required=True, help="Path to DuckDB database file.")
 @click.option("--trace-id", required=True, help="Trace ID, label, or 'latest'.")
-@click.option(
-    "--top-k", default=5, type=int, help="Top predictions per layer."
-)
+@click.option("--top-k", default=5, type=int, help="Top predictions per layer.")
 @click.option(
     "--changes-only", is_flag=True, help="Only show layers where top-1 changed."
 )
 @click.option("--layers", default=None, help="Comma-separated layer indices to show.")
-@click.option(
-    "--track", default=None, help="Token string to track across all layers."
-)
+@click.option("--track", default=None, help="Token string to track across all layers.")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
-def predict(db, trace_id, top_k, changes_only, layers, track, output_json):
+@click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+def predict(db, trace_id, top_k, changes_only, layers, track, output_json, adapter):
     """Show top-K token predictions at every layer from a stored trace."""
     import torch
 
@@ -433,12 +451,12 @@ def predict(db, trace_id, top_k, changes_only, layers, track, output_json):
         from neurotrace.models import load_model
 
         model_obj, tokenizer = load_model(model_name)
+        model_obj = _maybe_load_adapter(model_obj, adapter)
         progress.update(task, description="Projecting layers...")
 
-    lm_head = model_obj.lm_head
-    final_ln = None
-    if hasattr(model_obj, "model") and hasattr(model_obj.model, "norm"):
-        final_ln = model_obj.model.norm
+    from neurotrace.models import get_lm_head_and_norm
+
+    lm_head, final_ln = get_lm_head_and_norm(model_obj)
 
     # Resolve --track token to ID
     track_token_id = None
@@ -469,9 +487,9 @@ def predict(db, trace_id, top_k, changes_only, layers, track, output_json):
             continue
 
         with torch.no_grad():
-            res_tensor = torch.tensor(
-                snap.residual_out, dtype=torch.float32
-            ).unsqueeze(0)
+            res_tensor = torch.tensor(snap.residual_out, dtype=torch.float32).unsqueeze(
+                0
+            )
             if final_ln is not None:
                 res_tensor = final_ln(res_tensor)
             layer_logits = lm_head(res_tensor.squeeze(0))
@@ -524,9 +542,7 @@ def predict(db, trace_id, top_k, changes_only, layers, track, output_json):
 
         # For --changes-only: skip if top-1 didn't change
         if changes_only and prev_ranking:
-            prev_top1 = next(
-                (tid for tid, r in prev_ranking.items() if r == 0), None
-            )
+            prev_top1 = next((tid for tid, r in prev_ranking.items() if r == 0), None)
             if prev_top1 == topk_ids[0]:
                 # Update prev_ranking but skip display
                 prev_ranking = current_ranking
@@ -546,16 +562,16 @@ def predict(db, trace_id, top_k, changes_only, layers, track, output_json):
 
     for entry in layer_predictions:
         console.print(f"\n[bold]Layer {entry['layer_index']}[/bold] " + "-" * 50)
-        for rank, (tid, prob, s, ann) in enumerate(zip(
-            entry["top_k_ids"],
-            entry["top_k_probs"],
-            entry["top_k_strings"],
-            entry["annotations"],
-        )):
-            ann_str = f"  [dim]{ann}[/dim]" if ann else ""
-            console.print(
-                f"  {rank + 1}. {repr(s):20s} ({prob:.3f}){ann_str}"
+        for rank, (tid, prob, s, ann) in enumerate(
+            zip(
+                entry["top_k_ids"],
+                entry["top_k_probs"],
+                entry["top_k_strings"],
+                entry["annotations"],
             )
+        ):
+            ann_str = f"  [dim]{ann}[/dim]" if ann else ""
+            console.print(f"  {rank + 1}. {repr(s):20s} ({prob:.3f}){ann_str}")
         if entry["track"] is not None:
             t = entry["track"]
             console.print(
@@ -583,20 +599,20 @@ def _decode_tokens(tokenizer, token_ids: list[int]) -> list[dict]:
         raw_token = tokenizer.convert_ids_to_tokens(tid)
         token_bytes = decoded.encode("utf-8")
         hex_bytes = " ".join(f"{b:02x}" for b in token_bytes)
-        results.append({
-            "token_id": tid,
-            "string": decoded,
-            "raw_token": raw_token,
-            "hex_bytes": hex_bytes,
-            "is_special": tid in special_ids,
-        })
+        results.append(
+            {
+                "token_id": tid,
+                "string": decoded,
+                "raw_token": raw_token,
+                "hex_bytes": hex_bytes,
+                "is_special": tid in special_ids,
+            }
+        )
     return results
 
 
 @cli.command()
-@click.option(
-    "--model", required=True, help="HuggingFace model name or path."
-)
+@click.option("--model", required=True, help="HuggingFace model name or path.")
 @click.option(
     "--tokens",
     default=None,
@@ -613,9 +629,7 @@ def _decode_tokens(tokenizer, token_ids: list[int]) -> list[dict]:
 def decode(model, tokens, from_trace, db):
     """Decode token IDs to human-readable strings."""
     if not tokens and from_trace is None:
-        raise click.UsageError(
-            "Must provide --tokens or --from-trace."
-        )
+        raise click.UsageError("Must provide --tokens or --from-trace.")
     if from_trace is not None and db is None:
         raise click.UsageError("--from-trace requires --db.")
 
@@ -664,26 +678,25 @@ def decode(model, tokens, from_trace, db):
 
 
 @cli.command()
-@click.option(
-    "--model", required=True, help="HuggingFace model name or path."
-)
+@click.option("--model", required=True, help="HuggingFace model name or path.")
 @click.option("--prompt-a", required=True, help="First prompt.")
 @click.option("--prompt-b", required=True, help="Second prompt.")
 @click.option("--db", required=True, help="Path to DuckDB database file.")
 @click.option("--seed", default=42, type=int, help="Random seed.")
 @click.option("--light", is_flag=True, help="Use light capture mode.")
-@click.option(
-    "--flagged-only", is_flag=True, help="Show only flagged layers."
-)
-@click.option(
-    "--head-detail", is_flag=True, help="Show critical head details."
-)
-@click.option(
-    "--json", "output_json", is_flag=True, help="Output as JSON."
-)
+@click.option("--flagged-only", is_flag=True, help="Show only flagged layers.")
+@click.option("--head-detail", is_flag=True, help="Show critical head details.")
+@click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
 def compare(
-    model, prompt_a, prompt_b, db, seed, light, flagged_only,
-    head_detail, output_json,
+    model,
+    prompt_a,
+    prompt_b,
+    db,
+    seed,
+    light,
+    flagged_only,
+    head_detail,
+    output_json,
 ):
     """Trace two prompts, diff them, and show decoded results."""
     from neurotrace.analyzer import compute_diff
@@ -698,12 +711,13 @@ def compare(
     def find_or_trace(prompt, tracer_obj, tokenizer_obj):
         """Return trace_id, reusing existing trace if possible."""
         existing = db_conn.find_existing_trace(
-            model, prompt, seed, capture_mode,
+            model,
+            prompt,
+            seed,
+            capture_mode,
         )
         if existing is not None:
-            status_console.print(
-                f"[dim]Reusing existing trace {existing[:8]}[/dim]"
-            )
+            status_console.print(f"[dim]Reusing existing trace {existing[:8]}[/dim]")
             return existing
 
         label = _slugify(prompt)
@@ -725,7 +739,9 @@ def compare(
         progress.update(task, description="Model loaded.")
 
         tracer = Tracer(
-            model_obj, tokenizer, capture_mode=capture_mode,
+            model_obj,
+            tokenizer,
+            capture_mode=capture_mode,
         )
 
         progress.update(task, description="Tracing prompt A...")
@@ -759,9 +775,7 @@ def compare(
             "prompt_a": prompt_a,
             "prompt_b": prompt_b,
             "first_divergence_layer": diff_result.first_divergence_layer,
-            "token_legend": {
-                str(k): v for k, v in token_lookup.items()
-            },
+            "token_legend": {str(k): v for k, v in token_lookup.items()},
             "layer_metrics": [
                 {
                     "layer_index": m.layer_index,
@@ -770,14 +784,10 @@ def compare(
                     "kl_divergence": m.kl_divergence,
                     "flagged": m.flagged,
                     "trace_a_top1": m.trace_a_top1,
-                    "trace_a_top1_str": token_lookup.get(
-                        m.trace_a_top1, "?"
-                    ),
+                    "trace_a_top1_str": token_lookup.get(m.trace_a_top1, "?"),
                     "trace_a_top1_prob": m.trace_a_top1_prob,
                     "trace_b_top1": m.trace_b_top1,
-                    "trace_b_top1_str": token_lookup.get(
-                        m.trace_b_top1, "?"
-                    ),
+                    "trace_b_top1_str": token_lookup.get(m.trace_b_top1, "?"),
                     "trace_b_top1_prob": m.trace_b_top1_prob,
                 }
                 for m in diff_result.layer_metrics
@@ -795,9 +805,7 @@ def compare(
     if flagged_only:
         metrics = [m for m in metrics if m.flagged]
 
-    table = Table(
-        title=f"Compare: {trace_a_id[:8]} vs {trace_b_id[:8]}"
-    )
+    table = Table(title=f"Compare: {trace_a_id[:8]} vs {trace_b_id[:8]}")
     table.add_column("Layer", justify="right")
     table.add_column("Cos Sim", justify="right")
     table.add_column("Top-1 Changed")
@@ -824,31 +832,24 @@ def compare(
     console.print(table)
 
     # Summary
-    flagged_count = sum(
-        1 for m in diff_result.layer_metrics if m.flagged
-    )
+    flagged_count = sum(1 for m in diff_result.layer_metrics if m.flagged)
     console.print(
         f"\n[bold]Flagged layers:[/bold] "
         f"{flagged_count}/{len(diff_result.layer_metrics)}"
     )
     if diff_result.first_divergence_layer is not None:
         console.print(
-            f"[bold]First divergence:[/bold]"
-            f" layer {diff_result.first_divergence_layer}"
+            f"[bold]First divergence:[/bold] layer {diff_result.first_divergence_layer}"
         )
 
     if head_detail and diff_result.critical_heads:
-        console.print(
-            "\n[bold]Critical Heads (top JS divergence):[/bold]"
-        )
+        console.print("\n[bold]Critical Heads (top JS divergence):[/bold]")
         head_table = Table()
         head_table.add_column("Layer", justify="right")
         head_table.add_column("Head", justify="right")
         head_table.add_column("JS Divergence", justify="right")
         for layer_idx, head_idx, js_div in diff_result.critical_heads:
-            head_table.add_row(
-                str(layer_idx), str(head_idx), f"{js_div:.6f}"
-            )
+            head_table.add_row(str(layer_idx), str(head_idx), f"{js_div:.6f}")
         console.print(head_table)
 
     # Token legend
@@ -866,34 +867,51 @@ def compare(
 @click.option("--model", required=True, help="HuggingFace model name or path.")
 @click.option("--prompt", required=True, help="Prompt text to trace.")
 @click.option(
-    "--zero-layers", default=None,
+    "--zero-layers",
+    default=None,
     help="Zero entire layer outputs. E.g. '20' or '20,21'.",
 )
 @click.option(
-    "--zero-heads", default=None,
+    "--zero-heads",
+    default=None,
     help="Zero specific attention heads. E.g. '20:7,20:12'.",
 )
 @click.option(
-    "--scale-layer", default=None,
+    "--scale-layer",
+    default=None,
     help="Scale layer contributions. E.g. '20:0.5,21:2.0'.",
 )
 @click.option(
-    "--zero-mlp", default=None,
+    "--zero-mlp",
+    default=None,
     help="Zero MLP sublayer outputs. E.g. '20' or '20,21'.",
 )
 @click.option(
-    "--scale-mlp", default=None,
+    "--scale-mlp",
+    default=None,
     help="Scale MLP sublayer outputs. E.g. '20:0.5' or '20:0.3,21:0.7'.",
 )
 @click.option(
-    "--baseline", default=None,
+    "--baseline",
+    default=None,
     help="Baseline trace ID, label, or prefix. If omitted, runs a clean trace.",
 )
 @click.option("--label", default=None, help="Label for the ablated trace.")
 @click.option("--seed", default=42, type=int, help="Random seed.")
+@click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
 def ablate(
-    db, model, prompt, zero_layers, zero_heads, scale_layer,
-    zero_mlp, scale_mlp, baseline, label, seed,
+    db,
+    model,
+    prompt,
+    zero_layers,
+    zero_heads,
+    scale_layer,
+    zero_mlp,
+    scale_mlp,
+    baseline,
+    label,
+    seed,
+    adapter,
 ):
     """Run inference with targeted components disabled and compare to baseline."""
     from neurotrace.ablate import (
@@ -928,8 +946,11 @@ def ablate(
         )
 
     spec = AblationSpec(
-        zero_layers=zl, zero_heads=zh, scale_layers=sl,
-        zero_mlp=zm, scale_mlp=sm,
+        zero_layers=zl,
+        zero_heads=zh,
+        scale_layers=sl,
+        zero_mlp=zm,
+        scale_mlp=sm,
     )
 
     with Progress(
@@ -941,6 +962,7 @@ def ablate(
         from neurotrace.models import load_model
 
         model_obj, tokenizer = load_model(model)
+        model_obj = _maybe_load_adapter(model_obj, adapter)
         progress.update(task, description="Model loaded.")
 
         # Load baseline if provided
@@ -960,8 +982,13 @@ def ablate(
 
         progress.update(task, description="Running ablation...")
         result = run_ablation(
-            model_obj, tokenizer, prompt, spec,
-            baseline=baseline_trace, label=label, seed=seed,
+            model_obj,
+            tokenizer,
+            prompt,
+            spec,
+            baseline=baseline_trace,
+            label=label,
+            seed=seed,
         )
         progress.update(task, description="Storing traces...")
 
@@ -969,13 +996,15 @@ def ablate(
         if baseline is None:
             db_conn.write_trace(result.baseline_trace)
             console.print(
-                f"[green]Baseline stored: {result.baseline_trace.metadata.trace_id[:8]}[/green]"
+                f"[green]Baseline stored:"
+                f" {result.baseline_trace.metadata.trace_id[:8]}[/green]"
             )
 
         # Store ablated trace with interventions metadata
         db_conn.write_trace(result.ablated_trace, interventions=spec.to_json())
         console.print(
-            f"[green]Ablated stored: {result.ablated_trace.metadata.trace_id[:8]}[/green]"
+            f"[green]Ablated stored:"
+            f" {result.ablated_trace.metadata.trace_id[:8]}[/green]"
         )
         db_conn.close()
 
@@ -1004,10 +1033,10 @@ def ablate(
         # Mark intervened layers
         is_intervened = (
             lc.layer_index in spec.zero_layers
-            or any(l == lc.layer_index for l, _ in spec.zero_heads)
-            or any(l == lc.layer_index for l, _ in spec.scale_layers)
+            or any(ly == lc.layer_index for ly, _ in spec.zero_heads)
+            or any(ly == lc.layer_index for ly, _ in spec.scale_layers)
             or lc.layer_index in spec.zero_mlp
-            or any(l == lc.layer_index for l, _ in spec.scale_mlp)
+            or any(ly == lc.layer_index for ly, _ in spec.scale_mlp)
         )
         if is_intervened and lc.changed:
             marker += " \u2190"
@@ -1042,9 +1071,7 @@ def _compute_layer_predictions(
     """
     import torch
 
-    has_residuals = any(
-        s.residual_out is not None for s in result.layer_snapshots
-    )
+    has_residuals = any(s.residual_out is not None for s in result.layer_snapshots)
     if not has_residuals:
         return None, None
 
@@ -1054,10 +1081,9 @@ def _compute_layer_predictions(
         model_obj, tokenizer = load_model(result.metadata.model_name)
     except (OSError, ValueError):
         return None, None
-    lm_head = model_obj.lm_head
-    final_ln = None
-    if hasattr(model_obj, "model") and hasattr(model_obj.model, "norm"):
-        final_ln = model_obj.model.norm
+    from neurotrace.models import get_lm_head_and_norm
+
+    lm_head, final_ln = get_lm_head_and_norm(model_obj)
 
     layer_preds = []
     prev_ranking: dict[int, int] = {}
@@ -1069,9 +1095,7 @@ def _compute_layer_predictions(
             continue
 
         with torch.no_grad():
-            res = torch.tensor(
-                snap.residual_out, dtype=torch.float32
-            ).unsqueeze(0)
+            res = torch.tensor(snap.residual_out, dtype=torch.float32).unsqueeze(0)
             if final_ln is not None:
                 res = final_ln(res)
             logits = lm_head(res.squeeze(0))
@@ -1096,13 +1120,15 @@ def _compute_layer_predictions(
             else:
                 annotations.append(f"v #{prev_ranking[tid] + 1}")
 
-        layer_preds.append({
-            "layer_index": snap.layer_index,
-            "top_k_ids": topk_ids,
-            "top_k_probs": topk_probs,
-            "top_k_strings": topk_strings,
-            "annotations": annotations,
-        })
+        layer_preds.append(
+            {
+                "layer_index": snap.layer_index,
+                "top_k_ids": topk_ids,
+                "top_k_probs": topk_probs,
+                "top_k_strings": topk_strings,
+                "annotations": annotations,
+            }
+        )
 
         prob_vectors[snap.layer_index] = probs
         prev_ranking = current_ranking
@@ -1121,12 +1147,14 @@ def _compute_layer_predictions(
                     track_probs.append(float(pv[tid].item()))
                 else:
                     track_probs.append(0.0)
-            token_tracks.append({
-                "token": tok_str,
-                "token_id": tid,
-                "probs": track_probs,
-                "layers": [lp["layer_index"] for lp in layer_preds],
-            })
+            token_tracks.append(
+                {
+                    "token": tok_str,
+                    "token_id": tid,
+                    "probs": track_probs,
+                    "layers": [lp["layer_index"] for lp in layer_preds],
+                }
+            )
 
     return layer_preds, token_tracks
 
@@ -1136,38 +1164,46 @@ def _compute_layer_predictions(
 @click.option(
     "--trace-id", default=None, help="Single trace report: trace ID or label."
 )
+@click.option("--trace-a", default=None, help="Comparison report: first trace ID.")
+@click.option("--trace-b", default=None, help="Comparison report: second trace ID.")
+@click.option("-o", "--output", default="report.html", help="Output file path.")
 @click.option(
-    "--trace-a", default=None, help="Comparison report: first trace ID."
-)
-@click.option(
-    "--trace-b", default=None, help="Comparison report: second trace ID."
-)
-@click.option(
-    "-o", "--output", default="report.html", help="Output file path."
-)
-@click.option(
-    "--open", "open_browser", is_flag=True,
+    "--open",
+    "open_browser",
+    is_flag=True,
     help="Open report in browser after generating.",
 )
 @click.option(
-    "--full-attention", is_flag=True,
+    "--full-attention",
+    is_flag=True,
     help="Include attention heatmaps for all layers.",
 )
 @click.option(
-    "--no-attention", is_flag=True,
+    "--no-attention",
+    is_flag=True,
     help="Skip attention heatmaps entirely.",
 )
 @click.option(
-    "--upload", is_flag=True,
+    "--upload",
+    is_flag=True,
     help="Upload report to CarbonFiles after generating.",
 )
 @click.option(
-    "--bucket", default=None,
+    "--bucket",
+    default=None,
     help="Existing CarbonFiles bucket ID for upload.",
 )
 def report(
-    db, trace_id, trace_a, trace_b, output, open_browser,
-    full_attention, no_attention, upload, bucket,
+    db,
+    trace_id,
+    trace_a,
+    trace_b,
+    output,
+    open_browser,
+    full_attention,
+    no_attention,
+    upload,
+    bucket,
 ):
     """Generate a self-contained HTML report from one or two traces."""
     import os
@@ -1177,17 +1213,11 @@ def report(
 
     # Validate options
     if trace_id and (trace_a or trace_b):
-        raise click.UsageError(
-            "Cannot use --trace-id with --trace-a/--trace-b."
-        )
+        raise click.UsageError("Cannot use --trace-id with --trace-a/--trace-b.")
     if not trace_id and not (trace_a and trace_b):
-        raise click.UsageError(
-            "Provide --trace-id or both --trace-a and --trace-b."
-        )
+        raise click.UsageError("Provide --trace-id or both --trace-a and --trace-b.")
     if (trace_a and not trace_b) or (trace_b and not trace_a):
-        raise click.UsageError(
-            "Must provide both --trace-a and --trace-b."
-        )
+        raise click.UsageError("Must provide both --trace-a and --trace-b.")
 
     db_conn = TraceDB(db)
 
@@ -1204,17 +1234,17 @@ def report(
                 TextColumn("[progress.description]{task.description}"),
                 console=err_console,
             ) as progress:
-                task = progress.add_task(
-                    "Computing predictions...", total=None
-                )
-                layer_preds, token_tracks = _compute_layer_predictions(
-                    result
-                )
+                task = progress.add_task("Computing predictions...", total=None)
+                layer_preds, token_tracks = _compute_layer_predictions(result)
                 progress.update(task, description="Generating report...")
 
                 html = generate_report(
-                    result, layer_stats, layer_preds, token_tracks,
-                    full_attention, no_attention,
+                    result,
+                    layer_stats,
+                    layer_preds,
+                    token_tracks,
+                    full_attention,
+                    no_attention,
                 )
         else:
             # Comparison report
@@ -1250,15 +1280,11 @@ def report(
                 token_lookup: dict[int, str] = {}
                 if preds_a:
                     for lp in preds_a:
-                        for tid, s in zip(
-                            lp["top_k_ids"], lp["top_k_strings"]
-                        ):
+                        for tid, s in zip(lp["top_k_ids"], lp["top_k_strings"]):
                             token_lookup[tid] = s
                 if preds_b:
                     for lp in preds_b:
-                        for tid, s in zip(
-                            lp["top_k_ids"], lp["top_k_strings"]
-                        ):
+                        for tid, s in zip(lp["top_k_ids"], lp["top_k_strings"]):
                             token_lookup[tid] = s
                 # Also add from diff metrics
                 for m in diff_result.layer_metrics:
@@ -1267,14 +1293,20 @@ def report(
                     if m.trace_b_top1 not in token_lookup:
                         token_lookup[m.trace_b_top1] = str(m.trace_b_top1)
 
-                progress.update(
-                    task, description="Generating report..."
-                )
+                progress.update(task, description="Generating report...")
                 html = generate_comparison_report(
-                    result_a, result_b, stats_a, stats_b,
-                    preds_a, preds_b, tracks_a, tracks_b,
-                    diff_result, token_lookup,
-                    full_attention, no_attention,
+                    result_a,
+                    result_b,
+                    stats_a,
+                    stats_b,
+                    preds_a,
+                    preds_b,
+                    tracks_a,
+                    tracks_b,
+                    diff_result,
+                    token_lookup,
+                    full_attention,
+                    no_attention,
                 )
     except ValueError as e:
         db_conn.close()
@@ -1284,9 +1316,7 @@ def report(
         f.write(html)
 
     size_kb = os.path.getsize(output) / 1024
-    console.print(
-        f"[green]Report written to {output} ({size_kb:.0f} KB)[/green]"
-    )
+    console.print(f"[green]Report written to {output} ({size_kb:.0f} KB)[/green]")
 
     if upload:
         from neurotrace.upload import upload_report
@@ -1306,9 +1336,7 @@ def _parse_sweep_range(value: str) -> tuple[int, list[float]]:
     """
     parts = value.split(":")
     if len(parts) != 4:
-        raise click.BadParameter(
-            f"Expected format L:start:end:step, got {value!r}"
-        )
+        raise click.BadParameter(f"Expected format L:start:end:step, got {value!r}")
     layer = int(parts[0])
     start = float(parts[1])
     end = float(parts[2])
@@ -1325,15 +1353,11 @@ def _parse_sweep_zero_heads(value: str) -> tuple[int, list[int]]:
     """Parse 'L:start-end' into (layer, [head_indices])."""
     parts = value.split(":")
     if len(parts) != 2:
-        raise click.BadParameter(
-            f"Expected format L:start-end, got {value!r}"
-        )
+        raise click.BadParameter(f"Expected format L:start-end, got {value!r}")
     layer = int(parts[0])
     head_range = parts[1].split("-")
     if len(head_range) != 2:
-        raise click.BadParameter(
-            f"Expected format L:start-end, got {value!r}"
-        )
+        raise click.BadParameter(f"Expected format L:start-end, got {value!r}")
     start = int(head_range[0])
     end = int(head_range[1])
     return layer, list(range(start, end + 1))
@@ -1344,53 +1368,78 @@ def _parse_sweep_zero_heads(value: str) -> tuple[int, list[int]]:
 @click.option("--model", required=True, help="HuggingFace model name or path.")
 @click.option("--prompt", required=True, help="Prompt text to trace.")
 @click.option(
-    "--baseline", default=None,
+    "--baseline",
+    default=None,
     help="Baseline trace ID, label, or prefix. If omitted, runs a clean trace.",
 )
 @click.option("--label", default=None, help="Base label for sweep traces.")
 @click.option("--seed", default=42, type=int, help="Random seed.")
 @click.option(
-    "--sweep-scale-mlp", default=None,
+    "--sweep-scale-mlp",
+    default=None,
     help="Sweep MLP scale factor. Format: L:start:end:step (e.g. '20:0.1:0.9:0.1').",
 )
 @click.option(
-    "--sweep-zero-heads", "sweep_zero_heads_opt", default=None,
+    "--sweep-zero-heads",
+    "sweep_zero_heads_opt",
+    default=None,
     help="Sweep zero-heads one at a time. Format: L:start-end (e.g. '20:0-31').",
 )
 @click.option(
-    "--sweep-zero-mlp", default=None,
+    "--sweep-zero-mlp",
+    default=None,
     help="Sweep zero-mlp one layer at a time. Format: L1,L2,L3 (e.g. '18,19,20').",
 )
 @click.option(
-    "--sweep-scale-layer", default=None,
+    "--sweep-scale-layer",
+    default=None,
     help="Sweep layer scale factor. Format: L:start:end:step (e.g. '20:0.1:0.9:0.1').",
 )
 @click.option(
-    "--zero-layers", default=None,
+    "--zero-layers",
+    default=None,
     help="Fixed intervention: zero entire layer outputs. E.g. '20' or '20,21'.",
 )
 @click.option(
-    "--zero-heads", default=None,
+    "--zero-heads",
+    default=None,
     help="Fixed intervention: zero specific attention heads. E.g. '20:7,20:12'.",
 )
 @click.option(
-    "--scale-layer", default=None,
+    "--scale-layer",
+    default=None,
     help="Fixed intervention: scale layer contributions. E.g. '20:0.5,21:2.0'.",
 )
 @click.option(
-    "--zero-mlp", default=None,
+    "--zero-mlp",
+    default=None,
     help="Fixed intervention: zero MLP sublayer outputs. E.g. '20' or '20,21'.",
 )
 @click.option(
-    "--scale-mlp", default=None,
+    "--scale-mlp",
+    default=None,
     help="Fixed intervention: scale MLP sublayer outputs. E.g. '20:0.5'.",
 )
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
+@click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
 def sweep(
-    db, model, prompt, baseline, label, seed,
-    sweep_scale_mlp, sweep_zero_heads_opt, sweep_zero_mlp, sweep_scale_layer,
-    zero_layers, zero_heads, scale_layer, zero_mlp, scale_mlp,
+    db,
+    model,
+    prompt,
+    baseline,
+    label,
+    seed,
+    sweep_scale_mlp,
+    sweep_zero_heads_opt,
+    sweep_zero_mlp,
+    sweep_scale_layer,
+    zero_layers,
+    zero_heads,
+    scale_layer,
+    zero_mlp,
+    scale_mlp,
     output_json,
+    adapter,
 ):
     """Run multiple ablations in a single model load, sweeping a parameter range."""
     from neurotrace.ablate import (
@@ -1402,7 +1451,12 @@ def sweep(
     )
 
     # Count sweep flags
-    sweep_flags = [sweep_scale_mlp, sweep_zero_heads_opt, sweep_zero_mlp, sweep_scale_layer]
+    sweep_flags = [
+        sweep_scale_mlp,
+        sweep_zero_heads_opt,
+        sweep_zero_mlp,
+        sweep_scale_layer,
+    ]
     active_sweeps = [f for f in sweep_flags if f is not None]
     if len(active_sweeps) == 0:
         raise click.UsageError("Exactly one --sweep-* flag is required.")
@@ -1424,36 +1478,54 @@ def sweep(
     if sweep_scale_mlp:
         target_layer, values = _parse_sweep_range(sweep_scale_mlp)
         sweep_target_layer = target_layer
-        sweep_description = f"scale-mlp layer {target_layer} ({values[0]} → {values[-1]}, step {values[1] - values[0] if len(values) > 1 else 0})"
+        step = values[1] - values[0] if len(values) > 1 else 0
+        sweep_description = (
+            f"scale-mlp layer {target_layer} ({values[0]} → {values[-1]}, step {step})"
+        )
         for v in values:
             sm = fixed_sm + [(target_layer, v)]
             spec = AblationSpec(
-                zero_layers=fixed_zl, zero_heads=fixed_zh,
-                scale_layers=fixed_sl, zero_mlp=fixed_zm, scale_mlp=sm,
+                zero_layers=fixed_zl,
+                zero_heads=fixed_zh,
+                scale_layers=fixed_sl,
+                zero_mlp=fixed_zm,
+                scale_mlp=sm,
             )
             sweep_specs.append((str(v), spec))
 
     elif sweep_scale_layer:
         target_layer, values = _parse_sweep_range(sweep_scale_layer)
         sweep_target_layer = target_layer
-        sweep_description = f"scale-layer layer {target_layer} ({values[0]} → {values[-1]}, step {values[1] - values[0] if len(values) > 1 else 0})"
+        step = values[1] - values[0] if len(values) > 1 else 0
+        sweep_description = (
+            f"scale-layer layer {target_layer}"
+            f" ({values[0]} → {values[-1]}, step {step})"
+        )
         for v in values:
             sl = fixed_sl + [(target_layer, v)]
             spec = AblationSpec(
-                zero_layers=fixed_zl, zero_heads=fixed_zh,
-                scale_layers=sl, zero_mlp=fixed_zm, scale_mlp=fixed_sm,
+                zero_layers=fixed_zl,
+                zero_heads=fixed_zh,
+                scale_layers=sl,
+                zero_mlp=fixed_zm,
+                scale_mlp=fixed_sm,
             )
             sweep_specs.append((str(v), spec))
 
     elif sweep_zero_heads_opt:
         target_layer, heads = _parse_sweep_zero_heads(sweep_zero_heads_opt)
         sweep_target_layer = target_layer
-        sweep_description = f"zero-heads layer {target_layer} (head {heads[0]} → {heads[-1]})"
+        sweep_description = (
+            f"zero-heads layer {target_layer} (head {heads[0]} → {heads[-1]})"
+        )
         for h in heads:
             zh = fixed_zh + [(target_layer, h)]
             spec = AblationSpec(
-                zero_layers=fixed_zl, zero_heads=zh,
-                scale_layers=fixed_sl, zero_mlp=fixed_zm, scale_mlp=fixed_sm,
+                zero_layers=fixed_zl,
+                zero_heads=zh,
+                scale_layers=fixed_sl,
+                zero_mlp=fixed_zm,
+                scale_mlp=fixed_sm,
             )
             sweep_specs.append((f"h{h}", spec))
 
@@ -1464,8 +1536,11 @@ def sweep(
         for l_idx in layers:
             zm = fixed_zm + [l_idx]
             spec = AblationSpec(
-                zero_layers=fixed_zl, zero_heads=fixed_zh,
-                scale_layers=fixed_sl, zero_mlp=zm, scale_mlp=fixed_sm,
+                zero_layers=fixed_zl,
+                zero_heads=fixed_zh,
+                scale_layers=fixed_sl,
+                zero_mlp=zm,
+                scale_mlp=fixed_sm,
             )
             sweep_specs.append((f"L{l_idx}", spec))
 
@@ -1481,6 +1556,7 @@ def sweep(
         from neurotrace.models import load_model
 
         model_obj, tokenizer = load_model(model)
+        model_obj = _maybe_load_adapter(model_obj, adapter)
         progress.update(task, description="Model loaded.")
 
         db_conn = TraceDB(db)
@@ -1492,7 +1568,8 @@ def sweep(
                 baseline_id = _resolve_trace_id(db_conn, baseline)
                 baseline_trace = db_conn.read_trace(baseline_id)
                 progress.update(
-                    task, description=f"Loaded baseline {baseline_id[:8]}.",
+                    task,
+                    description=f"Loaded baseline {baseline_id[:8]}.",
                 )
             except ValueError as e:
                 db_conn.close()
@@ -1507,7 +1584,8 @@ def sweep(
             db_conn.write_trace(baseline_trace)
             if not output_json:
                 console.print(
-                    f"[green]Baseline stored: {baseline_trace.metadata.trace_id[:8]}[/green]"
+                    f"[green]Baseline stored:"
+                    f" {baseline_trace.metadata.trace_id[:8]}[/green]"
                 )
 
         # Run sweep
@@ -1518,8 +1596,13 @@ def sweep(
 
             trace_label = f"{label}-{sweep_val}" if label else f"sweep-{sweep_val}"
             ablation_result = run_ablation(
-                model_obj, tokenizer, prompt, spec,
-                baseline=baseline_trace, label=trace_label, seed=seed,
+                model_obj,
+                tokenizer,
+                prompt,
+                spec,
+                baseline=baseline_trace,
+                label=trace_label,
+                seed=seed,
             )
 
             # Store ablated trace
@@ -1539,14 +1622,16 @@ def sweep(
                     "prob": lc.ablated_top1_prob,
                 }
 
-            results.append({
-                "sweep_value": sweep_val,
-                "trace_id": trace_id,
-                "final_token": ablation_result.ablated_final_token,
-                "final_prob": ablation_result.ablated_final_prob,
-                "layer_preds": layer_preds,
-                "spec": spec.describe(),
-            })
+            results.append(
+                {
+                    "sweep_value": sweep_val,
+                    "trace_id": trace_id,
+                    "final_token": ablation_result.ablated_final_token,
+                    "final_prob": ablation_result.ablated_final_prob,
+                    "layer_preds": layer_preds,
+                    "spec": spec.describe(),
+                }
+            )
 
         progress.update(task, description="Done.")
         db_conn.close()
@@ -1580,8 +1665,8 @@ def sweep(
                     "final_prob": r["final_prob"],
                     "interventions": r["spec"],
                     "layer_predictions": {
-                        str(l): r["layer_preds"].get(l, {})
-                        for l in display_layers_sorted
+                        str(li): r["layer_preds"].get(li, {})
+                        for li in display_layers_sorted
                     },
                 }
                 for r in results
@@ -1592,9 +1677,7 @@ def sweep(
 
     # Rich table output
     console.print(f"\n[bold]Sweep: {sweep_description}[/bold]")
-    console.print(
-        f"[dim]Baseline: {baseline_trace.metadata.trace_id[:8]}[/dim]\n"
-    )
+    console.print(f"[dim]Baseline: {baseline_trace.metadata.trace_id[:8]}[/dim]\n")
 
     table = Table()
     table.add_column("Value", justify="right")
@@ -1622,49 +1705,64 @@ def sweep(
 @click.option("--db", required=True, help="Path to DuckDB database file.")
 @click.option("--model", required=True, help="HuggingFace model name or path.")
 @click.option(
-    "--dataset", "dataset_path", default=None,
+    "--dataset",
+    "dataset_path",
+    default=None,
     help="Path to JSON dataset file.",
 )
 @click.option(
-    "--dataset-builtin", default=None,
+    "--dataset-builtin",
+    default=None,
     help="Use a built-in dataset (e.g. 'capitals').",
 )
 @click.option("--seed", default=42, type=int, help="Random seed.")
 @click.option(
-    "--sabotage-threshold", default=0.5, type=float,
+    "--sabotage-threshold",
+    default=0.5,
+    type=float,
     help="Fraction of peak prob drop to flag as sabotage.",
 )
 @click.option(
-    "--final-threshold", default=0.3, type=float,
+    "--final-threshold",
+    default=0.3,
+    type=float,
     help="Minimum final probability to avoid weak flag.",
 )
 @click.option(
-    "--save-traces", is_flag=True,
+    "--save-traces",
+    is_flag=True,
     help="Store all traces to database.",
 )
 @click.option(
-    "--save-flagged", is_flag=True,
+    "--save-flagged",
+    is_flag=True,
     help="Store only flagged traces to database.",
 )
 @click.option("--details", is_flag=True, help="Show layer details for flagged prompts.")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
+@click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
 def scan(
-    db, model, dataset_path, dataset_builtin, seed,
-    sabotage_threshold, final_threshold,
-    save_traces, save_flagged, details, output_json,
+    db,
+    model,
+    dataset_path,
+    dataset_builtin,
+    seed,
+    sabotage_threshold,
+    final_threshold,
+    save_traces,
+    save_flagged,
+    details,
+    output_json,
+    adapter,
 ):
     """Scan a dataset for sabotaged predictions."""
     from neurotrace.datasets import get_builtin_dataset, load_dataset
     from neurotrace.scan import run_scan
 
     if dataset_path is None and dataset_builtin is None:
-        raise click.UsageError(
-            "Must provide either --dataset or --dataset-builtin."
-        )
+        raise click.UsageError("Must provide either --dataset or --dataset-builtin.")
     if dataset_path is not None and dataset_builtin is not None:
-        raise click.UsageError(
-            "Cannot provide both --dataset and --dataset-builtin."
-        )
+        raise click.UsageError("Cannot provide both --dataset and --dataset-builtin.")
 
     # Load dataset
     if dataset_builtin is not None:
@@ -1683,6 +1781,7 @@ def scan(
         from neurotrace.models import load_model
 
         model_obj, tokenizer = load_model(model)
+        model_obj = _maybe_load_adapter(model_obj, adapter)
         progress.update(task, description="Model loaded.")
 
         db_conn = None
@@ -1694,7 +1793,10 @@ def scan(
             progress.update(task, description=desc)
 
         scan_result = run_scan(
-            model_obj, tokenizer, dataset, dataset_name,
+            model_obj,
+            tokenizer,
+            dataset,
+            dataset_name,
             seed=seed,
             sabotage_threshold=sabotage_threshold,
             final_threshold=final_threshold,
@@ -1774,8 +1876,12 @@ def scan(
         flags_display = ", ".join(r.flags)
 
         table.add_row(
-            status_str, prompt_display, r.answer,
-            final_display, peak_display, flags_display,
+            status_str,
+            prompt_display,
+            r.answer,
+            final_display,
+            peak_display,
+            flags_display,
             style=style,
         )
 
@@ -1796,13 +1902,13 @@ def scan(
         if flagged:
             console.print("\n[bold]Flagged Details:[/bold]\n")
             for r in flagged:
-                console.print(
-                    f'[bold]\u26a0 "{r.prompt}" \u2192 {r.answer}[/bold]'
-                )
+                console.print(f'[bold]\u26a0 "{r.prompt}" \u2192 {r.answer}[/bold]')
                 if r.ranks and r.probs:
                     # Show compact layer-by-layer
                     parts = []
-                    peak_idx = r.probs.index(r.peak_prob) if r.peak_prob in r.probs else None
+                    peak_idx = (
+                        r.probs.index(r.peak_prob) if r.peak_prob in r.probs else None
+                    )
                     for i, (rank, prob) in enumerate(zip(r.ranks, r.probs)):
                         entry = f"L{i}: rank #{rank} ({prob:.3f})"
                         if i == peak_idx:
@@ -1832,57 +1938,400 @@ def scan(
 @cli.command()
 @click.option("--db", required=True, help="Path to DuckDB database file.")
 @click.option("--model", required=True, help="HuggingFace model name or path.")
+@click.option(
+    "--dataset-builtin",
+    default=None,
+    help="Use built-in dataset (e.g., 'capitals').",
+)
+@click.option(
+    "--dataset",
+    "dataset_path",
+    default=None,
+    help="Path to JSONL training data.",
+)
+@click.option(
+    "--from-scan",
+    "from_scan",
+    default=None,
+    help="Use scan results — trace ID or 'latest'."
+    " Auto-generates weighted training data.",
+)
+@click.option(
+    "--target-layers",
+    default="20,21",
+    help="MLP layers to apply LoRA to (comma-separated).",
+)
+@click.option("--rank", default=8, type=int, help="LoRA rank.")
+@click.option("--alpha", default=16, type=int, help="LoRA alpha.")
+@click.option("--epochs", default=10, type=int, help="Training epochs.")
+@click.option("--lr", default=1e-4, type=float, help="Learning rate.")
+@click.option(
+    "--output",
+    "output_dir",
+    default=None,
+    help="Directory to save adapter weights.",
+)
+@click.option("--eval-before", is_flag=True, help="Run scan before training.")
+@click.option("--eval-after", is_flag=True, help="Run scan after training.")
+@click.option("--seed", default=42, type=int, help="Random seed.")
+@click.option("--json", "output_json", is_flag=True, help="JSON output.")
+def finetune(
+    db,
+    model,
+    dataset_builtin,
+    dataset_path,
+    from_scan,
+    target_layers,
+    rank,
+    alpha,
+    epochs,
+    lr,
+    output_dir,
+    eval_before,
+    eval_after,
+    seed,
+    output_json,
+):
+    """Train a LoRA adapter on specified MLP layers to fix sabotaged predictions."""
+    from neurotrace.finetune import (
+        FinetuneConfig,
+        generate_training_data_from_builtin,
+        generate_training_data_from_jsonl,
+        generate_training_data_from_scan,
+        run_finetune,
+    )
+
+    # Validate data source
+    sources = [dataset_builtin, dataset_path, from_scan]
+    source_count = sum(1 for s in sources if s is not None)
+    if source_count == 0:
+        raise click.UsageError(
+            "Must provide --dataset-builtin, --dataset, or --from-scan."
+        )
+    if source_count > 1:
+        raise click.UsageError(
+            "Only one data source allowed:"
+            " --dataset-builtin, --dataset, or --from-scan."
+        )
+
+    # Parse target layers
+    layers = [int(x.strip()) for x in target_layers.split(",") if x.strip()]
+
+    # Determine output directory
+    if output_dir is None:
+        import re
+        from datetime import datetime
+
+        model_slug = re.sub(r"[^a-zA-Z0-9]", "-", model).strip("-")
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        output_dir = f"adapters/{model_slug}-{timestamp}"
+
+    # Generate training data
+    dataset_name = None
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task("Preparing training data...", total=None)
+
+        if dataset_builtin is not None:
+            from neurotrace.datasets import get_builtin_dataset
+
+            dataset = get_builtin_dataset(dataset_builtin)
+            dataset_name = dataset_builtin
+
+            # Optionally get sabotaged prompts from scan
+            sabotaged = None
+            if eval_before:
+                progress.update(task, description="Running pre-training scan...")
+                sabotaged = _run_eval_scan(
+                    model,
+                    dataset_builtin,
+                    seed,
+                    progress,
+                    task,
+                )
+
+            examples = generate_training_data_from_builtin(
+                dataset,
+                sabotaged_prompts=sabotaged.get("sabotaged_prompts")
+                if sabotaged
+                else None,
+            )
+            scan_before = sabotaged.get("summary") if sabotaged else None
+
+        elif dataset_path is not None:
+            examples = generate_training_data_from_jsonl(dataset_path)
+            dataset_name = dataset_path
+            scan_before = None
+
+        else:
+            # from_scan: run a fresh scan to get sabotage results for weighting
+            progress.update(task, description="Running scan for training data...")
+            from neurotrace.datasets import get_builtin_dataset
+            from neurotrace.models import load_model
+            from neurotrace.scan import run_scan
+
+            model_obj, tokenizer = load_model(model)
+            dataset = get_builtin_dataset("capitals")
+            scan_result = run_scan(model_obj, tokenizer, dataset, "capitals", seed=seed)
+            examples = generate_training_data_from_scan(scan_result)
+            dataset_name = "capitals (from scan)"
+            scan_before = {
+                "correct": scan_result.correct_count,
+                "sabotaged": scan_result.sabotaged_count,
+                "weak": scan_result.weak_count,
+                "wrong": scan_result.wrong_count,
+            }
+            del model_obj, tokenizer
+
+        progress.update(
+            task,
+            description=f"Training data ready: {len(examples)} examples.",
+        )
+
+        # Build config
+        config = FinetuneConfig(
+            target_layers=layers,
+            rank=rank,
+            alpha=alpha,
+            epochs=epochs,
+            learning_rate=lr,
+            seed=seed,
+        )
+
+        # Run training
+        def training_progress(desc):
+            progress.update(task, description=desc)
+
+        result = run_finetune(
+            model_name=model,
+            examples=examples,
+            config=config,
+            output_dir=output_dir,
+            progress_callback=training_progress,
+        )
+        result.dataset_name = dataset_name
+        result.scan_before = scan_before if eval_before else None
+
+        # Post-training eval
+        scan_after = None
+        if eval_after and dataset_builtin is not None:
+            progress.update(task, description="Running post-training scan...")
+            scan_after = _run_eval_scan(
+                model,
+                dataset_builtin,
+                seed,
+                progress,
+                task,
+                adapter_path=output_dir,
+            )
+            result.scan_after = scan_after.get("summary") if scan_after else None
+
+        # Save run to DB
+        progress.update(task, description="Saving run metadata...")
+        db_conn = TraceDB(db)
+        db_conn.save_finetune_run(result)
+        db_conn.close()
+
+        progress.update(task, description="Done.")
+
+    if output_json:
+        output = {
+            "run_id": result.run_id,
+            "model": result.model_name,
+            "adapter_path": result.adapter_path,
+            "target_layers": result.target_layers,
+            "lora_rank": result.lora_rank,
+            "lora_alpha": result.lora_alpha,
+            "dataset": result.dataset_name,
+            "dataset_size": result.dataset_size,
+            "epochs": result.epochs,
+            "learning_rate": result.learning_rate,
+            "train_loss_start": result.train_loss_start,
+            "train_loss_end": result.train_loss_end,
+            "scan_before": result.scan_before,
+            "scan_after": result.scan_after,
+        }
+        click.echo(json.dumps(output, indent=2, default=str))
+        return
+
+    # Rich output
+    console.print("\n[bold]Fine-tuning complete[/bold]")
+    console.print(f"[bold]Run ID:[/bold] {result.run_id[:8]}")
+    console.print(f"[bold]Model:[/bold] {result.model_name}")
+    console.print(f"[bold]Target layers:[/bold] {result.target_layers}")
+    console.print(
+        f"[bold]LoRA rank:[/bold] {result.lora_rank}, alpha: {result.lora_alpha}"
+    )
+    console.print(
+        f"[bold]Dataset:[/bold] {result.dataset_name} ({result.dataset_size} examples)"
+    )
+    console.print(f"[bold]Epochs:[/bold] {result.epochs}")
+    if result.train_loss_start is not None and result.train_loss_end is not None:
+        console.print(
+            f"[bold]Loss:[/bold]"
+            f" {result.train_loss_start:.4f} → {result.train_loss_end:.4f}"
+        )
+    console.print(f"[green]Adapter saved to {result.adapter_path}[/green]")
+
+    if result.scan_before:
+        console.print(f"\n[bold]Pre-training scan:[/bold] {result.scan_before}")
+    if result.scan_after:
+        console.print(f"[bold]Post-training scan:[/bold] {result.scan_after}")
+
+
+def _run_eval_scan(
+    model_name,
+    dataset_builtin,
+    seed,
+    progress,
+    task,
+    adapter_path=None,
+):
+    """Run a scan for evaluation, returning summary dict."""
+    from neurotrace.datasets import get_builtin_dataset
+    from neurotrace.models import load_model
+    from neurotrace.scan import run_scan
+
+    dataset = get_builtin_dataset(dataset_builtin)
+
+    model_obj, tokenizer = load_model(model_name)
+    model_obj = _maybe_load_adapter(model_obj, adapter_path)
+
+    def progress_cb(i, total, _prompt):
+        progress.update(task, description=f"Eval scan {i + 1}/{total}...")
+
+    scan_result = run_scan(
+        model_obj,
+        tokenizer,
+        dataset,
+        dataset_builtin,
+        seed=seed,
+        progress_callback=progress_cb,
+    )
+
+    sabotaged_prompts = {
+        r.prompt for r in scan_result.prompt_results if r.status == "sabotaged"
+    }
+
+    return {
+        "summary": {
+            "correct": scan_result.correct_count,
+            "sabotaged": scan_result.sabotaged_count,
+            "weak": scan_result.weak_count,
+            "wrong": scan_result.wrong_count,
+        },
+        "sabotaged_prompts": sabotaged_prompts,
+    }
+
+
+@cli.command()
+@click.option("--db", required=True, help="Path to DuckDB database file.")
+@click.option("--model", required=True, help="HuggingFace model name or path.")
 @click.option("--prompt", required=True, help="Target prompt.")
 @click.option("--layer", required=True, type=int, help="MLP layer to analyze.")
 @click.option(
-    "--contrast", default=None,
+    "--contrast",
+    default=None,
     help="Contrast prompt (model gets this right).",
 )
 @click.option("--top-n", default=20, type=int, help="Top N neurons.")
 @click.option(
-    "--save-profile", default=None, help="Label to save profile.",
+    "--save-profile",
+    default=None,
+    help="Label to save profile.",
 )
 @click.option(
-    "--ablate", "ablate_mode", is_flag=True,
+    "--ablate",
+    "ablate_mode",
+    is_flag=True,
     help="Enable ablation mode.",
 )
 @click.option(
-    "--neurons", "neuron_str", default=None,
+    "--neurons",
+    "neuron_str",
+    default=None,
     help="Neuron indices: '0,1,2' or '100-200'.",
 )
 @click.option(
-    "--from-profile", default=None,
+    "--from-profile",
+    default=None,
     help="Use top-N neurons from a saved profile.",
 )
 @click.option(
-    "--group-size", default=1, type=int,
+    "--group-size",
+    default=1,
+    type=int,
     help="Ablate in groups of N (default: 1).",
 )
 @click.option("--baseline", default=None, help="Baseline trace ID for comparison.")
 @click.option("--label", default=None, help="Label prefix for ablation traces.")
 @click.option("--seed", default=42, type=int, help="Random seed.")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
+@click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
 def neurons(
-    db, model, prompt, layer, contrast, top_n, save_profile,
-    ablate_mode, neuron_str, from_profile, group_size,
-    baseline, label, seed, output_json,
+    db,
+    model,
+    prompt,
+    layer,
+    contrast,
+    top_n,
+    save_profile,
+    ablate_mode,
+    neuron_str,
+    from_profile,
+    group_size,
+    baseline,
+    label,
+    seed,
+    output_json,
+    adapter,
 ):
     """Neuron-level MLP attribution: profile or ablate individual neurons."""
     if ablate_mode:
         _neurons_ablate(
-            db, model, prompt, layer, top_n, neuron_str, from_profile,
-            group_size, baseline, label, seed, output_json,
+            db,
+            model,
+            prompt,
+            layer,
+            top_n,
+            neuron_str,
+            from_profile,
+            group_size,
+            baseline,
+            label,
+            seed,
+            output_json,
+            adapter,
         )
     else:
         _neurons_profile(
-            db, model, prompt, layer, contrast, top_n,
-            save_profile, seed, output_json,
+            db,
+            model,
+            prompt,
+            layer,
+            contrast,
+            top_n,
+            save_profile,
+            seed,
+            output_json,
+            adapter,
         )
 
 
 def _neurons_profile(
-    db, model, prompt, layer, contrast, top_n,
-    save_profile, seed, output_json,
+    db,
+    model,
+    prompt,
+    layer,
+    contrast,
+    top_n,
+    save_profile,
+    seed,
+    output_json,
+    adapter=None,
 ):
     """Profile mode: capture and rank MLP intermediate neuron activations."""
     from neurotrace.neurons import profile_neurons
@@ -1896,12 +2345,18 @@ def _neurons_profile(
         from neurotrace.models import load_model
 
         model_obj, tokenizer = load_model(model)
+        model_obj = _maybe_load_adapter(model_obj, adapter)
         progress.update(task, description="Profiling neurons...")
 
         profile = profile_neurons(
-            model_obj, tokenizer, prompt, layer,
-            top_n=top_n, contrast_prompt=contrast,
-            seed=seed, label=save_profile,
+            model_obj,
+            tokenizer,
+            prompt,
+            layer,
+            top_n=top_n,
+            contrast_prompt=contrast,
+            seed=seed,
+            label=save_profile,
         )
 
         if save_profile:
@@ -1932,8 +2387,7 @@ def _neurons_profile(
                     profile.target_activations,
                     profile.contrast_activations
                     or [None] * len(profile.neuron_indices),
-                    profile.diff_activations
-                    or [None] * len(profile.neuron_indices),
+                    profile.diff_activations or [None] * len(profile.neuron_indices),
                 )
             ],
         }
@@ -1941,9 +2395,7 @@ def _neurons_profile(
         return
 
     # Rich table output
-    console.print(
-        f"\n[bold]Neuron Profile:[/bold] Layer {profile.layer} MLP"
-    )
+    console.print(f"\n[bold]Neuron Profile:[/bold] Layer {profile.layer} MLP")
     console.print(f"[bold]Prompt:[/bold] {profile.prompt}")
     if profile.contrast_prompt:
         console.print(f"[bold]Contrast:[/bold] {profile.contrast_prompt}")
@@ -1978,17 +2430,26 @@ def _neurons_profile(
 
 
 def _neurons_ablate(
-    db, model, prompt, layer, top_n, neuron_str, from_profile,
-    group_size, baseline, label, seed, output_json,
+    db,
+    model,
+    prompt,
+    layer,
+    top_n,
+    neuron_str,
+    from_profile,
+    group_size,
+    baseline,
+    label,
+    seed,
+    output_json,
+    adapter=None,
 ):
     """Ablate mode: zero specific neurons and measure prediction impact."""
     from neurotrace.neurons import ablate_neurons, parse_neurons
 
     # Determine which neurons to ablate
     if neuron_str is None and from_profile is None:
-        raise click.UsageError(
-            "Ablation mode requires --neurons or --from-profile."
-        )
+        raise click.UsageError("Ablation mode requires --neurons or --from-profile.")
 
     with Progress(
         SpinnerColumn(),
@@ -1999,6 +2460,7 @@ def _neurons_ablate(
         from neurotrace.models import load_model
 
         model_obj, tokenizer = load_model(model)
+        model_obj = _maybe_load_adapter(model_obj, adapter)
         progress.update(task, description="Model loaded.")
 
         db_conn = TraceDB(db)
@@ -2009,9 +2471,7 @@ def _neurons_ablate(
             profile = db_conn.load_neuron_profile(from_profile)
             if profile is None:
                 db_conn.close()
-                raise click.ClickException(
-                    f"Profile not found: {from_profile}"
-                )
+                raise click.ClickException(f"Profile not found: {from_profile}")
             neuron_indices = profile.neuron_indices[:top_n]
         else:
             neuron_indices = parse_neurons(neuron_str)
@@ -2021,7 +2481,7 @@ def _neurons_ablate(
             group_size = 1
         neuron_groups = []
         for i in range(0, len(neuron_indices), group_size):
-            neuron_groups.append(neuron_indices[i:i + group_size])
+            neuron_groups.append(neuron_indices[i : i + group_size])
 
         # Resolve baseline
         baseline_trace = None
@@ -2029,9 +2489,7 @@ def _neurons_ablate(
             try:
                 baseline_id = _resolve_trace_id(db_conn, baseline)
                 baseline_trace = db_conn.read_trace(baseline_id)
-                progress.update(
-                    task, description=f"Loaded baseline {baseline_id[:8]}."
-                )
+                progress.update(task, description=f"Loaded baseline {baseline_id[:8]}.")
             except ValueError as e:
                 db_conn.close()
                 raise click.ClickException(str(e))
@@ -2042,7 +2500,10 @@ def _neurons_ablate(
             description=f"Ablating {len(neuron_groups)} group(s)...",
         )
         baseline_created, results = ablate_neurons(
-            model_obj, tokenizer, prompt, layer,
+            model_obj,
+            tokenizer,
+            prompt,
+            layer,
             neuron_groups=neuron_groups,
             baseline=baseline_trace,
             label_prefix=label,
@@ -2055,9 +2516,9 @@ def _neurons_ablate(
             db_conn.write_trace(baseline_created)
 
         for r in results:
-            interventions = json.dumps({
-                "zero_neurons": {"layer": layer, "neurons": r.neurons}
-            })
+            interventions = json.dumps(
+                {"zero_neurons": {"layer": layer, "neurons": r.neurons}}
+            )
             db_conn.write_trace(r.trace, interventions=interventions)
 
         db_conn.close()
@@ -2084,9 +2545,7 @@ def _neurons_ablate(
         return
 
     # Rich table output
-    console.print(
-        f"\n[bold]Neuron Ablation:[/bold] Layer {layer} MLP"
-    )
+    console.print(f"\n[bold]Neuron Ablation:[/bold] Layer {layer} MLP")
     console.print(f"[bold]Prompt:[/bold] {prompt}\n")
 
     table = Table(title="Neuron Ablation Results")

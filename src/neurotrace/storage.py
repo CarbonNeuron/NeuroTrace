@@ -71,9 +71,7 @@ class TraceDB:
         """)
         # Migration: add interventions column if missing (for pre-existing DBs)
         try:
-            self._conn.execute(
-                "ALTER TABLE traces ADD COLUMN interventions VARCHAR"
-            )
+            self._conn.execute("ALTER TABLE traces ADD COLUMN interventions VARCHAR")
         except duckdb.CatalogException:
             pass  # column already exists
 
@@ -114,6 +112,26 @@ class TraceDB:
                 top_k_probs FLOAT[],
                 top_k_strings VARCHAR[],
                 PRIMARY KEY (trace_id, position)
+            )
+        """)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS finetune_runs (
+                id VARCHAR PRIMARY KEY,
+                model VARCHAR NOT NULL,
+                adapter_path VARCHAR NOT NULL,
+                target_layers VARCHAR NOT NULL,
+                lora_rank INTEGER NOT NULL,
+                lora_alpha INTEGER NOT NULL,
+                dataset_name VARCHAR,
+                dataset_size INTEGER,
+                epochs INTEGER NOT NULL,
+                learning_rate REAL NOT NULL,
+                seed INTEGER,
+                train_loss_start REAL,
+                train_loss_end REAL,
+                scan_before VARCHAR,
+                scan_after VARCHAR,
+                created_at VARCHAR DEFAULT (CURRENT_TIMESTAMP)
             )
         """)
         self._conn.execute("""
@@ -264,22 +282,19 @@ class TraceDB:
             return rows[0][0]
         if len(rows) > 1:
             raise ValueError(
-                f"Ambiguous label {identifier!r}: matches "
-                f"{len(rows)} traces"
+                f"Ambiguous label {identifier!r}: matches {len(rows)} traces"
             )
 
         # Try prefix match on trace_id
         rows = self._conn.execute(
-            "SELECT trace_id FROM traces"
-            " WHERE trace_id LIKE ? || '%'",
+            "SELECT trace_id FROM traces WHERE trace_id LIKE ? || '%'",
             [identifier],
         ).fetchall()
         if len(rows) == 1:
             return rows[0][0]
         if len(rows) > 1:
             raise ValueError(
-                f"Ambiguous prefix {identifier!r}: matches "
-                f"{len(rows)} traces"
+                f"Ambiguous prefix {identifier!r}: matches {len(rows)} traces"
             )
 
         raise ValueError(f"Trace not found: {identifier}")
@@ -504,9 +519,11 @@ class TraceDB:
                 json.dumps(profile.neuron_indices),
                 json.dumps(profile.target_activations),
                 json.dumps(profile.contrast_activations)
-                if profile.contrast_activations else None,
+                if profile.contrast_activations
+                else None,
                 json.dumps(profile.diff_activations)
-                if profile.diff_activations else None,
+                if profile.diff_activations
+                else None,
                 profile.label,
                 profile.created_at,
             ],
@@ -547,6 +564,65 @@ class TraceDB:
             diff_activations=json.loads(row[11]) if row[11] else None,
             label=row[12],
             created_at=row[13],
+        )
+
+    def save_finetune_run(self, result) -> None:
+        """Save a FinetuneResult to the database."""
+        import json as json_mod
+
+        self._conn.execute(
+            "INSERT INTO finetune_runs VALUES"
+            " (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                result.run_id,
+                result.model_name,
+                result.adapter_path,
+                json_mod.dumps(result.target_layers),
+                result.lora_rank,
+                result.lora_alpha,
+                result.dataset_name,
+                result.dataset_size,
+                result.epochs,
+                result.learning_rate,
+                result.seed,
+                result.train_loss_start,
+                result.train_loss_end,
+                json_mod.dumps(result.scan_before) if result.scan_before else None,
+                json_mod.dumps(result.scan_after) if result.scan_after else None,
+                result.created_at,
+            ],
+        )
+
+    def load_finetune_run(self, run_id: str):
+        """Load a FinetuneResult by ID. Returns None if not found."""
+        import json as json_mod
+
+        from neurotrace.finetune import FinetuneResult
+
+        row = self._conn.execute(
+            "SELECT * FROM finetune_runs WHERE id = ?",
+            [run_id],
+        ).fetchone()
+        if row is None:
+            return None
+
+        return FinetuneResult(
+            run_id=row[0],
+            model_name=row[1],
+            adapter_path=row[2],
+            target_layers=json_mod.loads(row[3]),
+            lora_rank=row[4],
+            lora_alpha=row[5],
+            dataset_name=row[6],
+            dataset_size=row[7],
+            epochs=row[8],
+            learning_rate=row[9],
+            seed=row[10],
+            train_loss_start=row[11],
+            train_loss_end=row[12],
+            scan_before=json_mod.loads(row[13]) if row[13] else None,
+            scan_after=json_mod.loads(row[14]) if row[14] else None,
+            created_at=row[15],
         )
 
     def close(self) -> None:

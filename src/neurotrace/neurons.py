@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 import numpy as np
 import torch
 
-from neurotrace.models import ModelArchitecture, get_architecture
+from neurotrace.models import ModelArchitecture, get_architecture, get_final_prediction
 from neurotrace.tracer import Tracer
 from neurotrace.types import TraceResult
 
@@ -152,11 +152,11 @@ def profile_neurons(
         target_activations=[float(target_last[i]) for i in top_indices],
         contrast_activations=(
             [float(contrast_last[i]) for i in top_indices]
-            if contrast_last is not None else None
+            if contrast_last is not None
+            else None
         ),
         diff_activations=(
-            [float(diff[i]) for i in top_indices]
-            if diff is not None else None
+            [float(diff[i]) for i in top_indices] if diff is not None else None
         ),
         label=label,
         created_at=datetime.now(timezone.utc).isoformat(),
@@ -188,7 +188,7 @@ def ablate_neurons(
         baseline_created = baseline
 
     # Get baseline final prediction
-    b_token, b_prob = _get_final_prediction(baseline)
+    b_token, b_prob = get_final_prediction(baseline.token_predictions)
 
     results = []
     for group in neuron_groups:
@@ -205,6 +205,7 @@ def ablate_neurons(
                 if isinstance(input, tuple):
                     return (modified,) + input[1:]
                 return (modified,)
+
             return hook
 
         handle = down_proj.register_forward_pre_hook(make_zero_hook(group))
@@ -217,25 +218,18 @@ def ablate_neurons(
         finally:
             handle.remove()
 
-        a_token, a_prob = _get_final_prediction(ablated_trace)
+        a_token, a_prob = get_final_prediction(ablated_trace.token_predictions)
 
-        results.append(NeuronAblationResult(
-            neurons=group,
-            baseline_top1=b_token,
-            baseline_top1_prob=b_prob,
-            ablated_top1=a_token,
-            ablated_top1_prob=a_prob,
-            changed=b_token != a_token,
-            trace=ablated_trace,
-        ))
+        results.append(
+            NeuronAblationResult(
+                neurons=group,
+                baseline_top1=b_token,
+                baseline_top1_prob=b_prob,
+                ablated_top1=a_token,
+                ablated_top1_prob=a_prob,
+                changed=b_token != a_token,
+                trace=ablated_trace,
+            )
+        )
 
     return baseline_created, results
-
-
-def _get_final_prediction(trace: TraceResult) -> tuple[str, float]:
-    """Get the final (last position) top-1 prediction."""
-    if trace.token_predictions:
-        last = trace.token_predictions[-1]
-        if last.top_k_strings:
-            return last.top_k_strings[0], last.top_k_probs[0]
-    return "", 0.0

@@ -209,9 +209,7 @@ def test_predict_no_residuals(tmp_path):
     db.close()
 
     runner = CliRunner()
-    result = runner.invoke(
-        cli, ["predict", "--db", db_path, "--trace-id", "no-res"]
-    )
+    result = runner.invoke(cli, ["predict", "--db", db_path, "--trace-id", "no-res"])
     assert result.exit_code != 0
     assert "Residuals not stored" in result.output
 
@@ -225,9 +223,15 @@ def test_predict_basic(tinyllama_model, tmp_path):
     runner.invoke(
         cli,
         [
-            "trace", "--model", TINYLLAMA,
-            "--prompt", "The capital of France is",
-            "--db", db_path, "--label", "predict-test",
+            "trace",
+            "--model",
+            TINYLLAMA,
+            "--prompt",
+            "The capital of France is",
+            "--db",
+            db_path,
+            "--label",
+            "predict-test",
         ],
     )
     # Run predict
@@ -247,15 +251,25 @@ def test_predict_changes_only(tinyllama_model, tmp_path):
     runner.invoke(
         cli,
         [
-            "trace", "--model", TINYLLAMA,
-            "--prompt", "The capital of France is",
-            "--db", db_path, "--label", "changes-test",
+            "trace",
+            "--model",
+            TINYLLAMA,
+            "--prompt",
+            "The capital of France is",
+            "--db",
+            db_path,
+            "--label",
+            "changes-test",
         ],
     )
     result = runner.invoke(
         cli,
         [
-            "predict", "--db", db_path, "--trace-id", "changes-test",
+            "predict",
+            "--db",
+            db_path,
+            "--trace-id",
+            "changes-test",
             "--changes-only",
         ],
     )
@@ -270,16 +284,27 @@ def test_predict_track_token(tinyllama_model, tmp_path):
     runner.invoke(
         cli,
         [
-            "trace", "--model", TINYLLAMA,
-            "--prompt", "The capital of France is",
-            "--db", db_path, "--label", "track-test",
+            "trace",
+            "--model",
+            TINYLLAMA,
+            "--prompt",
+            "The capital of France is",
+            "--db",
+            db_path,
+            "--label",
+            "track-test",
         ],
     )
     result = runner.invoke(
         cli,
         [
-            "predict", "--db", db_path, "--trace-id", "track-test",
-            "--track", "Paris",
+            "predict",
+            "--db",
+            db_path,
+            "--trace-id",
+            "track-test",
+            "--track",
+            "Paris",
         ],
     )
     assert result.exit_code == 0
@@ -294,16 +319,28 @@ def test_predict_json_output(tinyllama_model, tmp_path):
     runner.invoke(
         cli,
         [
-            "trace", "--model", TINYLLAMA,
-            "--prompt", "Hello",
-            "--db", db_path, "--label", "json-pred",
+            "trace",
+            "--model",
+            TINYLLAMA,
+            "--prompt",
+            "Hello",
+            "--db",
+            db_path,
+            "--label",
+            "json-pred",
         ],
     )
     result = runner.invoke(
         cli,
         [
-            "predict", "--db", db_path, "--trace-id", "json-pred",
-            "--json", "--top-k", "3",
+            "predict",
+            "--db",
+            db_path,
+            "--trace-id",
+            "json-pred",
+            "--json",
+            "--top-k",
+            "3",
         ],
     )
     assert result.exit_code == 0
@@ -312,9 +349,9 @@ def test_predict_json_output(tinyllama_model, tmp_path):
     # Find the JSON array start — look for newline + [
     idx = output.rfind("\n[")
     if idx >= 0:
-        output = output[idx + 1:]
+        output = output[idx + 1 :]
     else:
-        output = output[output.index("["):]
+        output = output[output.index("[") :]
     data = json.loads(output)
     assert isinstance(data, list)
     assert len(data) > 0
@@ -332,16 +369,28 @@ def test_predict_layers_filter(tinyllama_model, tmp_path):
     runner.invoke(
         cli,
         [
-            "trace", "--model", TINYLLAMA,
-            "--prompt", "Hello",
-            "--db", db_path, "--label", "layers-pred",
+            "trace",
+            "--model",
+            TINYLLAMA,
+            "--prompt",
+            "Hello",
+            "--db",
+            db_path,
+            "--label",
+            "layers-pred",
         ],
     )
     result = runner.invoke(
         cli,
         [
-            "predict", "--db", db_path, "--trace-id", "layers-pred",
-            "--json", "--layers", "0,5,10",
+            "predict",
+            "--db",
+            db_path,
+            "--trace-id",
+            "layers-pred",
+            "--json",
+            "--layers",
+            "0,5,10",
         ],
     )
     assert result.exit_code == 0
@@ -349,9 +398,9 @@ def test_predict_layers_filter(tinyllama_model, tmp_path):
     output = result.output
     idx = output.rfind("\n[")
     if idx >= 0:
-        output = output[idx + 1:]
+        output = output[idx + 1 :]
     else:
-        output = output[output.index("["):]
+        output = output[output.index("[") :]
     data = json.loads(output)
     layer_indices = {e["layer_index"] for e in data}
     assert layer_indices == {0, 5, 10}
@@ -377,16 +426,26 @@ def test_decode_from_trace(tinyllama_model, tmp_path):
     runner.invoke(
         cli,
         [
-            "trace", "--model", TINYLLAMA,
-            "--prompt", "Hello", "--db", db_path,
+            "trace",
+            "--model",
+            TINYLLAMA,
+            "--prompt",
+            "Hello",
+            "--db",
+            db_path,
         ],
     )
     # Now decode from it
     result = runner.invoke(
         cli,
         [
-            "decode", "--model", TINYLLAMA,
-            "--from-trace", "latest", "--db", db_path,
+            "decode",
+            "--model",
+            TINYLLAMA,
+            "--from-trace",
+            "latest",
+            "--db",
+            db_path,
         ],
     )
     assert result.exit_code == 0
@@ -400,10 +459,15 @@ def test_compare_end_to_end(tinyllama_model, tmp_path):
     result = runner.invoke(
         cli,
         [
-            "compare", "--model", TINYLLAMA,
-            "--prompt-a", "The capital of France is",
-            "--prompt-b", "The capital of Germany is",
-            "--db", db_path,
+            "compare",
+            "--model",
+            TINYLLAMA,
+            "--prompt-a",
+            "The capital of France is",
+            "--prompt-b",
+            "The capital of Germany is",
+            "--db",
+            db_path,
         ],
     )
     assert result.exit_code == 0
@@ -420,20 +484,30 @@ def test_compare_reuses_existing_traces(tinyllama_model, tmp_path):
     runner.invoke(
         cli,
         [
-            "compare", "--model", TINYLLAMA,
-            "--prompt-a", "Hello world",
-            "--prompt-b", "Goodbye world",
-            "--db", db_path,
+            "compare",
+            "--model",
+            TINYLLAMA,
+            "--prompt-a",
+            "Hello world",
+            "--prompt-b",
+            "Goodbye world",
+            "--db",
+            db_path,
         ],
     )
     # Run same compare again — should reuse
     result = runner.invoke(
         cli,
         [
-            "compare", "--model", TINYLLAMA,
-            "--prompt-a", "Hello world",
-            "--prompt-b", "Goodbye world",
-            "--db", db_path,
+            "compare",
+            "--model",
+            TINYLLAMA,
+            "--prompt-a",
+            "Hello world",
+            "--prompt-b",
+            "Goodbye world",
+            "--db",
+            db_path,
         ],
     )
     assert result.exit_code == 0
@@ -453,15 +527,21 @@ def test_compare_json_output(tinyllama_model, tmp_path):
     result = runner.invoke(
         cli,
         [
-            "compare", "--model", TINYLLAMA,
-            "--prompt-a", "Hello",
-            "--prompt-b", "Goodbye",
-            "--db", db_path, "--json",
+            "compare",
+            "--model",
+            TINYLLAMA,
+            "--prompt-a",
+            "Hello",
+            "--prompt-b",
+            "Goodbye",
+            "--db",
+            db_path,
+            "--json",
         ],
     )
     assert result.exit_code == 0
     # Extract JSON from output (tqdm progress bars may precede it)
-    output = result.output[result.output.index("{"):]
+    output = result.output[result.output.index("{") :]
     data = json.loads(output)
     assert "token_legend" in data
     assert "layer_metrics" in data
@@ -478,8 +558,13 @@ def test_sweep_requires_sweep_flag(tmp_path):
     result = runner.invoke(
         cli,
         [
-            "sweep", "--db", db_path, "--model", "test",
-            "--prompt", "hello",
+            "sweep",
+            "--db",
+            db_path,
+            "--model",
+            "test",
+            "--prompt",
+            "hello",
         ],
     )
     assert result.exit_code != 0
@@ -493,10 +578,17 @@ def test_sweep_rejects_multiple_sweep_flags(tmp_path):
     result = runner.invoke(
         cli,
         [
-            "sweep", "--db", db_path, "--model", "test",
-            "--prompt", "hello",
-            "--sweep-scale-mlp", "20:0.1:0.9:0.1",
-            "--sweep-zero-mlp", "18,19,20",
+            "sweep",
+            "--db",
+            db_path,
+            "--model",
+            "test",
+            "--prompt",
+            "hello",
+            "--sweep-scale-mlp",
+            "20:0.1:0.9:0.1",
+            "--sweep-zero-mlp",
+            "18,19,20",
         ],
     )
     assert result.exit_code != 0
@@ -511,10 +603,17 @@ def test_sweep_scale_mlp(tinyllama_model, tmp_path):
     result = runner.invoke(
         cli,
         [
-            "sweep", "--db", db_path, "--model", TINYLLAMA,
-            "--prompt", "The capital of France is",
-            "--sweep-scale-mlp", "10:0.3:0.7:0.2",
-            "--seed", "42",
+            "sweep",
+            "--db",
+            db_path,
+            "--model",
+            TINYLLAMA,
+            "--prompt",
+            "The capital of France is",
+            "--sweep-scale-mlp",
+            "10:0.3:0.7:0.2",
+            "--seed",
+            "42",
         ],
     )
     assert result.exit_code == 0
@@ -529,14 +628,22 @@ def test_sweep_json_output(tinyllama_model, tmp_path):
     result = runner.invoke(
         cli,
         [
-            "sweep", "--db", db_path, "--model", TINYLLAMA,
-            "--prompt", "The capital of France is",
-            "--sweep-scale-mlp", "10:0.3:0.7:0.2",
-            "--seed", "42", "--json",
+            "sweep",
+            "--db",
+            db_path,
+            "--model",
+            TINYLLAMA,
+            "--prompt",
+            "The capital of France is",
+            "--sweep-scale-mlp",
+            "10:0.3:0.7:0.2",
+            "--seed",
+            "42",
+            "--json",
         ],
     )
     assert result.exit_code == 0
-    output = result.output[result.output.index("{"):]
+    output = result.output[result.output.index("{") :]
     data = json.loads(output)
     assert "sweep_description" in data
     assert "results" in data
@@ -551,13 +658,21 @@ def test_sweep_zero_heads(tinyllama_model, tmp_path):
     result = runner.invoke(
         cli,
         [
-            "sweep", "--db", db_path, "--model", TINYLLAMA,
-            "--prompt", "Hello",
-            "--sweep-zero-heads", "10:0-2",
-            "--seed", "42", "--json",
+            "sweep",
+            "--db",
+            db_path,
+            "--model",
+            TINYLLAMA,
+            "--prompt",
+            "Hello",
+            "--sweep-zero-heads",
+            "10:0-2",
+            "--seed",
+            "42",
+            "--json",
         ],
     )
     assert result.exit_code == 0
-    output = result.output[result.output.index("{"):]
+    output = result.output[result.output.index("{") :]
     data = json.loads(output)
     assert len(data["results"]) == 3  # heads 0, 1, 2

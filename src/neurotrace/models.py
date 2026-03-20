@@ -75,9 +75,34 @@ def get_model_revision(model_name: str) -> str:
     from huggingface_hub import model_info
 
     info = model_info(model_name)
-    return info.sha
+    return info.sha or "unknown"
 
 
 def count_parameters(model: torch.nn.Module) -> int:
     """Count total parameters in a model."""
     return sum(p.numel() for p in model.parameters())
+
+
+def get_lm_head_and_norm(
+    model: torch.nn.Module,
+) -> tuple[torch.nn.Module, torch.nn.Module | None]:
+    """Extract lm_head and final layer norm from a causal LM model.
+
+    Returns (lm_head, final_ln) where final_ln may be None.
+    """
+    lm_head = model.lm_head  # type: ignore[union-attr]
+    final_ln = None
+    if hasattr(model, "model") and hasattr(model.model, "norm"):
+        final_ln = model.model.norm  # type: ignore[union-attr]
+    return lm_head, final_ln  # type: ignore[return-value]  # PyTorch dynamic attrs
+
+
+def get_final_prediction(
+    token_predictions: list,
+) -> tuple[str, float]:
+    """Get the final (last position) top-1 prediction from token predictions."""
+    if token_predictions:
+        last = token_predictions[-1]
+        if last.top_k_strings:
+            return last.top_k_strings[0], last.top_k_probs[0]
+    return "", 0.0

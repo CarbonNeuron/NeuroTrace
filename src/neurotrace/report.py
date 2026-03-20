@@ -74,7 +74,8 @@ def _css() -> str:
     * {{ box-sizing: border-box; margin: 0; padding: 0; }}
     body {{
         background: var(--bg); color: var(--text);
-        font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+        font-family: -apple-system, BlinkMacSystemFont,
+            'Segoe UI', Helvetica, Arial, sans-serif;
         font-size: 14px; line-height: 1.6; padding: 2rem;
         max-width: 1400px; margin: 0 auto;
     }}
@@ -86,14 +87,17 @@ def _css() -> str:
     h3 {{ color: var(--text); font-size: 1.1rem; margin: 1.5rem 0 0.5rem; }}
     h4 {{ color: var(--dim); font-size: 0.95rem; margin: 0.5rem 0; }}
     .meta {{
-        background: var(--bg2); padding: 1.5rem; border-radius: 8px; margin-bottom: 2rem;
+        background: var(--bg2); padding: 1.5rem;
+        border-radius: 8px; margin-bottom: 2rem;
     }}
     .meta-grid {{
-        display: grid; grid-template-columns: repeat(auto-fill, minmax(250px, 1fr)); gap: 0.5rem 2rem;
+        display: grid; gap: 0.5rem 2rem;
+        grid-template-columns: repeat(auto-fill, minmax(250px, 1fr));
     }}
     .meta-label {{ color: var(--dim); font-size: 0.85rem; }}
     .meta-value {{
-        color: var(--text); font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
+        color: var(--text);
+        font-family: 'SF Mono', 'Fira Code', 'Cascadia Code', monospace;
     }}
     .prediction {{
         font-family: 'SF Mono', 'Fira Code', monospace;
@@ -133,7 +137,8 @@ def _css() -> str:
         max-height: 600px; overflow-y: auto;
     }}
     .heads-grid {{
-        display: grid; grid-template-columns: repeat(auto-fill, minmax(180px, 1fr)); gap: 1rem;
+        display: grid; gap: 1rem;
+        grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
     }}
     @media (max-width: 900px) {{ .side-by-side {{ grid-template-columns: 1fr; }} }}
     @media print {{
@@ -304,9 +309,7 @@ def _svg_attention_heatmap(
 # --- HTML Sections ---
 
 
-def _section_header(
-    meta: Any, top_pred: str = "", top_prob: float = 0.0
-) -> str:
+def _section_header(meta: Any, top_pred: str = "", top_prob: float = 0.0) -> str:
     pred_html = ""
     if top_pred:
         pred_html = (
@@ -327,8 +330,9 @@ def _section_header(
                 <span class="meta-value">{_esc(meta.trace_id[:12])}</span></div>
             <div><span class="meta-label">Timestamp</span><br>
                 <span class="meta-value">{_esc(meta.timestamp)}</span></div>
-            <div><span class="meta-label">Layers / Heads</span><br>
-                <span class="meta-value">{meta.num_layers} / {meta.num_heads}</span></div>
+            <div><span class="meta-label">Layers/Heads</span><br>
+                <span class="meta-value">\
+{meta.num_layers} / {meta.num_heads}</span></div>
             <div><span class="meta-label">Tokens</span><br>
                 <span class="meta-value">{len(meta.token_ids)}</span></div>
         </div>
@@ -344,15 +348,13 @@ def _section_prediction_table(layer_preds: list[dict] | None) -> str:
         )
 
     top_k = len(layer_preds[0].get("top_k_strings", []))
-    headers = "<th>Layer</th>" + "".join(
-        f"<th>#{i + 1}</th>" for i in range(top_k)
-    )
+    headers = "<th>Layer</th>" + "".join(f"<th>#{i + 1}</th>" for i in range(top_k))
 
     rows = []
     for lp in layer_preds:
         cells = [
             f'<td style="text-align:right;color:var(--dim);background:var(--bg);">'
-            f'{lp["layer_index"]}</td>'
+            f"{lp['layer_index']}</td>"
         ]
         for i in range(min(top_k, len(lp["top_k_strings"]))):
             prob = lp["top_k_probs"][i]
@@ -374,12 +376,12 @@ def _section_prediction_table(layer_preds: list[dict] | None) -> str:
                 f'<br><span style="font-size:0.75rem;">{prob:.3f}</span>'
                 f"{ann_html}</td>"
             )
-        rows.append(f'<tr>{"".join(cells)}</tr>')
+        rows.append(f"<tr>{''.join(cells)}</tr>")
 
     return (
         f'<div style="overflow-x:auto;">'
         f'<table class="pred-table"><tr>{headers}</tr>'
-        f'{"".join(rows)}</table></div>'
+        f"{''.join(rows)}</table></div>"
     )
 
 
@@ -387,9 +389,7 @@ def _section_token_tracking(
     token_tracks: list[dict] | None,
 ) -> str:
     if not token_tracks:
-        return (
-            '<p style="color: var(--dim);">No token tracking data available.</p>'
-        )
+        return '<p style="color: var(--dim);">No token tracking data available.</p>'
 
     series = []
     for i, track in enumerate(token_tracks):
@@ -437,16 +437,12 @@ def _section_entropy(layer_stats: list[dict]) -> str:
         ent = s.get("attention_entropy") or []
         avg_entropies.append(sum(ent) / len(ent) if ent else 0.0)
 
-    series = [
-        {"label": "Avg Entropy", "data": avg_entropies, "color": _GREEN}
-    ]
+    series = [{"label": "Avg Entropy", "data": avg_entropies, "color": _GREEN}]
     chart = _svg_line_chart(series, x_title="Layer", y_title="Entropy")
     return f'<div class="chart-container">{chart}</div>'
 
 
-def _section_attention(
-    trace: TraceResult, sampled_layers: list[int]
-) -> str:
+def _section_attention(trace: TraceResult, sampled_layers: list[int]) -> str:
     tokens = trace.metadata.tokens
     parts = []
 
@@ -466,9 +462,7 @@ def _section_attention(
             svg = _svg_attention_heatmap(w, tokens, cell_size=cell)
             heads_html.append(f"<div><h4>Head {h}</h4>{svg}</div>")
 
-        grid = (
-            f'<div class="heads-grid">{"".join(heads_html)}</div>'
-        )
+        grid = f'<div class="heads-grid">{"".join(heads_html)}</div>'
         parts.append(
             f"<details><summary>Layer {snap.layer_index} "
             f"({num_heads} heads, {seq_len} tokens)</summary>"
@@ -480,9 +474,7 @@ def _section_attention(
     return "\n".join(parts)
 
 
-def _section_raw_data(
-    trace: TraceResult, layer_stats: list[dict]
-) -> str:
+def _section_raw_data(trace: TraceResult, layer_stats: list[dict]) -> str:
     meta = trace.metadata
     raw = {
         "trace_id": meta.trace_id,
@@ -515,9 +507,7 @@ def _section_raw_data(
 # --- Comparison-specific sections ---
 
 
-def _section_diff_table(
-    diff: DiffResult, token_lookup: dict[int, str]
-) -> str:
+def _section_diff_table(diff: DiffResult, token_lookup: dict[int, str]) -> str:
     headers = (
         "<th>Layer</th><th>Cosine Sim</th><th>Top-1 Changed</th>"
         "<th>KL Div</th><th>Trace A Top-1</th><th>Trace B Top-1</th>"
@@ -529,9 +519,7 @@ def _section_diff_table(
         a_str = token_lookup.get(m.trace_a_top1, "?")
         b_str = token_lookup.get(m.trace_b_top1, "?")
         changed = (
-            f'<span style="color:var(--red);">YES</span>'
-            if m.top1_changed
-            else "no"
+            '<span style="color:var(--red);">YES</span>' if m.top1_changed else "no"
         )
         rows.append(
             f"<tr{flag_class}>"
@@ -550,14 +538,12 @@ def _section_diff_table(
         f"Flagged: {flagged_count}/{len(diff.layer_metrics)} layers"
     )
     if diff.first_divergence_layer is not None:
-        summary += (
-            f" | First divergence: layer {diff.first_divergence_layer}"
-        )
+        summary += f" | First divergence: layer {diff.first_divergence_layer}"
     summary += "</p>"
 
     return (
         f'<div style="overflow-x:auto;">'
-        f'<table><tr>{headers}</tr>{"".join(rows)}</table></div>'
+        f"<table><tr>{headers}</tr>{''.join(rows)}</table></div>"
         f"{summary}"
     )
 
@@ -590,9 +576,7 @@ def _section_overlay_chart(
             }
         )
 
-    chart = _svg_line_chart(
-        series, y_min=0.0, x_title="Layer", y_title="Probability"
-    )
+    chart = _svg_line_chart(series, y_min=0.0, x_title="Layer", y_title="Probability")
     return f'<div class="chart-container">{chart}</div>'
 
 
@@ -605,18 +589,14 @@ def _section_divergence_heatmap(diff: DiffResult) -> str:
     n_layers = len(diff.layer_metrics)
 
     # Build matrix: rows=layers, cols=metrics, values normalized 0-1
-    max_kl = max(
-        (m.kl_divergence for m in diff.layer_metrics), default=1.0
-    )
+    max_kl = max((m.kl_divergence for m in diff.layer_metrics), default=1.0)
     max_kl = max(max_kl, 0.01)
 
     cell_w, cell_h = 80, 22
     w = 80 + len(metrics_names) * cell_w + 10
     h = 40 + n_layers * cell_h + 10
 
-    p = [
-        f'<svg viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg">'
-    ]
+    p = [f'<svg viewBox="0 0 {w} {h}" xmlns="http://www.w3.org/2000/svg">']
 
     # Column headers
     for ci, name in enumerate(metrics_names):
@@ -739,9 +719,7 @@ def generate_report(
     sections.append("<h2>Raw Data</h2>")
     sections.append(_section_raw_data(trace, layer_stats))
 
-    return _html_page(
-        f"NeuroTrace: {meta.prompt[:60]}", "\n".join(sections)
-    )
+    return _html_page(f"NeuroTrace: {meta.prompt[:60]}", "\n".join(sections))
 
 
 def generate_comparison_report(
@@ -809,25 +787,19 @@ def generate_comparison_report(
         # Side-by-side prediction tables
         "<h2>Token Prediction Evolution</h2>",
         '<div class="side-by-side">',
-        f"<div><h3>{_esc(label_a)}</h3>"
-        f"{_section_prediction_table(preds_a)}</div>",
-        f"<div><h3>{_esc(label_b)}</h3>"
-        f"{_section_prediction_table(preds_b)}</div>",
+        f"<div><h3>{_esc(label_a)}</h3>{_section_prediction_table(preds_a)}</div>",
+        f"<div><h3>{_esc(label_b)}</h3>{_section_prediction_table(preds_b)}</div>",
         "</div>",
         # Side-by-side norms and entropy
         "<h2>Residual Stream Norms</h2>",
         '<div class="side-by-side">',
-        f"<div><h3>{_esc(label_a)}</h3>"
-        f"{_section_residual_norms(stats_a)}</div>",
-        f"<div><h3>{_esc(label_b)}</h3>"
-        f"{_section_residual_norms(stats_b)}</div>",
+        f"<div><h3>{_esc(label_a)}</h3>{_section_residual_norms(stats_a)}</div>",
+        f"<div><h3>{_esc(label_b)}</h3>{_section_residual_norms(stats_b)}</div>",
         "</div>",
         "<h2>Attention Entropy</h2>",
         '<div class="side-by-side">',
-        f"<div><h3>{_esc(label_a)}</h3>"
-        f"{_section_entropy(stats_a)}</div>",
-        f"<div><h3>{_esc(label_b)}</h3>"
-        f"{_section_entropy(stats_b)}</div>",
+        f"<div><h3>{_esc(label_a)}</h3>{_section_entropy(stats_a)}</div>",
+        f"<div><h3>{_esc(label_b)}</h3>{_section_entropy(stats_b)}</div>",
         "</div>",
     ]
 
@@ -849,10 +821,8 @@ def generate_comparison_report(
         [
             "<h2>Raw Data</h2>",
             '<div class="side-by-side">',
-            f"<div><h3>{_esc(label_a)}</h3>"
-            f"{_section_raw_data(trace_a, stats_a)}</div>",
-            f"<div><h3>{_esc(label_b)}</h3>"
-            f"{_section_raw_data(trace_b, stats_b)}</div>",
+            f"<div><h3>{_esc(label_a)}</h3>{_section_raw_data(trace_a, stats_a)}</div>",
+            f"<div><h3>{_esc(label_b)}</h3>{_section_raw_data(trace_b, stats_b)}</div>",
             "</div>",
         ]
     )

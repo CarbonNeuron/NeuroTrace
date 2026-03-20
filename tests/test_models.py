@@ -30,9 +30,7 @@ def test_load_model_no_auth_warning(capsys):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         load_model(TINYLLAMA)
-    auth_warnings = [
-        w for w in caught if "unauthenticated" in str(w.message).lower()
-    ]
+    auth_warnings = [w for w in caught if "unauthenticated" in str(w.message).lower()]
     assert len(auth_warnings) == 0
 
 

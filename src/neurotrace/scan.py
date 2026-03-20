@@ -6,6 +6,7 @@ from dataclasses import dataclass
 @dataclass
 class SabotageResult:
     """Result of sabotage detection for a single prompt."""
+
     flags: list[str]
     status: str  # "correct", "wrong", "weak", "sabotaged"
     peak_prob: float
@@ -17,6 +18,7 @@ class SabotageResult:
 @dataclass
 class PromptResult:
     """Full result for a single (prompt, answer) pair."""
+
     prompt: str
     answer: str
     final_token: str
@@ -35,6 +37,7 @@ class PromptResult:
 @dataclass
 class ScanResult:
     """Aggregate results for a full dataset scan."""
+
     model_name: str
     dataset_name: str
     prompt_results: list[PromptResult]
@@ -92,8 +95,10 @@ def detect_sabotage(
     if final_rank != 1:
         flags.append("wrong")
         return SabotageResult(
-            flags=flags, status="wrong",
-            peak_prob=peak_prob, peak_layer_idx=peak_layer_idx,
+            flags=flags,
+            status="wrong",
+            peak_prob=peak_prob,
+            peak_layer_idx=peak_layer_idx,
             commitment_layer_idx=commitment_layer_idx,
             sabotage_layers=[],
         )
@@ -133,8 +138,10 @@ def detect_sabotage(
         status = "correct"
 
     return SabotageResult(
-        flags=flags, status=status,
-        peak_prob=peak_prob, peak_layer_idx=peak_layer_idx,
+        flags=flags,
+        status=status,
+        peak_prob=peak_prob,
+        peak_layer_idx=peak_layer_idx,
         commitment_layer_idx=commitment_layer_idx,
         sabotage_layers=sorted(set(sabotage_layers)),
     )
@@ -175,11 +182,9 @@ def run_scan(
     tracer = Tracer(model, tokenizer)
     model_name = model.config._name_or_path
 
-    # Get lm_head and final layer norm for projection
-    lm_head = model.lm_head
-    final_ln = None
-    if hasattr(model, "model") and hasattr(model.model, "norm"):
-        final_ln = model.model.norm
+    from neurotrace.models import get_lm_head_and_norm
+
+    lm_head, final_ln = get_lm_head_and_norm(model)
 
     prompt_results: list[PromptResult] = []
 
@@ -208,13 +213,23 @@ def run_scan(
 
         if answer_token_id is None:
             # Can't resolve token, mark as wrong
-            prompt_results.append(PromptResult(
-                prompt=prompt, answer=answer,
-                final_token="?", final_prob=0.0, final_rank=0,
-                peak_prob=0.0, peak_layer=None, commitment_layer=None,
-                sabotage_layers=[], flags=["unresolvable"],
-                status="wrong", ranks=[], probs=[],
-            ))
+            prompt_results.append(
+                PromptResult(
+                    prompt=prompt,
+                    answer=answer,
+                    final_token="?",
+                    final_prob=0.0,
+                    final_rank=0,
+                    peak_prob=0.0,
+                    peak_layer=None,
+                    commitment_layer=None,
+                    sabotage_layers=[],
+                    flags=["unresolvable"],
+                    status="wrong",
+                    ranks=[],
+                    probs=[],
+                )
+            )
             continue
 
         # Project each layer's residual_out through lm_head
@@ -261,20 +276,28 @@ def run_scan(
 
         # Detect sabotage
         sab = detect_sabotage(
-            ranks, probs_list, final_rank, final_prob,
-            sabotage_threshold, final_threshold,
+            ranks,
+            probs_list,
+            final_rank,
+            final_prob,
+            sabotage_threshold,
+            final_threshold,
         )
 
         pr = PromptResult(
-            prompt=prompt, answer=answer,
-            final_token=final_token, final_prob=final_prob,
+            prompt=prompt,
+            answer=answer,
+            final_token=final_token,
+            final_prob=final_prob,
             final_rank=final_rank,
             peak_prob=sab.peak_prob,
             peak_layer=sab.peak_layer_idx,
             commitment_layer=sab.commitment_layer_idx,
             sabotage_layers=sab.sabotage_layers,
-            flags=sab.flags, status=sab.status,
-            ranks=ranks, probs=probs_list,
+            flags=sab.flags,
+            status=sab.status,
+            ranks=ranks,
+            probs=probs_list,
         )
         prompt_results.append(pr)
 

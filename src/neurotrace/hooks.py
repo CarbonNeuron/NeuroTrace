@@ -20,7 +20,7 @@ class HookManager:
         self._arch = architecture
         self._capture_mode = capture_mode
         self._layer_stride = layer_stride
-        self._handles: list[torch.utils.hooks.RemovableHook] = []
+        self._handles: list[torch.utils.hooks.RemovableHandle] = []
         self._captured: dict[tuple[int, str], dict] = {}
 
         self._register_hooks()

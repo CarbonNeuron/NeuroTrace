@@ -34,7 +34,11 @@ def test_missing_sdk(tmp_path, monkeypatch):
 
     # Simulate ImportError by removing carbonfiles from sys.modules
     # and patching builtins.__import__
-    original_import = __builtins__.__import__ if hasattr(__builtins__, '__import__') else __import__
+    original_import = (
+        __builtins__.__import__  # type: ignore[union-attr]
+        if hasattr(__builtins__, "__import__")
+        else __import__
+    )
 
     def mock_import(name, *args, **kwargs):
         if name == "carbonfiles":
@@ -70,7 +74,10 @@ def test_bucket_provided_skips_creation(tmp_path, monkeypatch):
     # Should have used the existing bucket
     mock_cf_instance.buckets.__getitem__.assert_called_with("existing-bucket")
     mock_bucket.files.upload.assert_called_once_with(str(html))
-    assert url == "https://files.example.com/api/buckets/existing-bucket/files/report.html/content"
+    assert (
+        url
+        == "https://files.example.com/api/buckets/existing-bucket/files/report.html/content"
+    )
 
 
 def test_successful_upload_creates_bucket(tmp_path, monkeypatch):
@@ -100,7 +107,10 @@ def test_successful_upload_creates_bucket(tmp_path, monkeypatch):
     )
     mock_cf_instance.buckets.__getitem__.assert_called_with("new-bucket-123")
     mock_bucket_ref.files.upload.assert_called_once_with(str(html))
-    assert url == "https://files.example.com/api/buckets/new-bucket-123/files/report.html/content"
+    assert (
+        url
+        == "https://files.example.com/api/buckets/new-bucket-123/files/report.html/content"
+    )
 
 
 def test_upload_called_after_html_written(tmp_path, monkeypatch):
@@ -127,11 +137,14 @@ def test_upload_called_after_html_written(tmp_path, monkeypatch):
 
     # Verify the exact path was passed
     mock_bucket_ref.files.upload.assert_called_once_with(str(html))
-    assert url == "https://files.example.com/api/buckets/b1/files/my-report.html/content"
+    assert (
+        url == "https://files.example.com/api/buckets/b1/files/my-report.html/content"
+    )
 
 
 def test_cli_upload_flag(tmp_path, monkeypatch):
     """CLI --upload flag triggers upload after report generation."""
+    import numpy as np
     from click.testing import CliRunner
 
     from neurotrace.cli import cli
@@ -142,7 +155,6 @@ def test_cli_upload_flag(tmp_path, monkeypatch):
         TraceMetadata,
         TraceResult,
     )
-    import numpy as np
 
     # Write a sample trace
     db_path = str(tmp_path / "test.db")
@@ -171,17 +183,25 @@ def test_cli_upload_flag(tmp_path, monkeypatch):
         residual_out=np.ones((2, 4), dtype=np.float32),
         attention_weights=np.ones((1, 2, 2), dtype=np.float32) * 0.5,
         attention_output=np.ones((2, 4), dtype=np.float32),
-        mlp_in=None, mlp_out=None, ln_values=None,
-        residual_in_norm=2.0, residual_out_norm=2.0,
-        attention_entropy=[0.5], mlp_activation_mag=1.0,
-        top1_token=42, top1_prob=0.8,
+        mlp_in=None,
+        mlp_out=None,
+        ln_values=None,
+        residual_in_norm=2.0,
+        residual_out_norm=2.0,
+        attention_entropy=[0.5],
+        mlp_activation_mag=1.0,
+        top1_token=42,
+        top1_prob=0.8,
     )
     pred = TokenPrediction(
-        position=0, top_k_tokens=[42], top_k_probs=[0.8],
+        position=0,
+        top_k_tokens=[42],
+        top_k_probs=[0.8],
         top_k_strings=["the"],
     )
     trace_result = TraceResult(
-        metadata=meta, layer_snapshots=[snap],
+        metadata=meta,
+        layer_snapshots=[snap],
         token_predictions=[pred],
         final_logits=np.zeros((2, 100), dtype=np.float32),
     )
@@ -196,13 +216,21 @@ def test_cli_upload_flag(tmp_path, monkeypatch):
     runner = CliRunner()
 
     with patch("neurotrace.upload.upload_report") as mock_upload:
-        mock_upload.return_value = "https://files.example.com/api/buckets/b1/files/report.html/content"
+        mock_upload.return_value = (
+            "https://files.example.com/api/buckets/b1/files/report.html/content"
+        )
         result = runner.invoke(
             cli,
             [
-                "report", "--db", db_path,
-                "--trace-id", "upload-trace",
-                "-o", output, "--no-attention", "--upload",
+                "report",
+                "--db",
+                db_path,
+                "--trace-id",
+                "upload-trace",
+                "-o",
+                output,
+                "--no-attention",
+                "--upload",
             ],
         )
 
