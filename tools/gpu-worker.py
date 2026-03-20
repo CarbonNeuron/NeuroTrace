@@ -47,6 +47,74 @@ log = logging.getLogger("gpu-worker")
 # ---------------------------------------------------------------------------
 
 
+def _list_devices() -> list[dict[str, str]]:
+    """Return a list of all available GPU devices with index and name."""
+    devices: list[dict[str, str]] = []
+    try:
+        import torch_directml  # type: ignore[import-untyped]
+
+        count = torch_directml.device_count()
+        for i in range(count):
+            devices.append(
+                {
+                    "backend": "directml",
+                    "index": str(i),
+                    "name": torch_directml.device_name(i),
+                }
+            )
+    except ImportError:
+        pass
+    if torch.cuda.is_available():
+        for i in range(torch.cuda.device_count()):
+            devices.append(
+                {
+                    "backend": "cuda",
+                    "index": str(i),
+                    "name": torch.cuda.get_device_name(i),
+                }
+            )
+    devices.append({"backend": "cpu", "index": "0", "name": "CPU"})
+    return devices
+
+
+def _resolve_device_index_by_name(
+    backend: str, name_query: str
+) -> int:
+    """Find a device index by substring match on device name. Errors on ambiguity."""
+    query_lower = name_query.lower()
+    matches: list[tuple[int, str]] = []
+
+    if backend == "directml":
+        try:
+            import torch_directml  # type: ignore[import-untyped]
+
+            for i in range(torch_directml.device_count()):
+                dname = torch_directml.device_name(i)
+                if query_lower in dname.lower():
+                    matches.append((i, dname))
+        except ImportError:
+            pass
+    elif backend == "cuda":
+        if torch.cuda.is_available():
+            for i in range(torch.cuda.device_count()):
+                dname = torch.cuda.get_device_name(i)
+                if query_lower in dname.lower():
+                    matches.append((i, dname))
+    else:
+        raise ValueError(f"--device-name is not supported with --device {backend}")
+
+    if len(matches) == 0:
+        raise ValueError(
+            f"No {backend} device matching '{name_query}' found"
+        )
+    if len(matches) > 1:
+        match_list = ", ".join(f"[{i}] {n}" for i, n in matches)
+        raise ValueError(
+            f"Multiple {backend} devices match '{name_query}': {match_list}"
+        )
+    return matches[0][0]
+
+
 def _auto_detect_device() -> torch.device:
     """Pick the best available device: DirectML > CUDA > CPU."""
     try:
@@ -60,17 +128,28 @@ def _auto_detect_device() -> torch.device:
     return torch.device("cpu")
 
 
-def _resolve_device(choice: str | None) -> torch.device:
-    """Resolve a user-specified device string, or auto-detect."""
+def _resolve_device(
+    choice: str | None,
+    device_index: int = 0,
+    device_name: str | None = None,
+) -> torch.device:
+    """Resolve a user-specified device string with optional index or name."""
+    if device_name is not None and choice is None:
+        raise ValueError("--device-name requires --device to be specified")
+
+    if device_name is not None:
+        assert choice is not None
+        device_index = _resolve_device_index_by_name(choice, device_name)
+
     if choice is None:
         return _auto_detect_device()
     choice_lower = choice.lower()
     if choice_lower == "directml":
         import torch_directml  # type: ignore[import-untyped]
 
-        return torch_directml.device()
+        return torch_directml.device(device_index)
     if choice_lower == "cuda":
-        return torch.device("cuda")
+        return torch.device(f"cuda:{device_index}")
     if choice_lower == "cpu":
         return torch.device("cpu")
     # Allow raw torch device strings like "cuda:1"
@@ -83,6 +162,13 @@ def _device_display_name(device: torch.device) -> str:
         idx = device.index or 0
         return torch.cuda.get_device_name(idx)
     if device.type == "privateuseone":
+        try:
+            import torch_directml  # type: ignore[import-untyped]
+
+            idx = device.index or 0
+            return torch_directml.device_name(idx)
+        except ImportError:
+            pass
         return "DirectML"
     return str(device)
 
@@ -618,11 +704,36 @@ def main() -> None:
         help="Force device (default: auto-detect)",
     )
     parser.add_argument(
+        "--device-index",
+        type=int,
+        default=0,
+        help="GPU ordinal index (default: 0)",
+    )
+    parser.add_argument(
+        "--device-name",
+        default=None,
+        help="Select GPU by substring match on device name (case-insensitive)",
+    )
+    parser.add_argument(
+        "--list-devices",
+        action="store_true",
+        help="Print all available devices and exit",
+    )
+    parser.add_argument(
         "--cache-dir", default=None, help="Model cache directory"
     )
     args = parser.parse_args()
 
-    device = _resolve_device(args.device)
+    if args.list_devices:
+        devices = _list_devices()
+        for d in devices:
+            print(f"[{d['backend']}:{d['index']}] {d['name']}")
+        return
+
+    if args.device_index != 0 and args.device_name is not None:
+        parser.error("--device-index and --device-name are mutually exclusive")
+
+    device = _resolve_device(args.device, args.device_index, args.device_name)
     _load_model(args.model, device, args.cache_dir)
 
     log.info("Starting server on %s:%d", args.host, args.port)
