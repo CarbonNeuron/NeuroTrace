@@ -276,6 +276,12 @@ class ForwardMlpDeltasAllPositionsRequest(BaseModel):
     seed: int = 42
 
 
+class AttentionContributionsRequest(BaseModel):
+    prompt: str
+    layers: list[int] | None = None
+    seed: int = 42
+
+
 class AttributeGradientsRequest(BaseModel):
     prompts: list[str]
     layer: int
@@ -796,6 +802,102 @@ def forward_mlp_deltas_all_positions(
     return StreamingResponse(
         _generate(), media_type="text/event-stream"
     )
+
+
+@app.post("/attention-contributions")
+def attention_contributions(
+    req: AttentionContributionsRequest,
+) -> StreamingResponse:
+    """Decompose per-head attention contributions to the residual stream."""
+    assert _model is not None and _tokenizer is not None and _device is not None
+
+    import base64
+
+    import numpy as np
+
+    async def _generate():
+        model_layers = _get_transformer_layers()
+        target_layers = (
+            req.layers
+            if req.layers is not None
+            else list(range(len(model_layers)))
+        )
+
+        torch.manual_seed(req.seed)
+        inputs = _tokenizer(req.prompt, return_tensors="pt").to(_device)
+
+        num_heads = _model.config.num_attention_heads
+        hidden_dim = _model.config.hidden_size
+        head_dim = hidden_dim // num_heads
+
+        # Hook o_proj with register_forward_pre_hook to capture input
+        captured_pre_proj: dict[int, torch.Tensor] = {}
+        hooks: list[torch.utils.hooks.RemovableHandle] = []
+
+        for layer_idx in target_layers:
+            def _make_hook(li: int):
+                def hook_fn(
+                    module: torch.nn.Module,
+                    args: Any,
+                ) -> None:
+                    inp = args[0] if isinstance(args, tuple) else args
+                    # Capture last position: [hidden_dim]
+                    captured_pre_proj[li] = inp[0, -1, :].detach().cpu().float()
+                return hook_fn
+
+            if layer_idx < len(model_layers):
+                o_proj = model_layers[layer_idx].self_attn.o_proj
+                h = o_proj.register_forward_pre_hook(_make_hook(layer_idx))
+                hooks.append(h)
+
+        try:
+            with torch.no_grad():
+                _model(**inputs)
+        finally:
+            for h in hooks:
+                h.remove()
+
+        # Decompose and stream per layer
+        for li in target_layers:
+            if li not in captured_pre_proj:
+                continue
+            pre_proj = captured_pre_proj[li].numpy()
+
+            # Get o_proj weight for this layer
+            o_proj_weight = (
+                model_layers[li].self_attn.o_proj.weight
+                .data.cpu().float().numpy()
+            )
+
+            # Per-head decomposition
+            head_vectors = pre_proj.reshape(num_heads, head_dim)
+            contributions = np.zeros((num_heads, hidden_dim), dtype=np.float32)
+            for i in range(num_heads):
+                w_o_slice = o_proj_weight[:, i * head_dim : (i + 1) * head_dim]
+                contributions[i] = w_o_slice @ head_vectors[i]
+
+            encoded = base64.b64encode(
+                contributions.astype(np.float16).tobytes()
+            ).decode("ascii")
+
+            yield _sse_line({
+                "type": "layer-contributions",
+                "layer": li,
+                "num_heads": int(num_heads),
+                "shape": list(contributions.shape),
+                "dtype": "float16",
+                "contributions": encoded,
+            })
+
+            await asyncio.sleep(0)
+
+        yield _sse_line({
+            "type": "done",
+            "layers_completed": len(target_layers),
+            "heads_per_layer": int(num_heads),
+        })
+
+    return StreamingResponse(_generate(), media_type="text/event-stream")
 
 
 @app.post("/attribute-gradients")

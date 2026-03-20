@@ -154,6 +154,31 @@ class RemoteWorker:
                 if line.startswith("data: "):
                     yield json.loads(line[6:])
 
+    def attention_contributions_stream(
+        self,
+        prompt: str,
+        layers: list[int] | None = None,
+        seed: int = 42,
+    ) -> Generator[dict, None, None]:
+        """Stream per-head attention contributions via SSE.
+
+        Yields parsed event dicts with types: layer-contributions, done.
+        """
+        payload: dict = {"prompt": prompt, "seed": seed}
+        if layers is not None:
+            payload["layers"] = layers
+
+        with self.client.stream(
+            "POST",
+            f"{self.base_url}/attention-contributions",
+            json=payload,
+            timeout=600.0,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line.startswith("data: "):
+                    yield json.loads(line[6:])
+
     def forward_mlp_deltas_all_positions_stream(
         self,
         prompt: str,

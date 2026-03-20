@@ -342,6 +342,31 @@ class TraceDB:
                 prompt_count INTEGER NOT NULL
             )
         """)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS attention_trace_runs (
+                run_id TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                dataset TEXT,
+                model_name TEXT NOT NULL,
+                layers JSON NOT NULL,
+                prompt_count INTEGER NOT NULL
+            )
+        """)
+        self._conn.execute(
+            "CREATE SEQUENCE IF NOT EXISTS attention_trace_seq START 1"
+        )
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS attention_trace_results (
+                id INTEGER DEFAULT nextval('attention_trace_seq'),
+                run_id TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                layer INTEGER NOT NULL,
+                head_idx INTEGER NOT NULL,
+                answer_projection REAL NOT NULL,
+                magnitude REAL NOT NULL
+            )
+        """)
+
         self._conn.execute(
             "CREATE SEQUENCE IF NOT EXISTS token_trace_seq START 1"
         )
@@ -1357,6 +1382,52 @@ class TraceDB:
             "SELECT run_id, created_at, dataset, model_name,"
             " layers, prompt_count"
             " FROM token_trace_runs ORDER BY created_at DESC"
+        ).fetchall()
+        cols = [
+            "run_id", "created_at", "dataset", "model_name",
+            "layers", "prompt_count",
+        ]
+        return [dict(zip(cols, r)) for r in rows]
+
+    def write_attention_trace_run(
+        self,
+        run_id: str,
+        dataset: str | None,
+        model_name: str,
+        layers: str,
+        prompt_count: int,
+    ) -> None:
+        """Write an attention-trace run to the database."""
+        self._conn.execute(
+            "INSERT INTO attention_trace_runs VALUES"
+            " (?, CURRENT_TIMESTAMP, ?, ?, ?, ?)",
+            [run_id, dataset, model_name, layers, prompt_count],
+        )
+
+    def write_attention_trace_result(
+        self,
+        run_id: str,
+        prompt: str,
+        layer: int,
+        head_idx: int,
+        answer_projection: float,
+        magnitude: float,
+    ) -> None:
+        """Write a single attention-trace result to the database."""
+        self._conn.execute(
+            "INSERT INTO attention_trace_results"
+            " (run_id, prompt, layer, head_idx,"
+            "  answer_projection, magnitude)"
+            " VALUES (?, ?, ?, ?, ?, ?)",
+            [run_id, prompt, layer, head_idx, answer_projection, magnitude],
+        )
+
+    def list_attention_trace_runs(self) -> list[dict]:
+        """List all attention-trace runs."""
+        rows = self._conn.execute(
+            "SELECT run_id, created_at, dataset, model_name,"
+            " layers, prompt_count"
+            " FROM attention_trace_runs ORDER BY created_at DESC"
         ).fetchall()
         cols = [
             "run_id", "created_at", "dataset", "model_name",

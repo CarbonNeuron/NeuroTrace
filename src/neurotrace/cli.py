@@ -5924,6 +5924,475 @@ def _token_trace_local(
     return model_name, all_results, layers
 
 
+@cli.command("attention-trace")
+@click.option("--model", default=None, help="HuggingFace model name (local mode).")
+@click.option("--db", required=True, help="Path to DuckDB database file.")
+@click.option("--prompt", "prompt_text", default=None, help="Single prompt to trace.")
+@click.option("--answer", default=None, help="Expected answer token.")
+@click.option(
+    "--dataset-builtin", default=None,
+    help="Built-in dataset name (e.g. 'capitals').",
+)
+@click.option(
+    "--dataset", "dataset_path", default=None,
+    type=click.Path(exists=True),
+    help="Path to JSONL/JSON dataset file.",
+)
+@click.option(
+    "--layers", "layer_spec", default=None,
+    help="Comma-separated layer indices (default: all).",
+)
+@click.option(
+    "--remote", default=None,
+    help="GPU worker URL (e.g., http://172.30.0.1:8877).",
+)
+@click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
+@click.option("--html", "html_path", default=None, help="HTML report output path.")
+@click.option("--json", "output_json", is_flag=True, help="JSON output.")
+@click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option("--seed", default=42, type=int, help="Random seed.")
+def attention_trace(
+    model,
+    db,
+    prompt_text,
+    answer,
+    dataset_builtin,
+    dataset_path,
+    layer_spec,
+    remote,
+    device,
+    html_path,
+    output_json,
+    adapter,
+    seed,
+):
+    """Decompose per-head attention contributions to the answer direction."""
+    import uuid
+    from datetime import datetime, timezone
+
+    from neurotrace.attention_trace import (
+        AttentionTraceRun,
+        attention_trace_run_to_dict,
+        generate_attention_trace_html_batch,
+        generate_attention_trace_html_single,
+    )
+
+    if remote is None and model is None:
+        raise click.UsageError("Must provide --model (local mode) or --remote.")
+
+    if prompt_text is None and dataset_builtin is None and dataset_path is None:
+        raise click.UsageError(
+            "Must provide --prompt, --dataset-builtin, or --dataset."
+        )
+
+    # Build prompt list
+    prompts: list[dict] = []
+    dataset_name = None
+
+    if prompt_text is not None:
+        if answer is None:
+            raise click.UsageError("--answer is required with --prompt.")
+        prompts = [{"prompt": prompt_text, "answer": answer}]
+    elif dataset_builtin is not None:
+        from neurotrace.datasets import get_builtin_dataset
+
+        prompts = get_builtin_dataset(dataset_builtin)
+        dataset_name = dataset_builtin
+    elif dataset_path is not None:
+        from neurotrace.datasets import load_dataset
+
+        prompts = load_dataset(dataset_path)
+        dataset_name = dataset_path
+
+    db_conn = TraceDB(db)
+    run_id = str(uuid.uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    if remote is not None:
+        model_name, all_results, layers = _attention_trace_remote(
+            remote, prompts, layer_spec, seed, model,
+        )
+    else:
+        model_name, all_results, layers = _attention_trace_local(
+            model, prompts, layer_spec, seed, device, adapter,
+        )
+
+    # Build run
+    run = AttentionTraceRun(
+        run_id=run_id,
+        dataset=dataset_name,
+        model_name=model_name,
+        layers=layers,
+        prompt_count=len(all_results),
+        results=all_results,
+        created_at=created_at,
+    )
+
+    # Save to DB
+    db_conn.write_attention_trace_run(
+        run_id=run_id,
+        dataset=dataset_name,
+        model_name=model_name,
+        layers=json.dumps(layers),
+        prompt_count=len(all_results),
+    )
+    for result in all_results:
+        for entry in result.entries:
+            db_conn.write_attention_trace_result(
+                run_id=run_id,
+                prompt=result.prompt,
+                layer=entry.layer,
+                head_idx=entry.head_idx,
+                answer_projection=entry.answer_projection,
+                magnitude=entry.magnitude,
+            )
+
+    # Look up MLP total from token-trace if available (single prompt only)
+    mlp_total = None
+    if len(all_results) == 1:
+        try:
+            rows = db_conn._conn.execute(
+                "SELECT SUM(answer_projection) FROM token_trace_results"
+                " WHERE prompt = ? AND is_last = true",
+                [all_results[0].prompt],
+            ).fetchone()
+            if rows and rows[0] is not None:
+                mlp_total = float(rows[0])
+        except Exception:
+            pass
+
+    # Look up vulnerable prompts from heatmap data (batch)
+    vulnerable_prompts: set[str] | None = None
+    if len(all_results) > 1:
+        try:
+            heatmap_runs = db_conn.get_all_heatmap_runs()
+            if heatmap_runs:
+                import json as _json
+
+                cells = _json.loads(heatmap_runs[0]["cells"])
+                vuln = set()
+                for cell in cells:
+                    if cell.get("flipped") or cell.get("flip_direction"):
+                        vuln.add(cell["prompt"])
+                if vuln:
+                    vulnerable_prompts = vuln
+        except Exception:
+            pass
+
+    db_conn.close()
+
+    # HTML output
+    if html_path:
+        import os
+
+        os.makedirs(os.path.dirname(html_path) or ".", exist_ok=True)
+        if len(all_results) == 1:
+            html = generate_attention_trace_html_single(
+                all_results[0], run, mlp_total=mlp_total,
+            )
+        else:
+            html = generate_attention_trace_html_batch(
+                run, vulnerable_prompts=vulnerable_prompts,
+            )
+        with open(html_path, "w") as f:
+            f.write(html)
+        console.print(f"[green]Report saved to {html_path}[/green]")
+
+    # JSON output
+    result_dict = attention_trace_run_to_dict(run)
+    if output_json:
+        click.echo(json.dumps(result_dict, indent=2))
+        return
+
+    # Terminal output
+    if len(all_results) == 1:
+        r = all_results[0]
+        console.print(
+            f'\n[bold]Attention-Trace:[/bold] "{r.prompt}" → {r.answer}\n'
+        )
+
+        # Top 10 heads table
+        table = Table(title="Top attention head contributions")
+        table.add_column("Head")
+        table.add_column("Answer Proj", justify="right")
+        table.add_column("Magnitude", justify="right")
+
+        sorted_entries = sorted(
+            r.entries, key=lambda e: abs(e.answer_projection), reverse=True,
+        )
+        for e in sorted_entries[:10]:
+            proj_style = "green" if e.answer_projection > 0 else "red"
+            table.add_row(
+                f"L{e.layer}.H{e.head_idx}",
+                f"[{proj_style}]{e.answer_projection:+.2f}[/{proj_style}]",
+                f"{e.magnitude:.2f}",
+            )
+        console.print(table)
+
+        attn_total = sum(e.answer_projection for e in r.entries)
+        summary = f"\nTotal attention: {attn_total:+.2f}"
+        if mlp_total is not None:
+            net = attn_total + mlp_total
+            summary += (
+                f" | Total MLP (from token-trace): {mlp_total:+.2f}"
+                f" | Net: {net:+.2f}"
+            )
+        console.print(summary)
+
+    elif len(all_results) > 1:
+        import numpy as np
+
+        console.print(
+            f"\n[bold]Attention-Trace Summary:[/bold] "
+            f"{dataset_name or 'custom'} ({len(all_results)} prompts)\n"
+        )
+
+        # Top 10 heads by mean projection
+        head_projs: dict[tuple[int, int], list[float]] = {}
+        for r in all_results:
+            for e in r.entries:
+                key = (e.layer, e.head_idx)
+                head_projs.setdefault(key, []).append(e.answer_projection)
+
+        head_means = [
+            ((layer, head), float(np.mean(vals)))
+            for (layer, head), vals in head_projs.items()
+        ]
+        head_means.sort(key=lambda x: abs(x[1]), reverse=True)
+
+        table = Table(title="Top 10 heads by mean answer projection")
+        table.add_column("Head")
+        table.add_column("Mean Proj", justify="right")
+
+        if vulnerable_prompts:
+            table.add_column(
+                f"Robust ({len(all_results) - len(vulnerable_prompts)})",
+                justify="right",
+            )
+            table.add_column(
+                f"Vulnerable ({len(vulnerable_prompts)})",
+                justify="right",
+            )
+
+        for (layer, head), mean_proj in head_means[:10]:
+            proj_style = "green" if mean_proj > 0 else "red"
+            row = [
+                f"L{layer}.H{head}",
+                f"[{proj_style}]{mean_proj:+.4f}[/{proj_style}]",
+            ]
+            if vulnerable_prompts:
+                r_vals = [
+                    e.answer_projection
+                    for r in all_results if r.prompt not in vulnerable_prompts
+                    for e in r.entries
+                    if e.layer == layer and e.head_idx == head
+                ]
+                v_vals = [
+                    e.answer_projection
+                    for r in all_results if r.prompt in vulnerable_prompts
+                    for e in r.entries
+                    if e.layer == layer and e.head_idx == head
+                ]
+                row.append(f"{np.mean(r_vals):+.4f}" if r_vals else "—")
+                row.append(f"{np.mean(v_vals):+.4f}" if v_vals else "—")
+            table.add_row(*row)
+        console.print(table)
+
+        # Aggregate table
+        if vulnerable_prompts:
+            robust_results = [
+                r for r in all_results if r.prompt not in vulnerable_prompts
+            ]
+            vuln_results = [
+                r for r in all_results if r.prompt in vulnerable_prompts
+            ]
+
+            agg_table = Table(title="Aggregate")
+            agg_table.add_column("Metric")
+            agg_table.add_column(
+                f"Robust ({len(robust_results)})", justify="right",
+            )
+            agg_table.add_column(
+                f"Vulnerable ({len(vuln_results)})", justify="right",
+            )
+
+            r_totals = [
+                sum(e.answer_projection for e in r.entries) for r in robust_results
+            ] if robust_results else [0.0]
+            v_totals = [
+                sum(e.answer_projection for e in r.entries) for r in vuln_results
+            ]
+            agg_table.add_row(
+                "Total attn proj",
+                f"{np.mean(r_totals):+.2f}",
+                f"{np.mean(v_totals):+.2f}",
+            )
+
+            r_counts = [
+                sum(1 for e in r.entries if e.answer_projection > 0.5)
+                for r in robust_results
+            ] if robust_results else [0]
+            v_counts = [
+                sum(1 for e in r.entries if e.answer_projection > 0.5)
+                for r in vuln_results
+            ]
+            agg_table.add_row(
+                "Num heads > +0.5",
+                f"{np.mean(r_counts):.1f}",
+                f"{np.mean(v_counts):.1f}",
+            )
+            console.print(agg_table)
+    else:
+        console.print("[yellow]No attention-trace results computed.[/yellow]")
+
+
+def _attention_trace_local(
+    model_name, prompts, layer_spec, seed, device_str, adapter,
+):
+    """Run attention-trace locally."""
+    from neurotrace.attention_trace import run_attention_trace_local
+    from neurotrace.models import get_architecture, get_lm_head_and_norm, load_model
+
+    device_str = _resolve_device(device_str)
+    all_results = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task("Loading model...", total=None)
+        model_obj, tokenizer = load_model(model_name, device=device_str)
+        model_obj = _maybe_load_adapter(model_obj, adapter)
+        arch = get_architecture(model_obj.config.model_type)
+
+        lm_head, _ = get_lm_head_and_norm(model_obj)
+        lm_head_weight = lm_head.weight.data.cpu().float().numpy()
+
+        num_layers = len(arch.get_layers(model_obj))
+        if layer_spec:
+            layers = [int(x.strip()) for x in layer_spec.split(",")]
+        else:
+            layers = list(range(num_layers))
+
+        progress.update(
+            task,
+            description=(
+                f"Attention-trace: {len(prompts)} prompts"
+                f" × {len(layers)} layers"
+            ),
+            total=len(prompts),
+        )
+
+        for i, entry in enumerate(prompts):
+            progress.update(
+                task, completed=i,
+                description=f"Processing {i + 1}/{len(prompts)}...",
+            )
+            result = run_attention_trace_local(
+                model_obj, tokenizer, arch,
+                prompt=entry["prompt"],
+                answer=entry["answer"],
+                layers=layers,
+                lm_head_weight=lm_head_weight,
+                seed=seed,
+            )
+            all_results.append(result)
+
+        progress.update(task, description="Done.", completed=len(prompts))
+
+    return model_name, all_results, layers
+
+
+def _attention_trace_remote(
+    remote_url, prompts, layer_spec, seed, model_name_hint,
+):
+    """Run attention-trace via remote GPU worker."""
+    import base64
+
+    import numpy as np
+
+    from neurotrace.attention_trace import run_attention_trace_remote
+    from neurotrace.models import get_lm_head_and_norm, load_model
+    from neurotrace.remote import RemoteWorker
+
+    worker = RemoteWorker(remote_url)
+    health = worker.health()
+    device_name = health.get("device_name", health.get("device", "unknown"))
+    model_name = health["model"]
+    num_layers = health["num_layers"]
+
+    err_console.print(f"GPU: {device_name} via {remote_url}")
+
+    if layer_spec:
+        layers = [int(x.strip()) for x in layer_spec.split(",")]
+    else:
+        layers = list(range(num_layers))
+
+    all_results = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task("Loading tokenizer & lm_head...", total=None)
+        model_obj, tokenizer = load_model(model_name, device="cpu")
+        lm_head, _ = get_lm_head_and_norm(model_obj)
+        lm_head_weight = lm_head.weight.data.cpu().float().numpy()
+
+        progress.update(
+            task,
+            description=(
+                f"Attention-trace: {len(prompts)} prompts"
+                f" × {len(layers)} layers"
+            ),
+            total=len(prompts),
+        )
+
+        for i, entry in enumerate(prompts):
+            progress.update(
+                task, completed=i,
+                description=f"Attention-trace {i + 1}/{len(prompts)}...",
+            )
+
+            prompt_text = entry["prompt"]
+
+            # Fetch per-head contributions from remote
+            layer_contributions: dict[int, np.ndarray] = {}
+            for event in worker.attention_contributions_stream(
+                prompt_text, layers, seed=seed,
+            ):
+                etype = event.get("type")
+                if etype == "layer-contributions":
+                    layer_idx = event["layer"]
+                    shape = event["shape"]
+                    dtype = (
+                        np.float16
+                        if event.get("dtype") == "float16"
+                        else np.float32
+                    )
+                    arr = np.frombuffer(
+                        base64.b64decode(event["contributions"]),
+                        dtype=dtype,
+                    ).astype(np.float32).reshape(shape).copy()
+                    layer_contributions[layer_idx] = arr
+
+            result = run_attention_trace_remote(
+                layer_contributions=layer_contributions,
+                tokenizer=tokenizer,
+                prompt=prompt_text,
+                answer=entry["answer"],
+                layers=layers,
+                lm_head_weight=lm_head_weight,
+            )
+            all_results.append(result)
+
+        progress.update(task, description="Done.", completed=len(prompts))
+
+    return model_name, all_results, layers
+
+
 def _token_trace_remote(
     remote_url, prompts, layer_spec, commitment_data, seed, model_name_hint,
 ):
