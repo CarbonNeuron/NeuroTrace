@@ -386,6 +386,35 @@ class TraceDB:
             )
         """)
 
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS diagnosis_runs (
+                id TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                dataset TEXT,
+                model_name TEXT NOT NULL,
+                prompt_count INTEGER NOT NULL
+            )
+        """)
+        self._conn.execute(
+            "CREATE SEQUENCE IF NOT EXISTS diagnosis_seq START 1"
+        )
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS diagnosis_results (
+                id INTEGER DEFAULT nextval('diagnosis_seq'),
+                run_id TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                total_attention REAL,
+                total_mlp REAL,
+                top3_share REAL,
+                circuit_type TEXT,
+                signal_strength TEXT,
+                vulnerability TEXT,
+                confidence TEXT,
+                repair_json TEXT
+            )
+        """)
+
     def write_trace(
         self, result: TraceResult, interventions: str | None = None
     ) -> None:
@@ -1433,6 +1462,57 @@ class TraceDB:
             "run_id", "created_at", "dataset", "model_name",
             "layers", "prompt_count",
         ]
+        return [dict(zip(cols, r)) for r in rows]
+
+    def write_diagnosis_run(
+        self,
+        run_id: str,
+        dataset: str | None,
+        model_name: str,
+        prompt_count: int,
+    ) -> None:
+        """Write a diagnosis run to the database."""
+        self._conn.execute(
+            "INSERT INTO diagnosis_runs VALUES"
+            " (?, CURRENT_TIMESTAMP, ?, ?, ?)",
+            [run_id, dataset, model_name, prompt_count],
+        )
+
+    def write_diagnosis_result(
+        self,
+        run_id: str,
+        prompt: str,
+        answer: str,
+        total_attention: float,
+        total_mlp: float,
+        top3_share: float,
+        circuit_type: str,
+        signal_strength: str,
+        vulnerability: str,
+        confidence: str,
+        repair_json: str | None,
+    ) -> None:
+        """Write a single diagnosis result to the database."""
+        self._conn.execute(
+            "INSERT INTO diagnosis_results"
+            " (run_id, prompt, answer, total_attention, total_mlp,"
+            "  top3_share, circuit_type, signal_strength,"
+            "  vulnerability, confidence, repair_json)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                run_id, prompt, answer, total_attention, total_mlp,
+                top3_share, circuit_type, signal_strength,
+                vulnerability, confidence, repair_json,
+            ],
+        )
+
+    def list_diagnosis_runs(self) -> list[dict]:
+        """List all diagnosis runs."""
+        rows = self._conn.execute(
+            "SELECT id, created_at, dataset, model_name, prompt_count"
+            " FROM diagnosis_runs ORDER BY created_at DESC"
+        ).fetchall()
+        cols = ["id", "created_at", "dataset", "model_name", "prompt_count"]
         return [dict(zip(cols, r)) for r in rows]
 
     def close(self) -> None:

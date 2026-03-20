@@ -6072,7 +6072,7 @@ def attention_trace(
                 cells = _json.loads(heatmap_runs[0]["cells"])
                 vuln = set()
                 for cell in cells:
-                    if cell.get("flipped") or cell.get("flip_direction"):
+                    if cell.get("flip_direction") == "broke":
                         vuln.add(cell["prompt"])
                 if vuln:
                     vulnerable_prompts = vuln
@@ -6479,3 +6479,535 @@ def _token_trace_remote(
         progress.update(task, description="Done.", completed=len(prompts))
 
     return model_name, all_results, layers
+
+
+# ---------------------------------------------------------------------------
+# diagnose command
+# ---------------------------------------------------------------------------
+
+
+@cli.command("diagnose")
+@click.option("--model", default=None, help="HuggingFace model name (local mode).")
+@click.option("--db", required=True, help="Path to DuckDB database file.")
+@click.option(
+    "--prompt", "prompt_text", default=None,
+    help="Single prompt to diagnose.",
+)
+@click.option("--answer", default=None, help="Expected answer token.")
+@click.option("--subject", default=None, help="Subject entity in prompt.")
+@click.option(
+    "--dataset-builtin", default=None,
+    help="Built-in dataset name (e.g. 'capitals').",
+)
+@click.option(
+    "--dataset", "dataset_path", default=None,
+    type=click.Path(exists=True),
+    help="Path to JSONL/JSON dataset file.",
+)
+@click.option(
+    "--layers", "layer_spec", default=None,
+    help="Comma-separated layer indices (default: all).",
+)
+@click.option(
+    "--remote", default=None,
+    help="GPU worker URL (e.g., http://172.30.0.1:8877).",
+)
+@click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
+@click.option("--html", "html_path", default=None, help="HTML report output path.")
+@click.option("--json", "output_json", is_flag=True, help="JSON output.")
+@click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option("--seed", default=42, type=int, help="Random seed.")
+def diagnose(
+    model,
+    db,
+    prompt_text,
+    answer,
+    subject,
+    dataset_builtin,
+    dataset_path,
+    layer_spec,
+    remote,
+    device,
+    html_path,
+    output_json,
+    adapter,
+    seed,
+):
+    """Combined attention-trace + token-trace circuit diagnosis."""
+    import uuid
+
+    from neurotrace.diagnose import (
+        DiagnosisResult,
+        diagnosis_to_dict,
+        generate_diagnose_html_batch,
+        generate_diagnose_html_single,
+        run_diagnosis,
+    )
+
+    if remote is None and model is None:
+        raise click.UsageError("Must provide --model (local mode) or --remote.")
+
+    if prompt_text is None and dataset_builtin is None and dataset_path is None:
+        raise click.UsageError(
+            "Must provide --prompt, --dataset-builtin, or --dataset."
+        )
+
+    # Build prompt list
+    prompts: list[dict] = []
+    dataset_name = None
+
+    if prompt_text is not None:
+        if answer is None:
+            raise click.UsageError("--answer is required with --prompt.")
+        prompts = [{"prompt": prompt_text, "answer": answer, "subject": subject}]
+    elif dataset_builtin is not None:
+        from neurotrace.datasets import get_builtin_dataset
+
+        prompts = get_builtin_dataset(dataset_builtin)
+        dataset_name = dataset_builtin
+    elif dataset_path is not None:
+        from neurotrace.datasets import load_dataset
+
+        prompts = load_dataset(dataset_path)
+        dataset_name = dataset_path
+
+    # Load commitment data for competitor projections in token-trace
+    db_conn = TraceDB(db)
+    commitment_data: dict[str, dict] = {}
+    try:
+        for run_info in db_conn.list_commitment_runs():
+            results = db_conn.read_commitment_results(run_info["run_id"])
+            for r in results:
+                commitment_data[r["prompt"]] = {
+                    "competitor_token": r["competitor_token"] or "",
+                }
+    except Exception:
+        pass
+
+    run_id = str(uuid.uuid4())
+
+    if remote is not None:
+        model_name, attn_results, token_results, layers = _diagnose_remote(
+            remote, prompts, layer_spec, commitment_data, seed, model,
+        )
+    else:
+        model_name, attn_results, token_results, layers = _diagnose_local(
+            model, prompts, layer_spec, commitment_data, seed,
+            device, adapter,
+        )
+
+    # Run diagnosis on each prompt
+    diagnoses: list[DiagnosisResult] = []
+    for attn_r, token_r in zip(attn_results, token_results):
+        diag = run_diagnosis(attn_r, token_r)
+        diagnoses.append(diag)
+
+    # Save to DB
+    db_conn.write_diagnosis_run(
+        run_id=run_id,
+        dataset=dataset_name,
+        model_name=model_name,
+        prompt_count=len(diagnoses),
+    )
+    for diag in diagnoses:
+        repair_json_str = None
+        if diag.repair is not None:
+            repair_json_str = json.dumps({
+                "target_heads": diag.repair.target_heads,
+                "target_layers": diag.repair.target_layers,
+                "suggested_fix": diag.repair.suggested_fix,
+                "suggested_modules": diag.repair.suggested_modules,
+                "alternative_fix": diag.repair.alternative_fix,
+                "alternative_layers": diag.repair.alternative_layers,
+                "alternative_modules": diag.repair.alternative_modules,
+            })
+        db_conn.write_diagnosis_result(
+            run_id=run_id,
+            prompt=diag.prompt,
+            answer=diag.answer,
+            total_attention=diag.circuit.total_attention,
+            total_mlp=diag.suppression.total_mlp,
+            top3_share=diag.circuit.top3_share,
+            circuit_type=diag.circuit.circuit_type,
+            signal_strength=diag.verdict.signal_strength,
+            vulnerability=diag.verdict.vulnerability,
+            confidence=diag.verdict.confidence,
+            repair_json=repair_json_str,
+        )
+    db_conn.close()
+
+    # HTML output
+    if html_path:
+        import os
+
+        os.makedirs(os.path.dirname(html_path) or ".", exist_ok=True)
+        if len(diagnoses) == 1:
+            html = generate_diagnose_html_single(
+                diagnoses[0], attn_results[0], token_results[0],
+                layers, model_name,
+            )
+        else:
+            html = generate_diagnose_html_batch(
+                diagnoses, dataset_name, model_name,
+            )
+        with open(html_path, "w") as f:
+            f.write(html)
+        console.print(f"[green]Report saved to {html_path}[/green]")
+
+    # JSON output
+    if output_json:
+        for diag in diagnoses:
+            click.echo(json.dumps(diagnosis_to_dict(diag)))
+        return
+
+    # Terminal output
+    if len(diagnoses) == 1:
+        diag = diagnoses[0]
+        console.print(
+            f'\n[bold]Diagnosis:[/bold] "{diag.prompt}" \u2192 {diag.answer}\n'
+        )
+
+        # Circuit table
+        circuit_table = Table(title="Circuit")
+        circuit_table.add_column("Metric")
+        circuit_table.add_column("Value")
+
+        active_str = str(len(diag.circuit.active_heads))
+        if diag.circuit.active_heads:
+            top_entries = ", ".join(
+                f"L{h['layer']}.H{h['head']} {h['projection']:+.2f}"
+                for h in diag.circuit.active_heads[:3]
+            )
+            if len(diag.circuit.active_heads) > 3:
+                active_str += f" ({top_entries}, ...)"
+            else:
+                active_str += f" ({top_entries})"
+        circuit_table.add_row("Active heads", active_str)
+        circuit_table.add_row(
+            "Circuit type",
+            f"{diag.circuit.circuit_type.capitalize()}"
+            f" (top3: {diag.circuit.top3_share:.0%})",
+        )
+        circuit_table.add_row(
+            "Total attention", f"{diag.circuit.total_attention:+.2f}",
+        )
+        circuit_table.add_row(
+            "Signal strength", diag.verdict.signal_strength.capitalize(),
+        )
+        console.print(circuit_table)
+
+        # Suppression table
+        supp_table = Table(title="Suppression")
+        supp_table.add_column("Metric")
+        supp_table.add_column("Value")
+        supp_table.add_row("Total MLP", f"{diag.suppression.total_mlp:+.2f}")
+        supp_table.add_row("Subject MLP", f"{diag.suppression.subject_mlp:+.2f}")
+        if diag.suppression.worst_layer is not None:
+            wl = diag.suppression.worst_layer
+            wv = diag.suppression.worst_layer_value
+            worst_str = f"L{wl} ({wv:+.2f})"
+        else:
+            worst_str = "\u2014"
+        supp_table.add_row("Worst layer", worst_str)
+        supp_table.add_row(
+            "Suppression ratio", f"{diag.suppression.suppression_ratio:.1f}x",
+        )
+        console.print(supp_table)
+
+        # Verdict table
+        v_style = {
+            "robust": "green", "moderate": "yellow",
+            "vulnerable": "red", "absent": "red",
+        }.get(diag.verdict.vulnerability, "white")
+        verdict_table = Table(title="Verdict")
+        verdict_table.add_column("")
+        verdict_table.add_column("")
+        verdict_table.add_row(
+            "Vulnerability",
+            f"[{v_style}]{diag.verdict.vulnerability.upper()}[/{v_style}]",
+        )
+        verdict_table.add_row("Reason", diag.verdict.reason)
+        verdict_table.add_row("Confidence", diag.verdict.confidence.capitalize())
+        console.print(verdict_table)
+
+        # Repair prescription
+        if diag.repair:
+            heads_str = ", ".join(
+                f"L{h['layer']}.H{h['head']}"
+                for h in diag.repair.target_heads
+            )
+            layers_str = ", ".join(
+                f"L{ly}" for ly in diag.repair.target_layers
+            )
+            console.print("\n[bold]Repair Prescription[/bold]")
+            console.print(
+                f"  Target: {layers_str} attention "
+                f"({', '.join(diag.repair.suggested_modules)})"
+            )
+            console.print(f"  Heads to strengthen: {heads_str}")
+            if diag.repair.alternative_layers:
+                alt_layers_str = ", ".join(
+                    f"L{ly}" for ly in diag.repair.alternative_layers
+                )
+                console.print(
+                    f"  Alternative: {alt_layers_str} MLP "
+                    f"({', '.join(diag.repair.alternative_modules)})"
+                )
+
+    elif len(diagnoses) > 1:
+        console.print(
+            f"\n[bold]Diagnosis Summary:[/bold] "
+            f"{dataset_name or 'custom'} ({len(diagnoses)} prompts)\n"
+        )
+
+        # Verdict summary
+        counts: dict[str, int] = {}
+        for d in diagnoses:
+            counts[d.verdict.vulnerability] = counts.get(d.verdict.vulnerability, 0) + 1
+
+        summary_table = Table(title="Verdict Summary")
+        summary_table.add_column("Verdict")
+        summary_table.add_column("Count", justify="right")
+        for v in ["robust", "moderate", "vulnerable", "absent"]:
+            if v in counts:
+                v_style = {
+                    "robust": "green", "moderate": "yellow",
+                    "vulnerable": "red", "absent": "red",
+                }.get(v, "white")
+                summary_table.add_row(
+                    f"[{v_style}]{v.capitalize()}[/{v_style}]",
+                    str(counts[v]),
+                )
+        console.print(summary_table)
+
+        # Most common repair targets
+        layer_counts: dict[int, int] = {}
+        for d in diagnoses:
+            if d.repair:
+                for ly in d.repair.target_layers:
+                    layer_counts[ly] = layer_counts.get(ly, 0) + 1
+        if layer_counts:
+            top_layers = sorted(
+                layer_counts.items(), key=lambda x: x[1], reverse=True,
+            )[:5]
+            console.print("\nMost common repair targets:")
+            for layer, count in top_layers:
+                console.print(f"  L{layer} attention: {count} prompts")
+
+        # Per-prompt table
+        detail_table = Table()
+        detail_table.add_column("Prompt")
+        detail_table.add_column("Answer")
+        detail_table.add_column("Total Attn", justify="right")
+        detail_table.add_column("Total MLP", justify="right")
+        detail_table.add_column("Circuit")
+        detail_table.add_column("Verdict")
+
+        for d in diagnoses:
+            v_style = {
+                "robust": "green", "moderate": "yellow",
+                "vulnerable": "red", "absent": "red",
+            }.get(d.verdict.vulnerability, "white")
+            detail_table.add_row(
+                d.prompt[:50],
+                d.answer,
+                f"{d.circuit.total_attention:+.2f}",
+                f"{d.suppression.total_mlp:+.2f}",
+                d.circuit.circuit_type,
+                f"[{v_style}]{d.verdict.vulnerability.capitalize()}[/{v_style}]",
+            )
+        console.print(detail_table)
+    else:
+        console.print("[yellow]No diagnosis results computed.[/yellow]")
+
+
+def _diagnose_local(
+    model_name, prompts, layer_spec, commitment_data, seed,
+    device_str, adapter,
+):
+    """Run diagnose locally -- both attention-trace and token-trace."""
+    from neurotrace.attention_trace import run_attention_trace_local
+    from neurotrace.models import get_architecture, get_lm_head_and_norm, load_model
+    from neurotrace.token_trace import run_token_trace_local
+
+    device_str = _resolve_device(device_str)
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task("Loading model...", total=None)
+        model_obj, tokenizer = load_model(model_name, device=device_str)
+        model_obj = _maybe_load_adapter(model_obj, adapter)
+        arch = get_architecture(model_obj.config.model_type)
+
+        lm_head, _ = get_lm_head_and_norm(model_obj)
+        lm_head_weight = lm_head.weight.data.cpu().float().numpy()
+
+        num_layers = len(arch.get_layers(model_obj))
+        if layer_spec:
+            layers = [int(x.strip()) for x in layer_spec.split(",")]
+        else:
+            layers = list(range(num_layers))
+
+        progress.update(
+            task,
+            description=f"Diagnose: {len(prompts)} prompts x {len(layers)} layers",
+            total=len(prompts),
+        )
+
+        attn_results = []
+        token_results = []
+
+        for i, entry in enumerate(prompts):
+            progress.update(
+                task, completed=i,
+                description=f"Diagnosing {i + 1}/{len(prompts)}...",
+            )
+
+            attn_r = run_attention_trace_local(
+                model_obj, tokenizer, arch,
+                prompt=entry["prompt"],
+                answer=entry["answer"],
+                layers=layers,
+                lm_head_weight=lm_head_weight,
+                seed=seed,
+            )
+            attn_results.append(attn_r)
+
+            token_r = run_token_trace_local(
+                model_obj, tokenizer, arch,
+                prompt=entry["prompt"],
+                answer=entry["answer"],
+                subject=entry.get("subject"),
+                layers=layers,
+                lm_head_weight=lm_head_weight,
+                commitment_data=commitment_data,
+                seed=seed,
+            )
+            token_results.append(token_r)
+
+        progress.update(task, description="Done.", completed=len(prompts))
+
+    return model_name, attn_results, token_results, layers
+
+
+def _diagnose_remote(
+    remote_url, prompts, layer_spec, commitment_data, seed, model_name_hint,
+):
+    """Run diagnose via remote GPU worker."""
+    import base64
+
+    import numpy as np
+
+    from neurotrace.attention_trace import run_attention_trace_remote
+    from neurotrace.models import get_lm_head_and_norm, load_model
+    from neurotrace.remote import RemoteWorker
+    from neurotrace.token_trace import run_token_trace_remote
+
+    worker = RemoteWorker(remote_url)
+    health = worker.health()
+    device_name = health.get("device_name", health.get("device", "unknown"))
+    model_name = health["model"]
+    num_layers = health["num_layers"]
+
+    err_console.print(f"GPU: {device_name} via {remote_url}")
+
+    if layer_spec:
+        layers = [int(x.strip()) for x in layer_spec.split(",")]
+    else:
+        layers = list(range(num_layers))
+
+    attn_results = []
+    token_results = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task("Loading tokenizer & lm_head...", total=None)
+        model_obj, tokenizer = load_model(model_name, device="cpu")
+        lm_head, _ = get_lm_head_and_norm(model_obj)
+        lm_head_weight = lm_head.weight.data.cpu().float().numpy()
+
+        progress.update(
+            task,
+            description=f"Diagnose: {len(prompts)} prompts x {len(layers)} layers",
+            total=len(prompts),
+        )
+
+        for i, entry in enumerate(prompts):
+            progress.update(
+                task, completed=i,
+                description=f"Diagnosing {i + 1}/{len(prompts)}...",
+            )
+
+            prompt_text = entry["prompt"]
+
+            # Attention-trace: fetch per-head contributions
+            layer_contributions: dict[int, np.ndarray] = {}
+            for event in worker.attention_contributions_stream(
+                prompt_text, layers, seed=seed,
+            ):
+                etype = event.get("type")
+                if etype == "layer-contributions":
+                    layer_idx = event["layer"]
+                    shape = event["shape"]
+                    dtype = (
+                        np.float16
+                        if event.get("dtype") == "float16"
+                        else np.float32
+                    )
+                    arr = np.frombuffer(
+                        base64.b64decode(event["contributions"]),
+                        dtype=dtype,
+                    ).astype(np.float32).reshape(shape).copy()
+                    layer_contributions[layer_idx] = arr
+
+            attn_r = run_attention_trace_remote(
+                layer_contributions=layer_contributions,
+                tokenizer=tokenizer,
+                prompt=prompt_text,
+                answer=entry["answer"],
+                layers=layers,
+                lm_head_weight=lm_head_weight,
+            )
+            attn_results.append(attn_r)
+
+            # Token-trace: fetch all-position MLP deltas
+            all_position_deltas: dict[int, np.ndarray] = {}
+            for event in worker.forward_mlp_deltas_all_positions_stream(
+                prompt_text, layers, seed=seed,
+            ):
+                etype = event.get("type")
+                if etype == "layer-deltas":
+                    layer_idx = event["layer"]
+                    shape = event["shape"]
+                    dtype = (
+                        np.float16
+                        if event.get("dtype") == "float16"
+                        else np.float32
+                    )
+                    arr = np.frombuffer(
+                        base64.b64decode(event["deltas"]),
+                        dtype=dtype,
+                    ).astype(np.float32).reshape(shape).copy()
+                    all_position_deltas[layer_idx] = arr
+
+            token_r = run_token_trace_remote(
+                all_position_deltas=all_position_deltas,
+                tokenizer=tokenizer,
+                prompt=prompt_text,
+                answer=entry["answer"],
+                subject=entry.get("subject"),
+                layers=layers,
+                lm_head_weight=lm_head_weight,
+                commitment_data=commitment_data,
+            )
+            token_results.append(token_r)
+
+        progress.update(task, description="Done.", completed=len(prompts))
+
+    return model_name, attn_results, token_results, layers
