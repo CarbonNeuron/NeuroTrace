@@ -241,9 +241,15 @@ class TraceDB:
                 peak_prob REAL,
                 peak_layer INTEGER,
                 final_prob REAL,
-                recovery_ratio REAL,
+                min_margin REAL,
+                margin_at_final REAL,
+                competitor_token TEXT,
+                competitor_peak REAL,
+                crossover_layer INTEGER,
                 vulnerable BOOLEAN,
-                trajectory JSON
+                trajectory JSON,
+                margin_trajectory JSON,
+                competitor_trajectory JSON
             )
         """)
 
@@ -967,16 +973,26 @@ class TraceDB:
         peak_prob: float,
         peak_layer: int,
         final_prob: float,
-        recovery_ratio: float,
+        min_margin: float,
+        margin_at_final: float,
+        competitor_token: str,
+        competitor_peak: float,
+        crossover_layer: int | None,
         vulnerable: bool,
         trajectory: str,
+        margin_trajectory: str,
+        competitor_trajectory: str,
     ) -> None:
         """Write a single commitment result to the database."""
         self._conn.execute(
             "INSERT INTO commitment_results"
             " (run_id, prompt, answer, peak_prob, peak_layer,"
-            "  final_prob, recovery_ratio, vulnerable, trajectory)"
-            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            "  final_prob, min_margin, margin_at_final,"
+            "  competitor_token, competitor_peak,"
+            "  crossover_layer, vulnerable,"
+            "  trajectory, margin_trajectory,"
+            "  competitor_trajectory)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 run_id,
                 prompt,
@@ -984,9 +1000,15 @@ class TraceDB:
                 peak_prob,
                 peak_layer,
                 final_prob,
-                recovery_ratio,
+                min_margin,
+                margin_at_final,
+                competitor_token,
+                competitor_peak,
+                crossover_layer,
                 vulnerable,
                 trajectory,
+                margin_trajectory,
+                competitor_trajectory,
             ],
         )
 
@@ -1014,7 +1036,11 @@ class TraceDB:
         cols = [
             "id", "run_id", "prompt", "answer",
             "peak_prob", "peak_layer", "final_prob",
-            "recovery_ratio", "vulnerable", "trajectory",
+            "min_margin", "margin_at_final",
+            "competitor_token", "competitor_peak",
+            "crossover_layer", "vulnerable",
+            "trajectory", "margin_trajectory",
+            "competitor_trajectory",
         ]
         return [dict(zip(cols, r)) for r in rows]
 

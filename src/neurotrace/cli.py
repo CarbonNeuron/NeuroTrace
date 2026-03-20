@@ -4391,8 +4391,8 @@ def _probe_universal_remote(
     "--device", default="cpu", help="Device: cpu, cuda, directml, auto."
 )
 @click.option(
-    "--threshold", default=0.7, type=float,
-    help="Recovery ratio threshold for vulnerability (default: 0.7).",
+    "--threshold", default=0.1, type=float,
+    help="Min margin threshold for vulnerability (default: 0.1).",
 )
 @click.option("--html", "html_path", default=None, help="HTML report output path.")
 @click.option("--json", "output_json", is_flag=True, help="JSON output.")
@@ -4560,9 +4560,17 @@ def commitment(
             peak_prob=r.peak_prob,
             peak_layer=r.peak_layer,
             final_prob=r.final_prob,
-            recovery_ratio=r.recovery_ratio,
+            min_margin=r.min_margin,
+            margin_at_final=r.margin_at_final,
+            competitor_token=r.competitor_token,
+            competitor_peak=r.competitor_peak,
+            crossover_layer=r.crossover_layer,
             vulnerable=r.vulnerable,
             trajectory=json.dumps(r.trajectory),
+            margin_trajectory=json.dumps(r.margin_trajectory),
+            competitor_trajectory=json.dumps(
+                r.competitor_trajectory
+            ),
         )
     db_conn.close()
 
@@ -4601,21 +4609,28 @@ def commitment(
     table.add_column("Prompt", max_width=50)
     table.add_column("Answer")
     table.add_column("Peak", justify="right")
-    table.add_column("PkLyr", justify="right")
-    table.add_column("Final", justify="right")
-    table.add_column("Recovery", justify="right")
+    table.add_column("MinMargin", justify="right")
+    table.add_column("Competitor")
+    table.add_column("CompPeak", justify="right")
+    table.add_column("Crossover", justify="right")
     table.add_column("Status")
 
     for r in results:
         style = "red" if r.vulnerable else "green"
         status = "VULN" if r.vulnerable else "OK"
+        xover = (
+            f"L{r.crossover_layer}"
+            if r.crossover_layer is not None
+            else "-"
+        )
         table.add_row(
             r.prompt[:50],
             r.answer,
             f"{r.peak_prob:.3f}",
-            str(r.peak_layer),
-            f"{r.final_prob:.3f}",
-            f"{r.recovery_ratio:.3f}",
+            f"{r.min_margin:+.3f}",
+            r.competitor_token,
+            f"{r.competitor_peak:.3f}",
+            xover,
             status,
             style=style,
         )
