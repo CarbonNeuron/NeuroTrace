@@ -190,6 +190,18 @@ class TraceDB:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS circuits (
+                id TEXT PRIMARY KEY,
+                probe_id TEXT,
+                model TEXT NOT NULL,
+                layer INTEGER NOT NULL,
+                top_boosted_tokens TEXT,
+                top_suppressed_tokens TEXT,
+                reverse_tokens TEXT,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
 
     def write_trace(
         self, result: TraceResult, interventions: str | None = None
@@ -734,6 +746,31 @@ class TraceDB:
                 result.direction_alignment,
                 result.cross_dataset,
                 result.cross_auc_roc,
+            ],
+        )
+
+    def save_circuit(self, circuit_id: str, result, probe_id: str | None = None) -> None:
+        """Save a circuit analysis result to the database."""
+        import json
+
+        top_boosted = json.dumps(result.forward.top_boosted)
+        top_suppressed = json.dumps(result.forward.top_suppressed)
+        reverse_tokens = json.dumps([
+            {"token": r.token, "cosine_sim": r.cosine_sim_with_probe}
+            for r in result.reverse
+        ]) if result.reverse else None
+
+        self._conn.execute(
+            "INSERT INTO circuits VALUES"
+            " (?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            [
+                circuit_id,
+                probe_id,
+                result.model_name,
+                result.layer,
+                top_boosted,
+                top_suppressed,
+                reverse_tokens,
             ],
         )
 
