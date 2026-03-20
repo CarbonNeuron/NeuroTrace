@@ -211,7 +211,7 @@ def test_neurons_ablate_from_missing_profile(tmp_path):
 # --- Model-dependent tests ---
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_profile_returns_correct_top_n(tinyllama_model):
     """Profile mode returns correct number of top-N neurons."""
     model, tokenizer = tinyllama_model
@@ -228,7 +228,7 @@ def test_profile_returns_correct_top_n(tinyllama_model):
     assert len(profile.target_activations) == 15
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_profile_neuron_indices_valid(tinyllama_model):
     """Profile neuron indices are within valid range."""
     model, tokenizer = tinyllama_model
@@ -246,7 +246,7 @@ def test_profile_neuron_indices_valid(tinyllama_model):
         assert 0 <= idx < 5632, f"Neuron index {idx} out of range"
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_profile_with_contrast(tinyllama_model):
     """Profile with contrast prompt produces differential activations."""
     model, tokenizer = tinyllama_model
@@ -267,7 +267,7 @@ def test_profile_with_contrast(tinyllama_model):
     assert any(abs(d) > 0.01 for d in profile.diff_activations)
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_ablate_zeros_neurons(tinyllama_model):
     """Ablation mode zeros specified neurons."""
     model, tokenizer = tinyllama_model
@@ -286,7 +286,7 @@ def test_ablate_zeros_neurons(tinyllama_model):
     assert results[0].baseline_top1 != ""
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_ablate_from_profile(tinyllama_model, tmp_path):
     """Ablation with --from-profile loads and uses saved profile."""
     model, tokenizer = tinyllama_model
@@ -322,7 +322,7 @@ def test_ablate_from_profile(tinyllama_model, tmp_path):
     db.close()
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_ablate_group_size(tinyllama_model):
     """Ablation with group_size groups neurons correctly."""
     model, tokenizer = tinyllama_model
@@ -345,7 +345,7 @@ def test_ablate_group_size(tinyllama_model):
     assert results[3].neurons == [9]
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_neurons_cli_profile_json(tinyllama_model, tmp_path):
     """CLI integration test for profile mode with JSON output."""
     db_path = str(tmp_path / "test.db")
@@ -373,7 +373,7 @@ def test_neurons_cli_profile_json(tinyllama_model, tmp_path):
     assert len(data["neurons"]) == 5
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_neurons_cli_ablate_json(tinyllama_model, tmp_path):
     """CLI integration test for ablation mode with JSON output."""
     db_path = str(tmp_path / "test.db")

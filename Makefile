@@ -7,7 +7,7 @@ test:
 	uv run pytest tests/ -v
 
 test-quick:
-	uv run pytest tests/ -v -m "not model_download"
+	uv run pytest tests/ -v -m "not slow"
 
 lint:
 	uv run ruff check src/ tests/

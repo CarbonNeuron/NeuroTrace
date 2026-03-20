@@ -405,7 +405,7 @@ class TestBuildFromRemote:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 class TestFingerprintCLI:
     def test_fingerprint_local(self, tinyllama_model, tmp_path):
         from click.testing import CliRunner

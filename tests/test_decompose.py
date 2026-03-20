@@ -362,7 +362,7 @@ class TestStorage:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 class TestDecomposeCLI:
     def test_single_prompt_json(self, tinyllama_model, tmp_path):
         from click.testing import CliRunner

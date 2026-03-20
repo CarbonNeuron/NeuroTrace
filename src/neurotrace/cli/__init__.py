@@ -122,3 +122,7 @@ cli.add_command(bench)
 from neurotrace.cli.report import report  # noqa: E402
 
 cli.add_command(report)
+
+from neurotrace.cli.worker import worker  # noqa: E402
+
+cli.add_command(worker)

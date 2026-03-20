@@ -353,7 +353,7 @@ class TestPerplexity:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 class TestBenchCLI:
     def test_bench_json_output(self, tinyllama_model, tmp_path):
         from click.testing import CliRunner

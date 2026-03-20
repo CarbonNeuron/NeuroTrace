@@ -585,7 +585,7 @@ class TestDiagnoseConfidenceFix:
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 class TestRepairCLI:
     def test_single_prompt_local(self, tinyllama_model, tmp_path):
         from click.testing import CliRunner

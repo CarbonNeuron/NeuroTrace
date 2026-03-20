@@ -348,6 +348,27 @@ class RemoteWorker:
         r.raise_for_status()
         return r.json()
 
+    def worker_version(self) -> dict:
+        """Get worker version and status info."""
+        r = self.client.get(f"{self.base_url}/version")
+        r.raise_for_status()
+        return r.json()
+
+    def worker_update_stream(self) -> Generator[dict, None, None]:
+        """Stream worker update progress via SSE.
+
+        Yields parsed event dicts with types: progress, done, error.
+        """
+        with self.client.stream(
+            "POST",
+            f"{self.base_url}/update",
+            timeout=120.0,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line.startswith("data: "):
+                    yield json.loads(line[6:])
+
     def download_adapter(self, adapter_id: str, output_path: str) -> None:
         """Download trained adapter weights to local path."""
         import io

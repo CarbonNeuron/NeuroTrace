@@ -7,7 +7,7 @@ from neurotrace.models import get_architecture
 TINYLLAMA = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_hooks_register_on_correct_modules(tinyllama_model):
     model, tokenizer = tinyllama_model
     arch = get_architecture(model.config.model_type)
@@ -21,7 +21,7 @@ def test_hooks_register_on_correct_modules(tinyllama_model):
     manager.cleanup()
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_hooks_capture_activations(tinyllama_model):
     model, tokenizer = tinyllama_model
     arch = get_architecture(model.config.model_type)
@@ -44,7 +44,7 @@ def test_hooks_capture_activations(tinyllama_model):
     manager.cleanup()
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_hooks_cleanup(tinyllama_model):
     model, tokenizer = tinyllama_model
     arch = get_architecture(model.config.model_type)
@@ -63,7 +63,7 @@ def test_hooks_cleanup(tinyllama_model):
         assert len(module._forward_hooks) == pre_hook_counts[id(module)]
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_light_mode_skips_mlp_tensors(tinyllama_model):
     model, tokenizer = tinyllama_model
     arch = get_architecture(model.config.model_type)

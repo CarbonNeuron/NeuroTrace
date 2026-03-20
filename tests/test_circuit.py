@@ -208,7 +208,7 @@ def test_db_circuit_roundtrip(tmp_path):
 # --- Model tests (require TinyLlama download) ---
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_forward_circuit_shapes(tinyllama_model):
     """Test forward circuit produces correct output shapes."""
     model, tokenizer = tinyllama_model
@@ -231,7 +231,7 @@ def test_forward_circuit_shapes(tinyllama_model):
     assert result.top_boosted[0]["logit"] > result.top_suppressed[0]["logit"]
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_forward_circuit_token_ids(tinyllama_model):
     """Test that forward circuit returns valid token IDs."""
     model, tokenizer = tinyllama_model
@@ -247,7 +247,7 @@ def test_forward_circuit_token_ids(tinyllama_model):
         assert isinstance(t["logit"], float)
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_reverse_circuit_unit_vector(tinyllama_model):
     """Test reverse trace produces unit vectors."""
     model, tokenizer = tinyllama_model
@@ -267,7 +267,7 @@ def test_reverse_circuit_unit_vector(tinyllama_model):
         assert -1.0 <= r.cosine_sim_with_probe <= 1.0
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_reverse_circuit_cosine_bounds(tinyllama_model):
     """Test reverse cosine similarity is within [-1, 1]."""
     model, tokenizer = tinyllama_model
@@ -284,7 +284,7 @@ def test_reverse_circuit_cosine_bounds(tinyllama_model):
         assert -1.0 - 1e-6 <= r.cosine_sim_with_probe <= 1.0 + 1e-6
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_compare_prompt_basic(tinyllama_model):
     """Test prompt comparison captures real activations."""
     model, tokenizer = tinyllama_model
@@ -304,7 +304,7 @@ def test_compare_prompt_basic(tinyllama_model):
     assert len(result.top_suppressed) == 5
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_run_circuit_full(tinyllama_model, tmp_path):
     """Test the full circuit analysis pipeline."""
     model, tokenizer = tinyllama_model
@@ -329,7 +329,7 @@ def test_run_circuit_full(tinyllama_model, tmp_path):
     assert len(result.comparisons) == 1
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_circuit_cli_json(tinyllama_model, tmp_path):
     """Test circuit CLI command with JSON output."""
     from click.testing import CliRunner
@@ -451,7 +451,7 @@ def test_save_no_real_comparison_json(tmp_path):
 # --- Real MLP comparison tests (require TinyLlama download) ---
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_capture_mlp_io_shapes(tinyllama_model):
     """Test _capture_mlp_io returns correct shapes."""
     model, tokenizer = tinyllama_model
@@ -465,7 +465,7 @@ def test_capture_mlp_io_shapes(tinyllama_model):
     assert result["final_logits"].shape == (vocab_size,)
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_compare_real_mlp_two_prompts(tinyllama_model):
     """Test compare_real_mlp with 2 prompts produces pairwise diff."""
     model, tokenizer = tinyllama_model
@@ -499,7 +499,7 @@ def test_compare_real_mlp_two_prompts(tinyllama_model):
     assert len(pw.diff_suppressed) == 5
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_compare_real_mlp_single_prompt(tinyllama_model):
     """Test compare_real_mlp with 1 prompt has no pairwise diff."""
     model, tokenizer = tinyllama_model
@@ -520,7 +520,7 @@ def test_compare_real_mlp_single_prompt(tinyllama_model):
     assert result.prompts[0].mlp_output_norm > 0
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_compare_real_mlp_diff_logits_shape(tinyllama_model):
     """Test that diff_logits produce vocab_size-length token lists."""
     model, tokenizer = tinyllama_model
@@ -547,7 +547,7 @@ def test_compare_real_mlp_diff_logits_shape(tinyllama_model):
         assert 0 <= t["token_id"] < vocab_size
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_run_circuit_includes_real_comparison(tinyllama_model, tmp_path):
     """Test run_circuit populates real_comparison when compare_prompts given."""
     model, tokenizer = tinyllama_model

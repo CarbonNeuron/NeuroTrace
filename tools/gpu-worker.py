@@ -18,6 +18,9 @@ import io
 import json
 import logging
 import os
+import platform
+import subprocess
+import sys
 import tarfile
 import tempfile
 import time
@@ -203,6 +206,48 @@ def _safe_topk(probs: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]
 
 app = FastAPI(title="NeuroTrace GPU Worker", version="1.0.0")
 
+START_TIME = time.time()
+
+try:
+    REPO_DIR = subprocess.check_output(
+        ["git", "rev-parse", "--show-toplevel"], text=True
+    ).strip()
+except Exception:
+    REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def get_git_info() -> dict[str, Any]:
+    """Collect git commit, branch, dirty status, and timestamp."""
+    try:
+        commit = subprocess.check_output(
+            ["git", "rev-parse", "--short", "HEAD"], text=True, cwd=REPO_DIR
+        ).strip()
+        branch = subprocess.check_output(
+            ["git", "rev-parse", "--abbrev-ref", "HEAD"], text=True, cwd=REPO_DIR
+        ).strip()
+        dirty = bool(
+            subprocess.check_output(
+                ["git", "status", "--porcelain"], text=True, cwd=REPO_DIR
+            ).strip()
+        )
+        timestamp = subprocess.check_output(
+            ["git", "log", "-1", "--format=%cI"], text=True, cwd=REPO_DIR
+        ).strip()
+        return {
+            "commit": commit,
+            "branch": branch,
+            "dirty": dirty,
+            "timestamp": timestamp,
+        }
+    except Exception:
+        return {
+            "commit": "unknown",
+            "branch": "unknown",
+            "dirty": True,
+            "timestamp": None,
+        }
+
+
 _model: AutoModelForCausalLM | None = None
 _tokenizer: AutoTokenizer | None = None
 _device: torch.device | None = None
@@ -385,6 +430,76 @@ def health() -> dict[str, Any]:
         "device_name": _device_display_name(_device),
         "num_layers": _num_layers,
     }
+
+
+@app.get("/version")
+async def version() -> dict[str, Any]:
+    assert _device is not None
+    git = get_git_info()
+    return {
+        **git,
+        "python": platform.python_version(),
+        "torch": torch.__version__,
+        "device": str(_device),
+        "device_name": _device_display_name(_device),
+        "model": _model_name,
+        "uptime_seconds": int(time.time() - START_TIME),
+    }
+
+
+def _sse_event(event: str, data: dict[str, Any]) -> str:
+    return f"event: {event}\ndata: {json.dumps(data)}\n\n"
+
+
+@app.post("/update")
+async def update() -> StreamingResponse:
+    async def stream():
+        old_commit = get_git_info()["commit"]
+
+        yield _sse_event(
+            "progress", {"status": "pulling", "message": "Pulling latest from origin/main..."}
+        )
+
+        result = subprocess.run(
+            ["git", "pull", "origin", "main"],
+            capture_output=True,
+            text=True,
+            cwd=REPO_DIR,
+        )
+
+        if result.returncode != 0:
+            yield _sse_event("error", {"message": f"Git pull failed: {result.stderr}"})
+            return
+
+        new_commit = get_git_info()["commit"]
+        changed = old_commit != new_commit
+
+        yield _sse_event(
+            "progress", {"status": "pulled", "message": result.stdout.strip()}
+        )
+
+        if changed:
+            yield _sse_event(
+                "progress",
+                {"status": "restarting", "message": "Restarting worker in 2 seconds..."},
+            )
+            yield _sse_event(
+                "done",
+                {"old_commit": old_commit, "new_commit": new_commit, "changed": True},
+            )
+
+            async def restart():
+                await asyncio.sleep(2)
+                os.execv(sys.executable, [sys.executable] + sys.argv)
+
+            asyncio.create_task(restart())
+        else:
+            yield _sse_event(
+                "done",
+                {"old_commit": old_commit, "new_commit": new_commit, "changed": False},
+            )
+
+    return StreamingResponse(stream(), media_type="text/event-stream")
 
 
 @app.post("/trace", response_model=TraceResponse)

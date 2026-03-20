@@ -214,7 +214,7 @@ def test_predict_no_residuals(tmp_path):
     assert "Residuals not stored" in result.output
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_predict_basic(tinyllama_model, tmp_path):
     """predict shows per-layer top-K predictions from a stored trace."""
     db_path = str(tmp_path / "test.db")
@@ -243,7 +243,7 @@ def test_predict_basic(tinyllama_model, tmp_path):
     assert "Layer" in result.output
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_predict_changes_only(tinyllama_model, tmp_path):
     """--changes-only filters to layers where top-1 changed."""
     db_path = str(tmp_path / "test.db")
@@ -276,7 +276,7 @@ def test_predict_changes_only(tinyllama_model, tmp_path):
     assert result.exit_code == 0
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_predict_track_token(tinyllama_model, tmp_path):
     """--track shows a specific token's rank at every layer."""
     db_path = str(tmp_path / "test.db")
@@ -311,7 +311,7 @@ def test_predict_track_token(tinyllama_model, tmp_path):
     assert "rank" in result.output
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_predict_json_output(tinyllama_model, tmp_path):
     """--json produces valid JSON output."""
     db_path = str(tmp_path / "test.db")
@@ -361,7 +361,7 @@ def test_predict_json_output(tinyllama_model, tmp_path):
     assert "annotations" in data[0]
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_predict_layers_filter(tinyllama_model, tmp_path):
     """--layers filters to specific layer indices."""
     db_path = str(tmp_path / "test.db")
@@ -406,7 +406,7 @@ def test_predict_layers_filter(tinyllama_model, tmp_path):
     assert layer_indices == {0, 5, 10}
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_decode_specific_tokens(tinyllama_model):
     runner = CliRunner()
     result = runner.invoke(
@@ -418,7 +418,7 @@ def test_decode_specific_tokens(tinyllama_model):
     assert "593" in result.output
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_decode_from_trace(tinyllama_model, tmp_path):
     db_path = str(tmp_path / "test.db")
     runner = CliRunner()
@@ -452,7 +452,7 @@ def test_decode_from_trace(tinyllama_model, tmp_path):
     assert "Token Decode" in result.output
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_compare_end_to_end(tinyllama_model, tmp_path):
     db_path = str(tmp_path / "test.db")
     runner = CliRunner()
@@ -476,7 +476,7 @@ def test_compare_end_to_end(tinyllama_model, tmp_path):
     assert "Flagged layers:" in result.output
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_compare_reuses_existing_traces(tinyllama_model, tmp_path):
     db_path = str(tmp_path / "test.db")
     runner = CliRunner()
@@ -520,7 +520,7 @@ def test_compare_reuses_existing_traces(tinyllama_model, tmp_path):
     assert len(traces) == 2
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_compare_json_output(tinyllama_model, tmp_path):
     db_path = str(tmp_path / "test.db")
     runner = CliRunner()
@@ -595,7 +595,7 @@ def test_sweep_rejects_multiple_sweep_flags(tmp_path):
     assert "Only one --sweep-* flag" in result.output
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_sweep_scale_mlp(tinyllama_model, tmp_path):
     """Sweep scale-mlp runs multiple ablations and produces summary."""
     db_path = str(tmp_path / "test.db")
@@ -620,7 +620,7 @@ def test_sweep_scale_mlp(tinyllama_model, tmp_path):
     assert "Sweep" in result.output
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_sweep_json_output(tinyllama_model, tmp_path):
     """Sweep command --json produces valid JSON."""
     db_path = str(tmp_path / "test.db")
@@ -650,7 +650,7 @@ def test_sweep_json_output(tinyllama_model, tmp_path):
     assert len(data["results"]) == 3  # 0.3, 0.5, 0.7
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_sweep_zero_heads(tinyllama_model, tmp_path):
     """Sweep zero-heads runs one ablation per head."""
     db_path = str(tmp_path / "test.db")

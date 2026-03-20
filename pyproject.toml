@@ -51,6 +51,6 @@ select = ["E", "F", "I", "N", "W"]
 
 [tool.pytest.ini_options]
 markers = [
-    "model_download: marks tests that download HF models (deselect with '-m \"not model_download\"')",
+    "slow: marks tests that require a real model (skip with -m 'not slow')",
 ]
 testpaths = ["tests"]

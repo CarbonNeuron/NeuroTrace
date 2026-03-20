@@ -14,7 +14,7 @@ def test_llama_architecture_registered():
     assert arch.mlp_module == "mlp"
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_load_model():
     model, tokenizer = load_model(TINYLLAMA)
     assert model.config.model_type == "llama"
@@ -22,7 +22,7 @@ def test_load_model():
     assert model.config.num_hidden_layers > 0
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_load_model_no_auth_warning(capsys):
     """load_model should not produce HF authentication warnings."""
     import warnings
@@ -34,7 +34,7 @@ def test_load_model_no_auth_warning(capsys):
     assert len(auth_warnings) == 0
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_auto_detect_architecture():
     model, _ = load_model(TINYLLAMA)
     arch = get_architecture(model.config.model_type)

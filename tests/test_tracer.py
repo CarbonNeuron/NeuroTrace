@@ -7,7 +7,7 @@ from neurotrace.types import TraceResult
 TINYLLAMA = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_trace_returns_complete_result(tinyllama_model):
     model, tokenizer = tinyllama_model
     tracer = Tracer(model, tokenizer)
@@ -20,7 +20,7 @@ def test_trace_returns_complete_result(tinyllama_model):
     assert result.final_logits is not None
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_trace_tensor_shapes(tinyllama_model):
     model, tokenizer = tinyllama_model
     tracer = Tracer(model, tokenizer)
@@ -37,7 +37,7 @@ def test_trace_tensor_shapes(tinyllama_model):
         assert len(snap.attention_entropy) == num_heads
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_trace_light_mode(tinyllama_model):
     model, tokenizer = tinyllama_model
     tracer = Tracer(model, tokenizer, capture_mode="light")
@@ -51,7 +51,7 @@ def test_trace_light_mode(tinyllama_model):
         assert snap.residual_in_norm > 0
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_trace_layer_stride(tinyllama_model):
     model, tokenizer = tinyllama_model
     tracer = Tracer(model, tokenizer, layer_stride=4)
@@ -66,7 +66,7 @@ def test_trace_layer_stride(tinyllama_model):
         assert snap.residual_in_norm > 0
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_trace_top_k_predictions(tinyllama_model):
     model, tokenizer = tinyllama_model
     tracer = Tracer(model, tokenizer)
@@ -79,7 +79,7 @@ def test_trace_top_k_predictions(tinyllama_model):
         assert pred.top_k_probs[0] >= pred.top_k_probs[1]  # sorted descending
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_trace_metadata_completeness(tinyllama_model):
     model, tokenizer = tinyllama_model
     tracer = Tracer(model, tokenizer)

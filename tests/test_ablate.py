@@ -339,7 +339,7 @@ def test_ablate_baseline_resolve(tmp_path):
 # --- Hook management tests ---
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_mlp_hooks_registered_and_cleaned(tinyllama_model):
     """MLP ablation hooks are registered and properly cleaned up."""
     model, _ = tinyllama_model
@@ -355,7 +355,7 @@ def test_mlp_hooks_registered_and_cleaned(tinyllama_model):
     assert manager.num_hooks == 0
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_scale_mlp_hooks_registered_and_cleaned(tinyllama_model):
     """Scale MLP hooks are registered and properly cleaned up."""
     model, _ = tinyllama_model
@@ -376,7 +376,7 @@ def test_scale_mlp_hooks_registered_and_cleaned(tinyllama_model):
     assert manager.num_hooks == 0
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_zero_mlp_changes_output(tinyllama_model):
     """Zeroing a MLP sublayer produces different output than baseline."""
     model, tokenizer = tinyllama_model
@@ -395,7 +395,7 @@ def test_zero_mlp_changes_output(tinyllama_model):
     assert len(changed) > 0
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_scale_mlp_changes_output(tinyllama_model):
     """Scaling a MLP sublayer produces different output than baseline."""
     model, tokenizer = tinyllama_model
@@ -419,7 +419,7 @@ def test_scale_mlp_changes_output(tinyllama_model):
     assert len(changed) > 0
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_hooks_registered_and_cleaned(tinyllama_model):
     """Ablation hooks are registered and properly cleaned up."""
     model, _ = tinyllama_model
@@ -435,7 +435,7 @@ def test_hooks_registered_and_cleaned(tinyllama_model):
     assert manager.num_hooks == 0
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_zero_layer_changes_output(tinyllama_model):
     """Zeroing a layer produces different output than baseline."""
     model, tokenizer = tinyllama_model
@@ -454,7 +454,7 @@ def test_zero_layer_changes_output(tinyllama_model):
     assert len(changed) > 0
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_scale_identity_same_output(tinyllama_model):
     """Scale factor of 1.0 should produce identical output to baseline."""
     model, tokenizer = tinyllama_model
@@ -476,7 +476,7 @@ def test_scale_identity_same_output(tinyllama_model):
         )
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_zero_head_changes_output(tinyllama_model):
     """Zeroing attention heads changes the output."""
     model, tokenizer = tinyllama_model
@@ -496,7 +496,7 @@ def test_zero_head_changes_output(tinyllama_model):
     assert has_change
 
 
-@pytest.mark.model_download
+@pytest.mark.slow
 def test_ablated_trace_stored_with_interventions(tinyllama_model, tmp_path):
     """Full end-to-end: ablated trace is stored with interventions metadata."""
     model, tokenizer = tinyllama_model
