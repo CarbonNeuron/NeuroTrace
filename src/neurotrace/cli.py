@@ -1616,3 +1616,214 @@ def sweep(
         table.add_row(*row)
 
     console.print(table)
+
+
+@cli.command()
+@click.option("--db", required=True, help="Path to DuckDB database file.")
+@click.option("--model", required=True, help="HuggingFace model name or path.")
+@click.option(
+    "--dataset", "dataset_path", default=None,
+    help="Path to JSON dataset file.",
+)
+@click.option(
+    "--dataset-builtin", default=None,
+    help="Use a built-in dataset (e.g. 'capitals').",
+)
+@click.option("--seed", default=42, type=int, help="Random seed.")
+@click.option(
+    "--sabotage-threshold", default=0.5, type=float,
+    help="Fraction of peak prob drop to flag as sabotage.",
+)
+@click.option(
+    "--final-threshold", default=0.3, type=float,
+    help="Minimum final probability to avoid weak flag.",
+)
+@click.option(
+    "--save-traces", is_flag=True,
+    help="Store all traces to database.",
+)
+@click.option(
+    "--save-flagged", is_flag=True,
+    help="Store only flagged traces to database.",
+)
+@click.option("--details", is_flag=True, help="Show layer details for flagged prompts.")
+@click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
+def scan(
+    db, model, dataset_path, dataset_builtin, seed,
+    sabotage_threshold, final_threshold,
+    save_traces, save_flagged, details, output_json,
+):
+    """Scan a dataset for sabotaged predictions."""
+    from neurotrace.datasets import get_builtin_dataset, load_dataset
+    from neurotrace.scan import run_scan
+
+    if dataset_path is None and dataset_builtin is None:
+        raise click.UsageError(
+            "Must provide either --dataset or --dataset-builtin."
+        )
+    if dataset_path is not None and dataset_builtin is not None:
+        raise click.UsageError(
+            "Cannot provide both --dataset and --dataset-builtin."
+        )
+
+    # Load dataset
+    if dataset_builtin is not None:
+        dataset = get_builtin_dataset(dataset_builtin)
+        dataset_name = dataset_builtin
+    else:
+        dataset = load_dataset(dataset_path)
+        dataset_name = dataset_path
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task("Loading model...", total=None)
+        from neurotrace.models import load_model
+
+        model_obj, tokenizer = load_model(model)
+        progress.update(task, description="Model loaded.")
+
+        db_conn = None
+        if save_traces or save_flagged:
+            db_conn = TraceDB(db)
+
+        def progress_cb(i, total, prompt):
+            desc = f"Scanning {i + 1}/{total}: {prompt[:40]}..."
+            progress.update(task, description=desc)
+
+        scan_result = run_scan(
+            model_obj, tokenizer, dataset, dataset_name,
+            seed=seed,
+            sabotage_threshold=sabotage_threshold,
+            final_threshold=final_threshold,
+            save_traces=save_traces,
+            save_flagged=save_flagged,
+            db=db_conn,
+            progress_callback=progress_cb,
+        )
+
+        progress.update(task, description="Done.")
+        if db_conn:
+            db_conn.close()
+
+    if output_json:
+        output = {
+            "model": scan_result.model_name,
+            "dataset": scan_result.dataset_name,
+            "total": len(scan_result.prompt_results),
+            "correct": scan_result.correct_count,
+            "sabotaged": scan_result.sabotaged_count,
+            "weak": scan_result.weak_count,
+            "wrong": scan_result.wrong_count,
+            "results": [
+                {
+                    "prompt": r.prompt,
+                    "answer": r.answer,
+                    "final_token": r.final_token,
+                    "final_prob": r.final_prob,
+                    "final_rank": r.final_rank,
+                    "peak_prob": r.peak_prob,
+                    "peak_layer": r.peak_layer,
+                    "commitment_layer": r.commitment_layer,
+                    "sabotage_layers": r.sabotage_layers,
+                    "flags": r.flags,
+                    "status": r.status,
+                }
+                for r in scan_result.prompt_results
+            ],
+        }
+        click.echo(json.dumps(output, indent=2, default=str))
+        return
+
+    # Rich table output
+    console.print(
+        f"\n[bold]Scan:[/bold] {len(scan_result.prompt_results)} prompts, "
+        f"model {scan_result.model_name}\n"
+    )
+
+    table = Table()
+    table.add_column("Status", justify="center")
+    table.add_column("Prompt")
+    table.add_column("Answer")
+    table.add_column("Final (prob)")
+    table.add_column("Peak", justify="right")
+    table.add_column("Flags")
+
+    for r in scan_result.prompt_results:
+        if r.status == "correct":
+            status_str = "[green]\u2713[/green]"
+            style = None
+        elif r.status == "sabotaged":
+            status_str = "[red]\u26a0 SABO[/red]"
+            style = "red"
+        elif r.status == "weak":
+            status_str = "[yellow]\u26a0 WEAK[/yellow]"
+            style = "yellow"
+        else:
+            status_str = "[red]\u2717 WRONG[/red]"
+            style = "red"
+
+        prompt_display = r.prompt
+        if len(prompt_display) > 30:
+            prompt_display = "..." + prompt_display[-27:]
+
+        final_display = f"{r.final_token} ({r.final_prob:.2f})"
+        peak_display = f"{r.peak_prob:.2f}" if r.peak_prob > 0 else ""
+        flags_display = ", ".join(r.flags)
+
+        table.add_row(
+            status_str, prompt_display, r.answer,
+            final_display, peak_display, flags_display,
+            style=style,
+        )
+
+    console.print(table)
+
+    # Summary
+    console.print(
+        f"\n[bold]Summary:[/bold] "
+        f"{scan_result.correct_count} \u2713 correct | "
+        f"{scan_result.sabotaged_count} \u26a0 sabotaged | "
+        f"{scan_result.weak_count} \u26a0 weak | "
+        f"{scan_result.wrong_count} \u2717 wrong"
+    )
+
+    # Details for flagged prompts
+    if details:
+        flagged = [r for r in scan_result.prompt_results if r.flags]
+        if flagged:
+            console.print("\n[bold]Flagged Details:[/bold]\n")
+            for r in flagged:
+                console.print(
+                    f'[bold]\u26a0 "{r.prompt}" \u2192 {r.answer}[/bold]'
+                )
+                if r.ranks and r.probs:
+                    # Show compact layer-by-layer
+                    parts = []
+                    peak_idx = r.probs.index(r.peak_prob) if r.peak_prob in r.probs else None
+                    for i, (rank, prob) in enumerate(zip(r.ranks, r.probs)):
+                        entry = f"L{i}: rank #{rank} ({prob:.3f})"
+                        if i == peak_idx:
+                            entry += " \u2190 peak"
+                        if i in r.sabotage_layers:
+                            entry += " \u2190 SABOTAGE"
+                        parts.append(entry)
+                    # Show last few layers around the action
+                    if len(parts) > 10:
+                        start = max(0, (r.commitment_layer or 0) - 2)
+                        parts = parts[start:]
+                    console.print("  " + " | ".join(parts))
+                if r.sabotage_layers:
+                    severity = (
+                        (r.peak_prob - min(r.probs[s] for s in r.sabotage_layers))
+                        / r.peak_prob
+                        if r.peak_prob > 0
+                        else 0
+                    )
+                    console.print(
+                        f"  Sabotage layers: {r.sabotage_layers} | "
+                        f"Severity: {severity:.2f} (prob drop from peak)"
+                    )
+                console.print()
