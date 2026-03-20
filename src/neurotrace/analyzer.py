@@ -80,7 +80,10 @@ def compute_diff(
 
         # (C) KL divergence of attention weight distributions
         kl_div = 0.0
-        if snap_a.attention_weights is not None and snap_b.attention_weights is not None:
+        if (
+            snap_a.attention_weights is not None
+            and snap_b.attention_weights is not None
+        ):
             a_avg = snap_a.attention_weights.mean(axis=0).flatten()
             b_avg = snap_b.attention_weights.mean(axis=0).flatten()
             kl_div = _kl_divergence(a_avg, b_avg)
@@ -106,7 +109,10 @@ def compute_diff(
         )
 
         # Per-head JS divergence for critical head detection
-        if snap_a.attention_weights is not None and snap_b.attention_weights is not None:
+        if (
+            snap_a.attention_weights is not None
+            and snap_b.attention_weights is not None
+        ):
             num_heads = snap_a.attention_weights.shape[0]
             for h in range(num_heads):
                 a_head = snap_a.attention_weights[h].flatten()

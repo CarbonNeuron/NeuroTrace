@@ -1,6 +1,6 @@
 # tests/test_tracer.py
 import pytest
-import numpy as np
+
 from neurotrace.tracer import Tracer
 from neurotrace.types import TraceResult
 

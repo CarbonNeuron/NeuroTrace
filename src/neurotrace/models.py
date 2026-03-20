@@ -72,6 +72,7 @@ def load_model(
 def get_model_revision(model_name: str) -> str:
     """Get the HuggingFace commit hash for the model."""
     from huggingface_hub import model_info
+
     info = model_info(model_name)
     return info.sha
 

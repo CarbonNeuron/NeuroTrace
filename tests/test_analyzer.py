@@ -1,11 +1,14 @@
 import numpy as np
-import pytest
+
 from neurotrace.analyzer import DiffResult, compute_diff
 from neurotrace.types import LayerSnapshot, TokenPrediction, TraceMetadata, TraceResult
 
 
 def _make_trace(trace_id: str, diverge_at: int | None = None) -> TraceResult:
-    """Create a synthetic trace. If diverge_at is set, layer >= diverge_at gets different values."""
+    """Create a synthetic trace.
+
+    If diverge_at is set, layer >= diverge_at gets different values.
+    """
     num_layers = 12
     seq_len = 5
     hidden = 64
@@ -22,48 +25,70 @@ def _make_trace(trace_id: str, diverge_at: int | None = None) -> TraceResult:
             top1 = 99  # different prediction
             top1_prob = 0.4
         else:
-            residual_out = base_residual + np.random.randn(seq_len, hidden).astype(np.float32) * 0.01
+            residual_out = (
+                base_residual
+                + np.random.randn(seq_len, hidden).astype(np.float32) * 0.01
+            )
             top1 = 42
             top1_prob = 0.8
 
         # Create attention weights (valid probability distributions)
-        attn = np.random.dirichlet(np.ones(seq_len), size=(heads, seq_len)).astype(np.float32)
+        attn = np.random.dirichlet(np.ones(seq_len), size=(heads, seq_len)).astype(
+            np.float32
+        )
 
-        snapshots.append(LayerSnapshot(
-            layer_index=i,
-            residual_in=base_residual,
-            residual_out=residual_out,
-            attention_weights=attn,
-            attention_output=np.random.randn(seq_len, hidden).astype(np.float32),
-            mlp_in=None,
-            mlp_out=None,
-            ln_values=None,
-            residual_in_norm=float(np.linalg.norm(base_residual)),
-            residual_out_norm=float(np.linalg.norm(residual_out)),
-            attention_entropy=[1.0] * heads,
-            mlp_activation_mag=1.0,
-            top1_token=top1,
-            top1_prob=top1_prob,
-        ))
+        snapshots.append(
+            LayerSnapshot(
+                layer_index=i,
+                residual_in=base_residual,
+                residual_out=residual_out,
+                attention_weights=attn,
+                attention_output=np.random.randn(seq_len, hidden).astype(np.float32),
+                mlp_in=None,
+                mlp_out=None,
+                ln_values=None,
+                residual_in_norm=float(np.linalg.norm(base_residual)),
+                residual_out_norm=float(np.linalg.norm(residual_out)),
+                attention_entropy=[1.0] * heads,
+                mlp_activation_mag=1.0,
+                top1_token=top1,
+                top1_prob=top1_prob,
+            )
+        )
 
     meta = TraceMetadata(
-        trace_id=trace_id, model_name="test", model_revision="abc",
-        prompt="test", token_ids=[1]*seq_len, tokens=["t"]*seq_len,
-        num_layers=num_layers, num_heads=heads, hidden_size=hidden,
-        param_count=100, device="cpu", dtype="float32", random_seed=0,
-        label=None, capture_mode="full", layer_stride=1,
+        trace_id=trace_id,
+        model_name="test",
+        model_revision="abc",
+        prompt="test",
+        token_ids=[1] * seq_len,
+        tokens=["t"] * seq_len,
+        num_layers=num_layers,
+        num_heads=heads,
+        hidden_size=hidden,
+        param_count=100,
+        device="cpu",
+        dtype="float32",
+        random_seed=0,
+        label=None,
+        capture_mode="full",
+        layer_stride=1,
         timestamp="2026-01-01T00:00:00",
     )
 
-    preds = [TokenPrediction(
-        position=p,
-        top_k_tokens=[top1, 10, 5],
-        top_k_probs=[0.5, 0.3, 0.2],
-        top_k_strings=["a", "b", "c"],
-    ) for p, top1 in enumerate([42]*seq_len)]
+    preds = [
+        TokenPrediction(
+            position=p,
+            top_k_tokens=[top1, 10, 5],
+            top_k_probs=[0.5, 0.3, 0.2],
+            top_k_strings=["a", "b", "c"],
+        )
+        for p, top1 in enumerate([42] * seq_len)
+    ]
 
     return TraceResult(
-        metadata=meta, layer_snapshots=snapshots,
+        metadata=meta,
+        layer_snapshots=snapshots,
         token_predictions=preds,
         final_logits=np.random.randn(seq_len, 100).astype(np.float32),
     )
@@ -121,13 +146,15 @@ def test_configurable_thresholds():
 
     # With very strict thresholds, more layers flagged
     diff_strict = compute_diff(
-        trace_a, trace_b,
+        trace_a,
+        trace_b,
         cosine_threshold=0.999,
         kl_threshold=0.01,
     )
     # With very loose thresholds, fewer layers flagged
     diff_loose = compute_diff(
-        trace_a, trace_b,
+        trace_a,
+        trace_b,
         cosine_threshold=0.5,
         kl_threshold=10.0,
     )

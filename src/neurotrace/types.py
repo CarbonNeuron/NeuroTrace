@@ -1,6 +1,7 @@
 """Shared types and dataclasses for NeuroTrace."""
 
 from dataclasses import dataclass
+
 import numpy as np
 
 

@@ -122,31 +122,60 @@ class TraceDB:
                 top_pred_prob = last.top_k_probs[0]
 
         self._conn.execute(
-            """INSERT INTO traces VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            "INSERT INTO traces VALUES"
+            " (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
-                meta.trace_id, meta.model_name, meta.model_revision,
-                meta.prompt, meta.token_ids, meta.tokens,
-                meta.num_layers, meta.num_heads, meta.hidden_size,
-                meta.param_count, meta.device, meta.dtype,
-                meta.random_seed, meta.label, meta.capture_mode,
-                meta.layer_stride, top_pred, top_pred_prob, meta.timestamp,
+                meta.trace_id,
+                meta.model_name,
+                meta.model_revision,
+                meta.prompt,
+                meta.token_ids,
+                meta.tokens,
+                meta.num_layers,
+                meta.num_heads,
+                meta.hidden_size,
+                meta.param_count,
+                meta.device,
+                meta.dtype,
+                meta.random_seed,
+                meta.label,
+                meta.capture_mode,
+                meta.layer_stride,
+                top_pred,
+                top_pred_prob,
+                meta.timestamp,
             ],
         )
 
         for snap in result.layer_snapshots:
             self._conn.execute(
-                """INSERT INTO layer_snapshots VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                "INSERT INTO layer_snapshots VALUES"
+                " (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 [
-                    meta.trace_id, snap.layer_index,
-                    snap.residual_in_norm, snap.residual_out_norm,
-                    snap.attention_entropy, snap.mlp_activation_mag,
-                    snap.top1_token, snap.top1_prob,
-                    _serialize_tensor(snap.residual_in) if snap.residual_in is not None else None,
-                    _serialize_tensor(snap.residual_out) if snap.residual_out is not None else None,
-                    _serialize_tensor(snap.attention_output) if snap.attention_output is not None else None,
+                    meta.trace_id,
+                    snap.layer_index,
+                    snap.residual_in_norm,
+                    snap.residual_out_norm,
+                    snap.attention_entropy,
+                    snap.mlp_activation_mag,
+                    snap.top1_token,
+                    snap.top1_prob,
+                    _serialize_tensor(snap.residual_in)
+                    if snap.residual_in is not None
+                    else None,
+                    _serialize_tensor(snap.residual_out)
+                    if snap.residual_out is not None
+                    else None,
+                    _serialize_tensor(snap.attention_output)
+                    if snap.attention_output is not None
+                    else None,
                     _serialize_tensor(snap.mlp_in) if snap.mlp_in is not None else None,
-                    _serialize_tensor(snap.mlp_out) if snap.mlp_out is not None else None,
-                    _serialize_tensor(snap.ln_values) if snap.ln_values is not None else None,
+                    _serialize_tensor(snap.mlp_out)
+                    if snap.mlp_out is not None
+                    else None,
+                    _serialize_tensor(snap.ln_values)
+                    if snap.ln_values is not None
+                    else None,
                 ],
             )
 
@@ -155,12 +184,19 @@ class TraceDB:
                 num_heads = snap.attention_weights.shape[0]
                 for h in range(num_heads):
                     head_weights = snap.attention_weights[h]  # [seq, seq]
-                    head_entropy = snap.attention_entropy[h] if h < len(snap.attention_entropy) else 0.0
+                    head_entropy = (
+                        snap.attention_entropy[h]
+                        if h < len(snap.attention_entropy)
+                        else 0.0
+                    )
                     self._conn.execute(
                         """INSERT INTO attention_maps VALUES (?, ?, ?, ?, ?)""",
                         [
-                            meta.trace_id, snap.layer_index, h,
-                            head_entropy, _serialize_tensor(head_weights),
+                            meta.trace_id,
+                            snap.layer_index,
+                            h,
+                            head_entropy,
+                            _serialize_tensor(head_weights),
                         ],
                     )
 
@@ -168,8 +204,11 @@ class TraceDB:
             self._conn.execute(
                 """INSERT INTO token_predictions VALUES (?, ?, ?, ?, ?)""",
                 [
-                    meta.trace_id, pred.position,
-                    pred.top_k_tokens, pred.top_k_probs, pred.top_k_strings,
+                    meta.trace_id,
+                    pred.position,
+                    pred.top_k_tokens,
+                    pred.top_k_probs,
+                    pred.top_k_strings,
                 ],
             )
 
@@ -182,12 +221,23 @@ class TraceDB:
             raise ValueError(f"Trace not found: {trace_id}")
 
         meta = TraceMetadata(
-            trace_id=row[0], model_name=row[1], model_revision=row[2],
-            prompt=row[3], token_ids=row[4], tokens=row[5],
-            num_layers=row[6], num_heads=row[7], hidden_size=row[8],
-            param_count=row[9], device=row[10], dtype=row[11],
-            random_seed=row[12], label=row[13], capture_mode=row[14],
-            layer_stride=row[15], timestamp=row[18],
+            trace_id=row[0],
+            model_name=row[1],
+            model_revision=row[2],
+            prompt=row[3],
+            token_ids=row[4],
+            tokens=row[5],
+            num_layers=row[6],
+            num_heads=row[7],
+            hidden_size=row[8],
+            param_count=row[9],
+            device=row[10],
+            dtype=row[11],
+            random_seed=row[12],
+            label=row[13],
+            capture_mode=row[14],
+            layer_stride=row[15],
+            timestamp=row[18],
         )
 
         snap_rows = self._conn.execute(
@@ -199,7 +249,9 @@ class TraceDB:
         for sr in snap_rows:
             # Reconstruct attention weights from per-head maps
             head_rows = self._conn.execute(
-                "SELECT head_index, weights_blob FROM attention_maps WHERE trace_id = ? AND layer_index = ? ORDER BY head_index",
+                "SELECT head_index, weights_blob FROM attention_maps"
+                " WHERE trace_id = ? AND layer_index = ?"
+                " ORDER BY head_index",
                 [trace_id, sr[1]],
             ).fetchall()
             attn_weights = None
@@ -207,22 +259,32 @@ class TraceDB:
                 heads = [_deserialize_tensor(hr[1]) for hr in head_rows]
                 attn_weights = np.stack(heads, axis=0)
 
-            snapshots.append(LayerSnapshot(
-                layer_index=sr[1],
-                residual_in=_deserialize_tensor(sr[8]) if sr[8] is not None else None,
-                residual_out=_deserialize_tensor(sr[9]) if sr[9] is not None else None,
-                attention_weights=attn_weights,
-                attention_output=_deserialize_tensor(sr[10]) if sr[10] is not None else None,
-                mlp_in=_deserialize_tensor(sr[11]) if sr[11] is not None else None,
-                mlp_out=_deserialize_tensor(sr[12]) if sr[12] is not None else None,
-                ln_values=_deserialize_tensor(sr[13]) if sr[13] is not None else None,
-                residual_in_norm=sr[2],
-                residual_out_norm=sr[3],
-                attention_entropy=sr[4] if sr[4] is not None else [],
-                mlp_activation_mag=sr[5],
-                top1_token=sr[6],
-                top1_prob=sr[7],
-            ))
+            snapshots.append(
+                LayerSnapshot(
+                    layer_index=sr[1],
+                    residual_in=_deserialize_tensor(sr[8])
+                    if sr[8] is not None
+                    else None,
+                    residual_out=_deserialize_tensor(sr[9])
+                    if sr[9] is not None
+                    else None,
+                    attention_weights=attn_weights,
+                    attention_output=_deserialize_tensor(sr[10])
+                    if sr[10] is not None
+                    else None,
+                    mlp_in=_deserialize_tensor(sr[11]) if sr[11] is not None else None,
+                    mlp_out=_deserialize_tensor(sr[12]) if sr[12] is not None else None,
+                    ln_values=_deserialize_tensor(sr[13])
+                    if sr[13] is not None
+                    else None,
+                    residual_in_norm=sr[2],
+                    residual_out_norm=sr[3],
+                    attention_entropy=sr[4] if sr[4] is not None else [],
+                    mlp_activation_mag=sr[5],
+                    top1_token=sr[6],
+                    top1_prob=sr[7],
+                )
+            )
 
         pred_rows = self._conn.execute(
             "SELECT * FROM token_predictions WHERE trace_id = ? ORDER BY position",
@@ -231,8 +293,10 @@ class TraceDB:
 
         predictions = [
             TokenPrediction(
-                position=pr[1], top_k_tokens=pr[2],
-                top_k_probs=pr[3], top_k_strings=pr[4],
+                position=pr[1],
+                top_k_tokens=pr[2],
+                top_k_probs=pr[3],
+                top_k_strings=pr[4],
             )
             for pr in pred_rows
         ]
@@ -251,7 +315,11 @@ class TraceDB:
 
     def list_traces(self, model_filter: str | None = None) -> list[dict]:
         """List all traces, optionally filtered by model name."""
-        query = "SELECT trace_id, label, model_name, prompt, top_prediction, top_prediction_prob, timestamp FROM traces"
+        query = (
+            "SELECT trace_id, label, model_name, prompt,"
+            " top_prediction, top_prediction_prob, timestamp"
+            " FROM traces"
+        )
         params = []
         if model_filter:
             query += " WHERE model_name LIKE ?"
@@ -260,9 +328,13 @@ class TraceDB:
         rows = self._conn.execute(query, params).fetchall()
         return [
             {
-                "trace_id": r[0], "label": r[1], "model_name": r[2],
-                "prompt": r[3], "top_prediction": r[4],
-                "top_prediction_prob": r[5], "timestamp": r[6],
+                "trace_id": r[0],
+                "label": r[1],
+                "model_name": r[2],
+                "prompt": r[3],
+                "top_prediction": r[4],
+                "top_prediction_prob": r[5],
+                "timestamp": r[6],
             }
             for r in rows
         ]
@@ -281,12 +353,15 @@ class TraceDB:
     ) -> np.ndarray:
         """Get a single head's attention weight matrix."""
         row = self._conn.execute(
-            "SELECT weights_blob FROM attention_maps WHERE trace_id = ? AND layer_index = ? AND head_index = ?",
+            "SELECT weights_blob FROM attention_maps"
+            " WHERE trace_id = ? AND layer_index = ?"
+            " AND head_index = ?",
             [trace_id, layer_index, head_index],
         ).fetchone()
         if row is None:
             raise ValueError(
-                f"Attention map not found: trace={trace_id}, layer={layer_index}, head={head_index}"
+                f"Attention map not found: trace={trace_id},"
+                f" layer={layer_index}, head={head_index}"
             )
         return _deserialize_tensor(row[0])
 
@@ -300,9 +375,13 @@ class TraceDB:
         ).fetchall()
         return [
             {
-                "layer_index": r[0], "residual_in_norm": r[1],
-                "residual_out_norm": r[2], "attention_entropy": r[3],
-                "mlp_activation_mag": r[4], "top1_token": r[5], "top1_prob": r[6],
+                "layer_index": r[0],
+                "residual_in_norm": r[1],
+                "residual_out_norm": r[2],
+                "attention_entropy": r[3],
+                "mlp_activation_mag": r[4],
+                "top1_token": r[5],
+                "top1_prob": r[6],
             }
             for r in rows
         ]

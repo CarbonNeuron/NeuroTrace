@@ -1,5 +1,6 @@
 import numpy as np
-from neurotrace.types import TraceMetadata, LayerSnapshot, TokenPrediction, TraceResult
+
+from neurotrace.types import LayerSnapshot, TokenPrediction, TraceMetadata, TraceResult
 
 
 def test_trace_metadata_construction():
@@ -118,7 +119,9 @@ def test_trace_result_construction():
         top1_token=1,
         top1_prob=1.0,
     )
-    pred = TokenPrediction(position=0, top_k_tokens=[1], top_k_probs=[1.0], top_k_strings=["hello"])
+    pred = TokenPrediction(
+        position=0, top_k_tokens=[1], top_k_probs=[1.0], top_k_strings=["hello"]
+    )
     result = TraceResult(
         metadata=meta,
         layer_snapshots=[snap],

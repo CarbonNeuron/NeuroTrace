@@ -3,7 +3,6 @@
 import json
 
 import numpy as np
-import pytest
 from click.testing import CliRunner
 
 from neurotrace.cli import cli
@@ -139,7 +138,7 @@ def test_prompts_file(tmp_path):
     """Test that --prompts-file reads prompts from a file (one per line)."""
     prompts_file = tmp_path / "prompts.txt"
     prompts_file.write_text("hello\nworld\n")
-    # We can't actually run trace without a model, but we can verify the CLI accepts the flag
+    # Can't run trace without a model, but verify CLI accepts the flag
     runner = CliRunner()
     result = runner.invoke(
         cli,

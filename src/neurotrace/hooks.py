@@ -1,7 +1,8 @@
 """PyTorch hook registration and management for activation capture."""
 
-import torch
 import numpy as np
+import torch
+
 from neurotrace.models import ModelArchitecture
 
 
@@ -51,16 +52,12 @@ class HookManager:
 
             # Hook on MLP module
             mlp = self._arch.get_mlp(layer)
-            handle = mlp.register_forward_hook(
-                self._make_mlp_hook(i, store_tensors)
-            )
+            handle = mlp.register_forward_hook(self._make_mlp_hook(i, store_tensors))
             self._handles.append(handle)
 
             # Hooks on layer norms
             for ln in self._arch.get_layer_norms(layer):
-                handle = ln.register_forward_hook(
-                    self._make_ln_hook(i, store_tensors)
-                )
+                handle = ln.register_forward_hook(self._make_ln_hook(i, store_tensors))
                 self._handles.append(handle)
 
     def _to_numpy(self, tensor: torch.Tensor) -> np.ndarray:
@@ -78,6 +75,7 @@ class HookManager:
                 "input_norm": float(np.linalg.norm(inp_np)),
                 "output_norm": float(np.linalg.norm(out_np)),
             }
+
         return hook
 
     def _make_attention_hook(self, layer_index: int, store_tensors: bool):
@@ -99,9 +97,7 @@ class HookManager:
                 for head_idx in range(weights_np.shape[0]):
                     head_weights = weights_np[head_idx]  # [seq, seq]
                     eps = 1e-10
-                    h = -np.sum(
-                        head_weights * np.log(head_weights + eps), axis=-1
-                    )
+                    h = -np.sum(head_weights * np.log(head_weights + eps), axis=-1)
                     entropy.append(float(np.mean(h)))
 
             self._captured[(layer_index, "attention")] = {
@@ -109,6 +105,7 @@ class HookManager:
                 "weights": weights_np if store_tensors else None,
                 "entropy": entropy,
             }
+
         return hook
 
     def _make_mlp_hook(self, layer_index: int, store_tensors: bool):
@@ -124,6 +121,7 @@ class HookManager:
                 "output_tensor": out_np if (store_tensors and is_full) else None,
                 "activation_mag": float(np.linalg.norm(out_np)),
             }
+
         return hook
 
     def _make_ln_hook(self, layer_index: int, store_tensors: bool):
@@ -138,6 +136,7 @@ class HookManager:
             self._captured[key]["values"].append(
                 out_np if (store_tensors and is_full) else None
             )
+
         return hook
 
     def get_captured_data(self) -> dict[tuple[int, str], dict]:

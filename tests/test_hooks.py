@@ -1,8 +1,8 @@
 import pytest
 import torch
-import numpy as np
+
 from neurotrace.hooks import HookManager
-from neurotrace.models import load_model, get_architecture
+from neurotrace.models import get_architecture
 
 TINYLLAMA = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
@@ -29,13 +29,11 @@ def test_hooks_capture_activations(tinyllama_model):
 
     inputs = tokenizer("Hello world", return_tensors="pt").to(model.device)
     with torch.no_grad():
-        outputs = model(**inputs, output_attentions=True)
+        model(**inputs, output_attentions=True)
 
     captured = manager.get_captured_data()
     num_layers = model.config.num_hidden_layers
-    seq_len = inputs["input_ids"].shape[1]
-    hidden_size = model.config.hidden_size
-    num_heads = model.config.num_attention_heads
+    inputs["input_ids"].shape[1]
 
     # Check we captured data for every layer
     for i in range(num_layers):
@@ -52,9 +50,7 @@ def test_hooks_cleanup(tinyllama_model):
     arch = get_architecture(model.config.model_type)
 
     # Record pre-existing hook counts (HF may install its own hooks)
-    pre_hook_counts = {
-        id(m): len(m._forward_hooks) for m in model.modules()
-    }
+    pre_hook_counts = {id(m): len(m._forward_hooks) for m in model.modules()}
 
     manager = HookManager(model, arch, capture_mode="full", layer_stride=1)
     assert manager.num_hooks > 0

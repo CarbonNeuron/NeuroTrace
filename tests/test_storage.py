@@ -1,8 +1,11 @@
 import numpy as np
-import pytest
+
 from neurotrace.storage import TraceDB
 from neurotrace.types import (
-    TraceMetadata, LayerSnapshot, TokenPrediction, TraceResult,
+    LayerSnapshot,
+    TokenPrediction,
+    TraceMetadata,
+    TraceResult,
 )
 
 
@@ -29,25 +32,41 @@ def _make_sample_trace() -> TraceResult:
     )
     snapshots = []
     for i in range(2):
-        snapshots.append(LayerSnapshot(
-            layer_index=i,
-            residual_in=np.array([[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]], dtype=np.float32),
-            residual_out=np.array([[1.1, 2.1, 3.1, 4.1], [5.1, 6.1, 7.1, 8.1]], dtype=np.float32),
-            attention_weights=np.random.randn(2, 2, 2).astype(np.float32),
-            attention_output=np.random.randn(2, 4).astype(np.float32),
-            mlp_in=np.random.randn(2, 4).astype(np.float32),
-            mlp_out=np.random.randn(2, 4).astype(np.float32),
-            ln_values=np.random.randn(2, 4).astype(np.float32),
-            residual_in_norm=7.746,
-            residual_out_norm=7.946,
-            attention_entropy=[1.5, 1.2],
-            mlp_activation_mag=3.0,
-            top1_token=42,
-            top1_prob=0.5,
-        ))
+        snapshots.append(
+            LayerSnapshot(
+                layer_index=i,
+                residual_in=np.array(
+                    [[1.0, 2.0, 3.0, 4.0], [5.0, 6.0, 7.0, 8.0]], dtype=np.float32
+                ),
+                residual_out=np.array(
+                    [[1.1, 2.1, 3.1, 4.1], [5.1, 6.1, 7.1, 8.1]], dtype=np.float32
+                ),
+                attention_weights=np.random.randn(2, 2, 2).astype(np.float32),
+                attention_output=np.random.randn(2, 4).astype(np.float32),
+                mlp_in=np.random.randn(2, 4).astype(np.float32),
+                mlp_out=np.random.randn(2, 4).astype(np.float32),
+                ln_values=np.random.randn(2, 4).astype(np.float32),
+                residual_in_norm=7.746,
+                residual_out_norm=7.946,
+                attention_entropy=[1.5, 1.2],
+                mlp_activation_mag=3.0,
+                top1_token=42,
+                top1_prob=0.5,
+            )
+        )
     predictions = [
-        TokenPrediction(position=0, top_k_tokens=[42, 10], top_k_probs=[0.5, 0.3], top_k_strings=["the", "a"]),
-        TokenPrediction(position=1, top_k_tokens=[7, 8], top_k_probs=[0.4, 0.35], top_k_strings=["is", "was"]),
+        TokenPrediction(
+            position=0,
+            top_k_tokens=[42, 10],
+            top_k_probs=[0.5, 0.3],
+            top_k_strings=["the", "a"],
+        ),
+        TokenPrediction(
+            position=1,
+            top_k_tokens=[7, 8],
+            top_k_probs=[0.4, 0.35],
+            top_k_strings=["is", "was"],
+        ),
     ]
     return TraceResult(
         metadata=meta,
@@ -83,7 +102,9 @@ def test_tensor_roundtrip_fidelity(tmp_path):
     for orig, loaded_snap in zip(trace.layer_snapshots, loaded.layer_snapshots):
         np.testing.assert_array_equal(orig.residual_in, loaded_snap.residual_in)
         np.testing.assert_array_equal(orig.residual_out, loaded_snap.residual_out)
-        np.testing.assert_array_equal(orig.attention_weights, loaded_snap.attention_weights)
+        np.testing.assert_array_equal(
+            orig.attention_weights, loaded_snap.attention_weights
+        )
     db.close()
 
 

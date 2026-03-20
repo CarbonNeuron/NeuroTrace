@@ -1,7 +1,6 @@
 """Click CLI for NeuroTrace — trace, list, inspect, diff, predict commands."""
 
 import json
-import sys
 
 import click
 from rich.console import Console
@@ -29,13 +28,21 @@ def cli() -> None:
 @cli.command()
 @click.option("--model", required=True, help="HuggingFace model name or path.")
 @click.option("--prompt", default=None, help="Prompt text to trace.")
-@click.option("--prompts-file", default=None, type=click.Path(exists=True),
-              help="File with one prompt per line.")
+@click.option(
+    "--prompts-file",
+    default=None,
+    type=click.Path(exists=True),
+    help="File with one prompt per line.",
+)
 @click.option("--db", required=True, help="Path to DuckDB database file.")
 @click.option("--label", default=None, help="Optional label for the trace.")
 @click.option("--seed", default=42, type=int, help="Random seed.")
-@click.option("--capture-mode", default="full", type=click.Choice(["full", "light"]),
-              help="Capture mode.")
+@click.option(
+    "--capture-mode",
+    default="full",
+    type=click.Choice(["full", "light"]),
+    help="Capture mode.",
+)
 @click.option("--layer-stride", default=1, type=int, help="Layer stride for capture.")
 def trace(model, prompt, prompts_file, db, label, seed, capture_mode, layer_stride):
     """Run a forward-pass trace and store results."""
@@ -51,8 +58,11 @@ def trace(model, prompt, prompts_file, db, label, seed, capture_mode, layer_stri
     else:
         prompts = [prompt]
 
-    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
-                  console=err_console) as progress:
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
         task = progress.add_task("Loading model...", total=None)
         from neurotrace.models import load_model
         from neurotrace.tracer import Tracer
@@ -60,8 +70,9 @@ def trace(model, prompt, prompts_file, db, label, seed, capture_mode, layer_stri
         model_obj, tokenizer = load_model(model)
         progress.update(task, description="Model loaded.")
 
-        tracer = Tracer(model_obj, tokenizer, capture_mode=capture_mode,
-                        layer_stride=layer_stride)
+        tracer = Tracer(
+            model_obj, tokenizer, capture_mode=capture_mode, layer_stride=layer_stride
+        )
         db_conn = TraceDB(db)
 
         try:
@@ -123,7 +134,9 @@ def list_traces(db, model):
 @click.option("--db", required=True, help="Path to DuckDB database file.")
 @click.option("--trace-id", required=True, help="Trace ID or 'latest'.")
 @click.option("--layer", default=None, type=int, help="Show only this layer.")
-@click.option("--head", default=None, type=int, help="Show specific head (requires --layer).")
+@click.option(
+    "--head", default=None, type=int, help="Show specific head (requires --layer)."
+)
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
 def inspect(db, trace_id, layer, head, output_json):
     """Inspect a stored trace."""
@@ -191,8 +204,13 @@ def inspect(db, trace_id, layer, head, output_json):
     console.print(f"[bold]Model:[/bold] {meta.model_name} (rev {meta.model_revision})")
     console.print(f"[bold]Prompt:[/bold] {meta.prompt}")
     console.print(f"[bold]Tokens:[/bold] {len(meta.token_ids)}")
-    console.print(f"[bold]Layers:[/bold] {meta.num_layers}  [bold]Heads:[/bold] {meta.num_heads}")
-    console.print(f"[bold]Capture:[/bold] {meta.capture_mode}  [bold]Stride:[/bold] {meta.layer_stride}")
+    console.print(
+        f"[bold]Layers:[/bold] {meta.num_layers}  [bold]Heads:[/bold] {meta.num_heads}"
+    )
+    console.print(
+        f"[bold]Capture:[/bold] {meta.capture_mode}"
+        f"  [bold]Stride:[/bold] {meta.layer_stride}"
+    )
     console.print()
 
     # Filter stats
@@ -231,17 +249,38 @@ def inspect(db, trace_id, layer, head, output_json):
 @click.option("--db", required=True, help="Path to DuckDB database file.")
 @click.option("--trace-a", required=True, help="First trace ID.")
 @click.option("--trace-b", required=True, help="Second trace ID.")
-@click.option("--cosine-threshold", default=0.95, type=float,
-              help="Cosine similarity threshold for flagging.")
-@click.option("--kl-threshold", default=0.5, type=float,
-              help="KL divergence threshold for flagging.")
-@click.option("--sort-by", default="layer", type=click.Choice(["layer", "cosine", "kl"]),
-              help="Sort order for diff table.")
+@click.option(
+    "--cosine-threshold",
+    default=0.95,
+    type=float,
+    help="Cosine similarity threshold for flagging.",
+)
+@click.option(
+    "--kl-threshold",
+    default=0.5,
+    type=float,
+    help="KL divergence threshold for flagging.",
+)
+@click.option(
+    "--sort-by",
+    default="layer",
+    type=click.Choice(["layer", "cosine", "kl"]),
+    help="Sort order for diff table.",
+)
 @click.option("--flagged-only", is_flag=True, help="Show only flagged layers.")
 @click.option("--head-detail", is_flag=True, help="Show critical head details.")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
-def diff(db, trace_a, trace_b, cosine_threshold, kl_threshold, sort_by,
-         flagged_only, head_detail, output_json):
+def diff(
+    db,
+    trace_a,
+    trace_b,
+    cosine_threshold,
+    kl_threshold,
+    sort_by,
+    flagged_only,
+    head_detail,
+    output_json,
+):
     """Compare two traces and show divergence metrics."""
     from neurotrace.analyzer import compute_diff
 
@@ -257,9 +296,9 @@ def diff(db, trace_a, trace_b, cosine_threshold, kl_threshold, sort_by,
     finally:
         db_conn.close()
 
-    diff_result = compute_diff(result_a, result_b,
-                               cosine_threshold=cosine_threshold,
-                               kl_threshold=kl_threshold)
+    diff_result = compute_diff(
+        result_a, result_b, cosine_threshold=cosine_threshold, kl_threshold=kl_threshold
+    )
 
     if output_json:
         output = {
@@ -298,7 +337,9 @@ def diff(db, trace_a, trace_b, cosine_threshold, kl_threshold, sort_by,
     elif sort_by == "kl":
         metrics.sort(key=lambda m: m.kl_divergence, reverse=True)
 
-    table = Table(title=f"Diff: {diff_result.trace_a_id[:8]} vs {diff_result.trace_b_id[:8]}")
+    table = Table(
+        title=f"Diff: {diff_result.trace_a_id[:8]} vs {diff_result.trace_b_id[:8]}"
+    )
     table.add_column("Layer", justify="right")
     table.add_column("Cosine Sim", justify="right")
     table.add_column("Top-1 Changed")
@@ -320,9 +361,14 @@ def diff(db, trace_a, trace_b, cosine_threshold, kl_threshold, sort_by,
 
     # Summary
     flagged_count = sum(1 for m in diff_result.layer_metrics if m.flagged)
-    console.print(f"\n[bold]Flagged layers:[/bold] {flagged_count}/{len(diff_result.layer_metrics)}")
+    console.print(
+        f"\n[bold]Flagged layers:[/bold] "
+        f"{flagged_count}/{len(diff_result.layer_metrics)}"
+    )
     if diff_result.first_divergence_layer is not None:
-        console.print(f"[bold]First divergence:[/bold] layer {diff_result.first_divergence_layer}")
+        console.print(
+            f"[bold]First divergence:[/bold] layer {diff_result.first_divergence_layer}"
+        )
 
     if head_detail and diff_result.critical_heads:
         console.print("\n[bold]Critical Heads (top JS divergence):[/bold]")
@@ -338,11 +384,16 @@ def diff(db, trace_a, trace_b, cosine_threshold, kl_threshold, sort_by,
 @cli.command()
 @click.option("--model", required=True, help="HuggingFace model name or path.")
 @click.option("--prompt", required=True, help="Prompt text.")
-@click.option("--top-k", default=5, type=int, help="Number of top predictions per position.")
+@click.option(
+    "--top-k", default=5, type=int, help="Number of top predictions per position."
+)
 def predict(model, prompt, top_k):
     """Show per-position token predictions (no DB write)."""
-    with Progress(SpinnerColumn(), TextColumn("[progress.description]{task.description}"),
-                  console=err_console) as progress:
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
         task = progress.add_task("Loading model...", total=None)
         from neurotrace.models import load_model
         from neurotrace.tracer import Tracer
@@ -358,8 +409,12 @@ def predict(model, prompt, top_k):
     for pred in result.token_predictions:
         pos = pred.position
         token_str = tokens[pos] if pos < len(tokens) else "?"
-        console.print(f"\n[bold]Position {pos}[/bold] (input: [cyan]{repr(token_str)}[/cyan])")
-        for tok, prob, s in zip(pred.top_k_tokens, pred.top_k_probs, pred.top_k_strings):
+        console.print(
+            f"\n[bold]Position {pos}[/bold] (input: [cyan]{repr(token_str)}[/cyan])"
+        )
+        for tok, prob, s in zip(
+            pred.top_k_tokens, pred.top_k_probs, pred.top_k_strings
+        ):
             bar_len = int(prob * 40)
             bar = "#" * bar_len
             console.print(f"  {prob:6.3f} [green]{bar}[/green] {repr(s)} (id={tok})")

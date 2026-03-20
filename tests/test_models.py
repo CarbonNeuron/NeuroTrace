@@ -1,6 +1,7 @@
 # tests/test_models.py
 import pytest
-from neurotrace.models import get_architecture, load_model, ModelArchitecture
+
+from neurotrace.models import ModelArchitecture, get_architecture, load_model
 
 TINYLLAMA = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 

@@ -3,12 +3,10 @@
 import uuid
 from datetime import datetime, timezone
 
-import numpy as np
 import torch
 
 from neurotrace.hooks import HookManager
 from neurotrace.models import (
-    ModelArchitecture,
     count_parameters,
     get_architecture,
     get_model_revision,
@@ -54,9 +52,7 @@ class Tracer:
 
         # Enable attention output on model config temporarily.
         # Must switch to eager attention implementation to support output_attentions.
-        old_output_attentions = getattr(
-            self._model.config, "output_attentions", False
-        )
+        old_output_attentions = getattr(self._model.config, "output_attentions", False)
         old_attn_implementation = getattr(
             self._model.config, "_attn_implementation", None
         )
