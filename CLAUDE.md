@@ -17,7 +17,7 @@ make install           # install neurotrace CLI to ~/.local/bin via uv tool
 
 ## Architecture
 
-NeuroTrace captures activations from transformer forward passes, stores them in DuckDB, and provides CLI commands for analysis and ablation.
+NeuroTrace captures activations from transformer forward passes, stores them in DuckDB, and provides CLI commands for analysis, ablation, probing, and repair.
 
 ### Data flow
 
@@ -47,6 +47,44 @@ DuckDB (not SQLite). Single `.db` file. 4 tables: `traces`, `layer_snapshots`, `
 
 `top1_token`/`top1_prob` in `LayerSnapshot` are computed by projecting `residual_out` through `model.model.norm` (final layer norm) then `model.lm_head`. This happens during tracing and again in `predict`/`report` commands.
 
+### Analysis pipeline
+
+The full interpretability pipeline (available via `neurotrace experiment`) runs: scan → ablate → finetune → verify. Each stage can also be run independently.
+
+- **scan.py**: Tests a model against a JSONL dataset to find anomalous predictions.
+- **probe.py**: Trains a linear probe on activations at a target layer to find a "sabotage direction" separating correct from incorrect predictions. Requires `scikit-learn`.
+- **circuit.py**: Projects the probe direction through MLP weight matrices to identify which neurons contribute most to the direction.
+- **neurons.py**: Profiles individual neuron attributions in an MLP layer, or ablates top-N neurons to measure their causal effect.
+- **finetune.py**: Trains a LoRA adapter (via PEFT) on specified MLP layers to repair identified failures. Requires `peft`, `datasets`, `accelerate`.
+- **datasets.py**: Loads JSONL dataset files for scan/probe/finetune commands.
+
+### CLI modules
+
+- **cli.py**: All Click commands. Progress/spinners go to stderr (`err_console`), data to stdout.
+- **report.py**: Generates self-contained HTML reports (inline CSS, inline SVG, no JS, no external resources).
+- **upload.py**: Optional upload to CarbonFiles (requires `carbonfiles-client`).
+
+## Source files
+
+| File | Purpose |
+|---|---|
+| `types.py` | Core dataclasses: `TraceResult`, `LayerSnapshot`, `AttentionMap`, etc. |
+| `models.py` | Model loading, architecture registry (`ARCHITECTURE_REGISTRY`) |
+| `hooks.py` | `HookManager` — read-only activation capture |
+| `tracer.py` | `Tracer` — orchestrates forward pass with hooks |
+| `storage.py` | `TraceDB` — DuckDB persistence with tensor blob serialization |
+| `analyzer.py` | Diff engine: cosine sim, KL divergence, top-1 change, critical heads |
+| `ablate.py` | `AblationSpec`, `AblationHookManager` — component zeroing/scaling |
+| `scan.py` | Dataset scanning for anomalous predictions |
+| `probe.py` | Linear probe training on activation geometry |
+| `circuit.py` | Circuit tracing from probe direction through MLP weights |
+| `neurons.py` | Per-neuron MLP attribution profiling and ablation |
+| `finetune.py` | LoRA adapter training for targeted repair |
+| `datasets.py` | JSONL dataset loading |
+| `report.py` | Self-contained HTML report generation |
+| `cli.py` | Click CLI (17 commands) |
+| `upload.py` | Optional CarbonFiles upload |
+
 ## Conventions
 
 - Python 3.12+. Use `uv` for dependency management.
@@ -56,3 +94,4 @@ DuckDB (not SQLite). Single `.db` file. 4 tables: `traces`, `layer_snapshots`, `
 - HTML reports are fully self-contained (inline CSS, inline SVG, no JS, no external resources).
 - `AblationSpec.zero_mlp` defaults to `[]` via `__post_init__` for backward compatibility.
 - The `interventions` column in the `traces` table is nullable JSON (VARCHAR). Added via idempotent `ALTER TABLE` migration on every `TraceDB.__init__`.
+- Optional features use extras: `finetune` (peft, datasets, accelerate), `probe` (scikit-learn), `upload` (carbonfiles-client).
