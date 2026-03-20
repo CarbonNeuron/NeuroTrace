@@ -101,19 +101,22 @@ def compute_commitment(
     peak_prob = max(trajectory)
     peak_layer = trajectory.index(peak_prob)
     final_prob = trajectory[-1]
-    min_margin = min(margin_trajectory)
     margin_at_final = margin_trajectory[-1]
     competitor_peak = max(competitor_trajectory)
 
-    # Find crossover: first layer where competitor > correct
+    # Only consider layers >= peak_layer for min_margin and crossover
+    post_peak_margins = margin_trajectory[peak_layer:]
+    min_margin = min(post_peak_margins)
+
+    # Find crossover: first layer >= peak_layer where competitor > correct
     crossover_layer = None
-    for i, m in enumerate(margin_trajectory):
-        if m < 0:
+    for i in range(peak_layer, len(margin_trajectory)):
+        if margin_trajectory[i] < 0:
             crossover_layer = i
             break
 
     # Find the most threatening competitor (at the layer with min margin)
-    min_margin_idx = margin_trajectory.index(min_margin)
+    min_margin_idx = peak_layer + post_peak_margins.index(min_margin)
     competitor_token = (
         competitor_tokens[min_margin_idx]
         if min_margin_idx < len(competitor_tokens)

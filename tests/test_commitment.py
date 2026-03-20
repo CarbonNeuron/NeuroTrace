@@ -105,32 +105,33 @@ def _make_run(results=None, threshold=0.1) -> CommitmentRun:
 
 class TestComputeCommitment:
     def test_robust_large_margin(self):
-        """Large positive margin everywhere -> robust."""
+        """Large positive post-peak margin -> robust."""
         traj = [0.3, 0.5, 0.91, 0.85]
-        margin = [0.15, 0.30, 0.71, 0.51]
-        comp = [0.15, 0.20, 0.20, 0.34]
+        margin = [-0.05, 0.30, 0.71, 0.51]
+        comp = [0.35, 0.20, 0.20, 0.34]
         comp_tokens = ["the"] * 4
         m = compute_commitment(
             traj, margin, comp, comp_tokens, threshold=0.1
         )
         assert m["peak_prob"] == pytest.approx(0.91)
         assert m["peak_layer"] == 2
-        assert m["min_margin"] == pytest.approx(0.15)
+        # min_margin only from peak_layer onward: [0.71, 0.51]
+        assert m["min_margin"] == pytest.approx(0.51)
         assert m["margin_at_final"] == pytest.approx(0.51)
-        assert m["competitor_peak"] == pytest.approx(0.34)
         assert m["crossover_layer"] is None
-        assert m["vulnerable"] is False  # 0.15 >= 0.1
+        assert m["vulnerable"] is False
 
     def test_robust_no_crossover(self):
-        """All margins above threshold, no crossover -> robust."""
+        """All post-peak margins above threshold -> robust."""
         traj = [0.5, 0.8, 0.9]
-        margin = [0.3, 0.5, 0.6]
-        comp = [0.2, 0.3, 0.3]
+        margin = [0.01, 0.5, 0.6]
+        comp = [0.49, 0.3, 0.3]
         comp_tokens = ["the"] * 3
         m = compute_commitment(
             traj, margin, comp, comp_tokens, threshold=0.1
         )
-        assert m["min_margin"] == pytest.approx(0.3)
+        # peak at 2, post-peak margins: [0.6]
+        assert m["min_margin"] == pytest.approx(0.6)
         assert m["crossover_layer"] is None
         assert m["vulnerable"] is False
 
@@ -166,16 +167,31 @@ class TestComputeCommitment:
         assert m["vulnerable"] is True
         assert m["competitor_token"] == ""
 
-    def test_crossover_detection_first_layer(self):
-        """Crossover at the very first layer."""
-        traj = [0.1, 0.5, 0.8]
-        margin = [-0.2, 0.3, 0.5]
-        comp = [0.3, 0.2, 0.3]
+    def test_crossover_detection_post_peak(self):
+        """Crossover after peak layer is detected."""
+        traj = [0.1, 0.8, 0.5, 0.3]
+        margin = [-0.2, 0.5, 0.1, -0.1]
+        comp = [0.3, 0.3, 0.4, 0.4]
+        comp_tokens = ["x"] * 4
+        m = compute_commitment(
+            traj, margin, comp, comp_tokens, threshold=0.1
+        )
+        # peak at 1, post-peak: [0.5, 0.1, -0.1] -> crossover at 3
+        assert m["crossover_layer"] == 3
+
+    def test_pre_peak_crossover_ignored(self):
+        """Negative margin before peak is ignored."""
+        traj = [0.1, 0.8, 0.7]
+        margin = [-0.5, 0.5, 0.3]
+        comp = [0.6, 0.3, 0.4]
         comp_tokens = ["x"] * 3
         m = compute_commitment(
             traj, margin, comp, comp_tokens, threshold=0.1
         )
-        assert m["crossover_layer"] == 0
+        # peak at 1, post-peak margins: [0.5, 0.3]
+        assert m["crossover_layer"] is None
+        assert m["min_margin"] == pytest.approx(0.3)
+        assert m["vulnerable"] is False
 
     def test_competitor_token_at_min_margin(self):
         """Competitor token comes from the layer with min margin."""
@@ -221,7 +237,8 @@ class TestBuildCommitmentResult:
     def test_vulnerable_fields(self):
         r = _make_vulnerable_result()
         assert r.vulnerable is True
-        assert r.crossover_layer == 0  # first negative margin
+        # peak at layer 4, first post-peak negative margin at layer 5
+        assert r.crossover_layer == 5
         assert r.competitor_token == "located"
 
 
