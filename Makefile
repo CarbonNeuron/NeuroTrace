@@ -18,7 +18,7 @@ trace-demo:
 	uv run neurotrace inspect --db demo.db --trace-id latest
 
 install:
-	uv tool install --force --reinstall --from '.[upload,finetune]' neurotrace
+	uv tool install --force --reinstall --from '.[upload,finetune,probe]' neurotrace
 
 uninstall:
 	uv tool uninstall neurotrace

@@ -2230,6 +2230,482 @@ def _run_eval_scan(
 @cli.command()
 @click.option("--db", required=True, help="Path to DuckDB database file.")
 @click.option("--model", required=True, help="HuggingFace model name or path.")
+@click.option(
+    "--dataset-builtin",
+    required=True,
+    help="Built-in dataset name (e.g. capitals, math_simple, all).",
+)
+@click.option(
+    "--target-layers",
+    default=None,
+    help="MLP layers to ablate/finetune (comma-separated). Auto-detected if omitted.",
+)
+@click.option(
+    "--output",
+    "output_dir",
+    default=None,
+    help="Directory for experiment results.",
+)
+@click.option("--skip-ablate", is_flag=True, help="Skip the ablation step.")
+@click.option("--skip-finetune", is_flag=True, help="Skip the finetune step.")
+@click.option("--seed", default=42, type=int, help="Random seed.")
+@click.option("--json", "output_json", is_flag=True, help="JSON output.")
+def experiment(
+    db,
+    model,
+    dataset_builtin,
+    target_layers,
+    output_dir,
+    skip_ablate,
+    skip_finetune,
+    seed,
+    output_json,
+):
+    """Run a full diagnostic pipeline: scan, ablate, finetune, verify."""
+    import os
+    import time
+    import uuid
+    from datetime import datetime
+
+    from neurotrace.datasets import get_builtin_dataset
+
+    start_time = time.time()
+    experiment_id = str(uuid.uuid4())
+
+    # Determine output directory
+    if output_dir is None:
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        output_dir = f"experiments/{dataset_builtin}-{timestamp}"
+    os.makedirs(output_dir, exist_ok=True)
+
+    dataset = get_builtin_dataset(dataset_builtin)
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task("Loading model...", total=None)
+
+        from neurotrace.models import load_model
+        from neurotrace.scan import run_scan
+
+        model_obj, tokenizer = load_model(model)
+        progress.update(task, description="Model loaded.")
+
+        # --- Step 1: Baseline scan ---
+        progress.update(task, description="Step 1/4: Running baseline scan...")
+
+        def scan_progress(i, total, prompt):
+            progress.update(
+                task, description=f"Scanning {i + 1}/{total}: {prompt[:40]}..."
+            )
+
+        scan_result = run_scan(
+            model_obj,
+            tokenizer,
+            dataset,
+            dataset_builtin,
+            seed=seed,
+            progress_callback=scan_progress,
+        )
+
+        baseline_summary = {
+            "model": scan_result.model_name,
+            "dataset": scan_result.dataset_name,
+            "total": len(scan_result.prompt_results),
+            "correct": scan_result.correct_count,
+            "sabotaged": scan_result.sabotaged_count,
+            "weak": scan_result.weak_count,
+            "wrong": scan_result.wrong_count,
+            "results": [
+                {
+                    "prompt": r.prompt,
+                    "answer": r.answer,
+                    "final_token": r.final_token,
+                    "final_prob": r.final_prob,
+                    "status": r.status,
+                    "flags": r.flags,
+                    "sabotage_layers": r.sabotage_layers,
+                }
+                for r in scan_result.prompt_results
+            ],
+        }
+        scan_baseline_path = os.path.join(output_dir, "scan_baseline.json")
+        with open(scan_baseline_path, "w") as f:
+            json.dump(baseline_summary, f, indent=2, default=str)
+
+        err_console.print(
+            f"  Baseline: {scan_result.correct_count} correct, "
+            f"{scan_result.sabotaged_count} sabotaged, "
+            f"{scan_result.weak_count} weak, "
+            f"{scan_result.wrong_count} wrong"
+        )
+
+        # --- Step 2: Ablation analysis ---
+        ablation_summary = {"target_layers": [], "layer_impacts": {}}
+        detected_layers = None
+
+        if not skip_ablate:
+            progress.update(task, description="Step 2/4: Running ablation analysis...")
+            from neurotrace.ablate import AblationSpec, run_ablation
+
+            # Get prompts that were sabotaged or wrong
+            problem_prompts = [
+                r
+                for r in scan_result.prompt_results
+                if r.status in ("sabotaged", "wrong")
+            ]
+
+            if problem_prompts:
+                # For each problem prompt, ablate MLP at each layer
+                num_layers = len(scan_result.prompt_results[0].ranks)
+                layer_improvement_counts: dict[int, int] = {}
+
+                for pi, pr in enumerate(problem_prompts):
+                    progress.update(
+                        task,
+                        description=(
+                            f"Ablating {pi + 1}/{len(problem_prompts)}: "
+                            f"{pr.prompt[:30]}..."
+                        ),
+                    )
+                    for layer_idx in range(num_layers):
+                        spec = AblationSpec(
+                            zero_layers=[],
+                            zero_heads=[],
+                            scale_layers=[],
+                            zero_mlp=[layer_idx],
+                        )
+                        try:
+                            abl_result = run_ablation(
+                                model_obj,
+                                tokenizer,
+                                pr.prompt,
+                                spec,
+                                seed=seed,
+                            )
+                            # Check if ablating this layer improved the prediction
+                            ablated_token = abl_result.ablated_final_token.strip()
+                            answer_lower = pr.answer.strip().lower()
+                            ablated_lower = ablated_token.lstrip("\u2581").lower()
+                            if ablated_lower and answer_lower.startswith(ablated_lower):
+                                layer_improvement_counts[layer_idx] = (
+                                    layer_improvement_counts.get(layer_idx, 0) + 1
+                                )
+                        except Exception:
+                            continue
+
+                ablation_summary["layer_impacts"] = {
+                    str(k): v
+                    for k, v in sorted(
+                        layer_improvement_counts.items(),
+                        key=lambda x: x[1],
+                        reverse=True,
+                    )
+                }
+
+                # Pick top 2 layers
+                if layer_improvement_counts:
+                    sorted_layers = sorted(
+                        layer_improvement_counts.items(),
+                        key=lambda x: x[1],
+                        reverse=True,
+                    )
+                    detected_layers = [ly for ly, _ in sorted_layers[:2]]
+                    ablation_summary["target_layers"] = detected_layers
+            else:
+                err_console.print("  No problem prompts found, skipping ablation.")
+        else:
+            err_console.print("  Skipping ablation step.")
+
+        ablation_path = os.path.join(output_dir, "ablation_summary.json")
+        with open(ablation_path, "w") as f:
+            json.dump(ablation_summary, f, indent=2)
+
+        # Resolve target layers
+        if target_layers is not None:
+            layers = [int(x.strip()) for x in target_layers.split(",") if x.strip()]
+        elif detected_layers:
+            layers = detected_layers
+        else:
+            layers = [20, 21]
+            err_console.print(
+                "  No impactful layers detected, using defaults: [20, 21]"
+            )
+
+        err_console.print(f"  Target layers: {layers}")
+
+        # --- Step 3: Finetune ---
+        finetune_run_id = None
+        ft_result = None
+        verify_result = None
+        adapter_path = os.path.join(output_dir, "adapter")
+
+        if not skip_finetune:
+            progress.update(task, description="Step 3/4: Fine-tuning LoRA adapter...")
+            from neurotrace.finetune import (
+                FinetuneConfig,
+                generate_training_data_from_scan,
+                run_finetune,
+            )
+
+            examples = generate_training_data_from_scan(scan_result, sabotage_weight=3)
+            config = FinetuneConfig(
+                target_layers=layers,
+                seed=seed,
+            )
+
+            def ft_progress(desc):
+                progress.update(task, description=f"  {desc}")
+
+            # Need to delete model to free memory before loading for training
+            del model_obj, tokenizer
+
+            ft_result = run_finetune(
+                model_name=model,
+                examples=examples,
+                config=config,
+                output_dir=adapter_path,
+                progress_callback=ft_progress,
+            )
+            ft_result.dataset_name = dataset_builtin
+            finetune_run_id = ft_result.run_id
+
+            # Save finetune run to DB
+            db_conn = TraceDB(db)
+            db_conn.save_finetune_run(ft_result)
+            db_conn.close()
+
+            err_console.print(
+                f"  Training: loss {ft_result.train_loss_start:.4f} -> "
+                f"{ft_result.train_loss_end:.4f}"
+            )
+        else:
+            err_console.print("  Skipping finetune step.")
+
+        # --- Step 4: Verify ---
+        adapted_summary = None
+        if not skip_finetune:
+            progress.update(task, description="Step 4/4: Verifying with adapter...")
+
+            model_obj, tokenizer = load_model(model)
+            model_obj = _maybe_load_adapter(model_obj, adapter_path)
+
+            def verify_progress(i, total, prompt):
+                progress.update(
+                    task,
+                    description=f"Verifying {i + 1}/{total}: {prompt[:40]}...",
+                )
+
+            verify_result = run_scan(
+                model_obj,
+                tokenizer,
+                dataset,
+                dataset_builtin,
+                seed=seed,
+                progress_callback=verify_progress,
+            )
+
+            adapted_summary = {
+                "model": verify_result.model_name,
+                "dataset": verify_result.dataset_name,
+                "total": len(verify_result.prompt_results),
+                "correct": verify_result.correct_count,
+                "sabotaged": verify_result.sabotaged_count,
+                "weak": verify_result.weak_count,
+                "wrong": verify_result.wrong_count,
+                "results": [
+                    {
+                        "prompt": r.prompt,
+                        "answer": r.answer,
+                        "final_token": r.final_token,
+                        "final_prob": r.final_prob,
+                        "status": r.status,
+                        "flags": r.flags,
+                    }
+                    for r in verify_result.prompt_results
+                ],
+            }
+            scan_adapted_path = os.path.join(output_dir, "scan_adapted.json")
+            with open(scan_adapted_path, "w") as f:
+                json.dump(adapted_summary, f, indent=2, default=str)
+
+            err_console.print(
+                f"  Adapted: {verify_result.correct_count} correct, "
+                f"{verify_result.sabotaged_count} sabotaged, "
+                f"{verify_result.weak_count} weak, "
+                f"{verify_result.wrong_count} wrong"
+            )
+            del model_obj, tokenizer
+        else:
+            err_console.print("  Skipping verification (no finetune).")
+
+        progress.update(task, description="Saving experiment...")
+
+    duration = time.time() - start_time
+
+    # --- Generate report.md ---
+    report_lines = [
+        f"# Experiment Report: {dataset_builtin}",
+        "",
+        f"**Experiment ID:** {experiment_id[:8]}",
+        f"**Model:** {model}",
+        f"**Dataset:** {dataset_builtin} ({len(dataset)} examples)",
+        f"**Duration:** {duration:.1f}s",
+        "",
+        "## Baseline Accuracy",
+        "",
+        f"- Correct: {baseline_summary['correct']}",
+        f"- Sabotaged: {baseline_summary['sabotaged']}",
+        f"- Weak: {baseline_summary['weak']}",
+        f"- Wrong: {baseline_summary['wrong']}",
+        "",
+    ]
+
+    if not skip_ablate and ablation_summary.get("layer_impacts"):
+        report_lines.extend([
+            "## Ablation Analysis",
+            "",
+            "Top impactful layers (MLP-zero improvement count):",
+            "",
+        ])
+        for layer_str, count in list(ablation_summary["layer_impacts"].items())[:5]:
+            report_lines.append(f"- Layer {layer_str}: {count} improvements")
+        report_lines.extend(["", f"**Selected target layers:** {layers}", ""])
+
+    if not skip_finetune and finetune_run_id and ft_result is not None:
+        report_lines.extend([
+            "## Fine-tuning",
+            "",
+            f"- Target layers: {layers}",
+            "- LoRA rank: 8, alpha: 16",
+            "- Epochs: 10",
+            f"- Loss: {ft_result.train_loss_start:.4f}"
+            f" -> {ft_result.train_loss_end:.4f}",
+            f"- Adapter: {adapter_path}",
+            "",
+        ])
+
+    if adapted_summary:
+        report_lines.extend([
+            "## Post-Fix Accuracy",
+            "",
+            f"- Correct: {adapted_summary['correct']}",
+            f"- Sabotaged: {adapted_summary['sabotaged']}",
+            f"- Weak: {adapted_summary['weak']}",
+            f"- Wrong: {adapted_summary['wrong']}",
+            "",
+            "## Delta",
+            "",
+            f"- Correct: {baseline_summary['correct']} -> {adapted_summary['correct']}"
+            f" ({adapted_summary['correct'] - baseline_summary['correct']:+d})",
+            f"- Sabotaged: {baseline_summary['sabotaged']}"
+            f" -> {adapted_summary['sabotaged']}"
+            f" ({adapted_summary['sabotaged'] - baseline_summary['sabotaged']:+d})",
+            f"- Wrong: {baseline_summary['wrong']} -> {adapted_summary['wrong']}"
+            f" ({adapted_summary['wrong'] - baseline_summary['wrong']:+d})",
+            "",
+        ])
+
+        # Remaining failures
+        remaining = [
+            r for r in (verify_result.prompt_results if verify_result else [])
+            if r.status != "correct"
+        ]
+        if remaining:
+            report_lines.extend(["## Remaining Failures", ""])
+            for r in remaining:
+                report_lines.append(
+                    f"- [{r.status}] {r.prompt} -> {r.final_token} "
+                    f"(expected {r.answer})"
+                )
+            report_lines.append("")
+
+    report_path = os.path.join(output_dir, "report.md")
+    with open(report_path, "w") as f:
+        f.write("\n".join(report_lines))
+
+    # --- Save experiment to DB ---
+    db_conn = TraceDB(db)
+    db_conn.save_experiment({
+        "id": experiment_id,
+        "dataset_name": dataset_builtin,
+        "model": model,
+        "baseline_correct": baseline_summary["correct"],
+        "baseline_sabotaged": baseline_summary["sabotaged"],
+        "baseline_weak": baseline_summary["weak"],
+        "baseline_wrong": baseline_summary["wrong"],
+        "target_layers": json.dumps(layers),
+        "finetune_run_id": finetune_run_id,
+        "adapter_path": adapter_path if not skip_finetune else None,
+        "result_correct": adapted_summary["correct"] if adapted_summary else None,
+        "result_sabotaged": adapted_summary["sabotaged"] if adapted_summary else None,
+        "result_weak": adapted_summary["weak"] if adapted_summary else None,
+        "result_wrong": adapted_summary["wrong"] if adapted_summary else None,
+        "created_at": datetime.now().isoformat(),
+        "duration_seconds": duration,
+    })
+    db_conn.close()
+
+    # --- Output ---
+    if output_json:
+        output = {
+            "experiment_id": experiment_id,
+            "model": model,
+            "dataset": dataset_builtin,
+            "output_dir": output_dir,
+            "target_layers": layers,
+            "baseline": {
+                "correct": baseline_summary["correct"],
+                "sabotaged": baseline_summary["sabotaged"],
+                "weak": baseline_summary["weak"],
+                "wrong": baseline_summary["wrong"],
+            },
+            "ablation": ablation_summary,
+            "result": {
+                "correct": adapted_summary["correct"],
+                "sabotaged": adapted_summary["sabotaged"],
+                "weak": adapted_summary["weak"],
+                "wrong": adapted_summary["wrong"],
+            }
+            if adapted_summary
+            else None,
+            "duration_seconds": round(duration, 1),
+        }
+        click.echo(json.dumps(output, indent=2, default=str))
+        return
+
+    console.print("\n[bold]Experiment complete[/bold]")
+    console.print(f"[bold]ID:[/bold] {experiment_id[:8]}")
+    console.print(f"[bold]Dataset:[/bold] {dataset_builtin} ({len(dataset)} examples)")
+    console.print(f"[bold]Target layers:[/bold] {layers}")
+    console.print(
+        f"\n[bold]Baseline:[/bold] "
+        f"{baseline_summary['correct']} correct, "
+        f"{baseline_summary['sabotaged']} sabotaged, "
+        f"{baseline_summary['weak']} weak, "
+        f"{baseline_summary['wrong']} wrong"
+    )
+    if adapted_summary:
+        console.print(
+            f"[bold]Adapted:[/bold]  "
+            f"{adapted_summary['correct']} correct, "
+            f"{adapted_summary['sabotaged']} sabotaged, "
+            f"{adapted_summary['weak']} weak, "
+            f"{adapted_summary['wrong']} wrong"
+        )
+        delta_correct = adapted_summary["correct"] - baseline_summary["correct"]
+        console.print(
+            f"[bold]Delta:[/bold]    {delta_correct:+d} correct"
+        )
+    console.print(f"\n[green]Results saved to {output_dir}/[/green]")
+    console.print(f"Duration: {duration:.1f}s")
+
+
+@cli.command()
+@click.option("--db", required=True, help="Path to DuckDB database file.")
+@click.option("--model", required=True, help="HuggingFace model name or path.")
 @click.option("--prompt", required=True, help="Target prompt.")
 @click.option("--layer", required=True, type=int, help="MLP layer to analyze.")
 @click.option(
@@ -2575,3 +3051,260 @@ def _neurons_ablate(
         f"\n[bold]Summary:[/bold] {changed_count}/{len(results)}"
         f" ablation(s) changed the top-1 prediction."
     )
+
+
+@cli.command()
+@click.option("--db", required=True, help="Path to DuckDB database file.")
+@click.option("--model", required=True, help="HuggingFace model name or path.")
+@click.option(
+    "--dataset-builtin",
+    default=None,
+    help="Built-in dataset name.",
+)
+@click.option(
+    "--dataset",
+    "dataset_path",
+    default=None,
+    type=click.Path(exists=True),
+    help="Custom dataset JSON file.",
+)
+@click.option(
+    "--layer", default=None, type=int,
+    help="Layer to extract (default: auto).",
+)
+@click.option(
+    "--extraction-point",
+    default="pre_mlp",
+    type=click.Choice(["pre_mlp", "post_attn", "post_mlp"]),
+    help="Activation extraction point.",
+)
+@click.option("--seed", default=42, type=int, help="Random seed.")
+@click.option("--output", default=None, help="Output directory.")
+@click.option(
+    "--cross-dataset",
+    default=None,
+    help="Cross-domain dataset (builtin name or path).",
+)
+@click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
+def probe(
+    db,
+    model,
+    dataset_builtin,
+    dataset_path,
+    layer,
+    extraction_point,
+    seed,
+    output,
+    cross_dataset,
+    adapter,
+    output_json,
+):
+    """Find the sabotage direction in activation space via linear probing."""
+    from neurotrace.datasets import get_builtin_dataset, load_dataset
+    from neurotrace.probe import (
+        auto_detect_layer,
+        run_probe,
+        save_probe_outputs,
+    )
+    from neurotrace.scan import run_scan
+
+    if dataset_path is None and dataset_builtin is None:
+        raise click.UsageError("Must provide either --dataset or --dataset-builtin.")
+    if dataset_path is not None and dataset_builtin is not None:
+        raise click.UsageError("Cannot provide both --dataset and --dataset-builtin.")
+
+    # Load dataset
+    if dataset_builtin is not None:
+        dataset = get_builtin_dataset(dataset_builtin)
+        dataset_name = dataset_builtin
+    else:
+        dataset = load_dataset(dataset_path)
+        dataset_name = dataset_path
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task("Loading model...", total=None)
+        from neurotrace.models import load_model
+
+        model_obj, tokenizer = load_model(model)
+        model_obj = _maybe_load_adapter(model_obj, adapter)
+        progress.update(task, description="Model loaded.")
+
+        # Run scan to get labels
+        progress.update(task, description="Scanning dataset for sabotage labels...")
+
+        def scan_progress(i, total, prompt):
+            progress.update(
+                task,
+                description=f"Scanning {i + 1}/{total}: {prompt[:40]}...",
+            )
+
+        scan_result = run_scan(
+            model_obj,
+            tokenizer,
+            dataset,
+            dataset_name,
+            seed=seed,
+            progress_callback=scan_progress,
+        )
+
+        # Auto-detect layer if not specified
+        if layer is None:
+            layer = auto_detect_layer(scan_result)
+            if layer is None:
+                raise click.ClickException(
+                    "No sabotage layers found in scan. Specify --layer manually."
+                )
+            err_console.print(f"Auto-detected sabotage layer: {layer}")
+
+        # Cross-dataset scan
+        cross_scan = None
+        cross_name = None
+        if cross_dataset is not None:
+            progress.update(
+                task,
+                description=f"Cross-scan: {cross_dataset}...",
+            )
+            try:
+                cross_ds = get_builtin_dataset(cross_dataset)
+                cross_name = cross_dataset
+            except ValueError:
+                cross_ds = load_dataset(cross_dataset)
+                cross_name = cross_dataset
+
+            def cross_progress(i, total, prompt):
+                progress.update(
+                    task,
+                    description=f"Cross-scan {i + 1}/{total}: {prompt[:40]}...",
+                )
+
+            cross_scan = run_scan(
+                model_obj,
+                tokenizer,
+                cross_ds,
+                cross_name,
+                seed=seed,
+                progress_callback=cross_progress,
+            )
+
+        # Run probe
+        def probe_progress(desc):
+            progress.update(task, description=desc)
+
+        result = run_probe(
+            model_obj,
+            tokenizer,
+            scan_result,
+            layer=layer,
+            extraction_point=extraction_point,
+            seed=seed,
+            cross_scan_result=cross_scan,
+            cross_dataset_name=cross_name,
+            progress_callback=probe_progress,
+        )
+
+        # Determine output directory
+        if output is None:
+            from datetime import datetime
+
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            output = f"probes/{dataset_name}-{timestamp}"
+
+        # Save outputs
+        progress.update(task, description="Saving outputs...")
+        save_probe_outputs(result, output)
+
+        # Save to DB
+        import uuid
+
+        probe_id = str(uuid.uuid4())
+        db_conn = TraceDB(db)
+        db_conn.save_probe(probe_id, result)
+        db_conn.close()
+
+        progress.update(task, description="Done.")
+
+    if output_json:
+        json_output = {
+            "probe_id": probe_id,
+            "dataset": result.dataset_name,
+            "model": result.model_name,
+            "layer": result.layer,
+            "extraction_point": result.extraction_point,
+            "num_clean": result.num_clean,
+            "num_sabotaged": result.num_sabotaged,
+            "cohens_d": result.cohens_d,
+            "auc_roc": result.auc_roc,
+            "probe_accuracy": result.probe_accuracy,
+            "probe_correct": result.probe_correct,
+            "probe_total": result.probe_total,
+            "direction_alignment": result.direction_alignment,
+            "pca_explained_variance": result.pca_explained_variance.tolist(),
+            "output_dir": output,
+        }
+        if result.cross_dataset:
+            json_output["cross_dataset"] = result.cross_dataset
+            json_output["cross_auc_roc"] = result.cross_auc_roc
+        click.echo(json.dumps(json_output, indent=2, default=str))
+        return
+
+    # Rich output
+    console.print(f"\n[bold]Probe Analysis:[/bold] {result.dataset_name}")
+    console.print(
+        f"Layer {result.layer} | {result.extraction_point} | "
+        f"{result.num_clean} clean, {result.num_sabotaged} sabotaged"
+    )
+
+    if result.num_sabotaged < 5:
+        console.print(
+            f"\n[yellow]Warning: Only {result.num_sabotaged} sabotaged examples."
+            f" Results may be unreliable.[/yellow]"
+        )
+
+    console.print("\n[bold]Mean Difference Direction:[/bold]")
+    clean_scores = result.projection_scores[~result.labels]
+    sabo_scores = result.projection_scores[result.labels]
+    c_m, c_s = clean_scores.mean(), clean_scores.std()
+    s_m, s_s = sabo_scores.mean(), sabo_scores.std()
+    console.print(f"  Clean mean:  {c_m:.4f} +/- {c_s:.4f}")
+    console.print(f"  Sabo mean:   {s_m:.4f} +/- {s_s:.4f}")
+    console.print(f"  Cohen's d:   {result.cohens_d:.4f}")
+    console.print(f"  AUC-ROC:     {result.auc_roc:.4f}")
+
+    console.print("\n[bold]Linear Probe (LOO):[/bold]")
+    acc = f"{result.probe_correct}/{result.probe_total}"
+    console.print(f"  Accuracy: {acc} ({result.probe_accuracy:.1%})")
+    console.print(f"  Direction alignment: {result.direction_alignment:.4f}")
+
+    # Per-prompt table
+    table = Table(title="Per-Prompt Projections")
+    table.add_column("Prompt")
+    table.add_column("Label", justify="center")
+    table.add_column("Score", justify="right")
+
+    for i, prompt in enumerate(result.prompts):
+        label = "SABO" if result.labels[i] else "clean"
+        score = result.projection_scores[i]
+        style = "red" if result.labels[i] else None
+        prompt_display = prompt if len(prompt) <= 40 else "..." + prompt[-37:]
+        table.add_row(prompt_display, label, f"{score:.4f}", style=style)
+
+    console.print(table)
+
+    pca_var = result.pca_explained_variance
+    console.print(
+        f"\n[bold]PCA:[/bold] PC1={pca_var[0]:.1%},"
+        f" PC2={pca_var[1]:.1%}, PC3={pca_var[2]:.1%}"
+    )
+
+    if result.cross_dataset:
+        console.print(
+            f"\n[bold]Cross-Domain ({result.cross_dataset}):[/bold] "
+            f"AUC-ROC = {result.cross_auc_roc:.4f}"
+        )
+
+    console.print(f"\n[green]Results saved to {output}/[/green]")

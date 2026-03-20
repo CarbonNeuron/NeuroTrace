@@ -135,6 +135,26 @@ class TraceDB:
             )
         """)
         self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS experiments (
+                id TEXT PRIMARY KEY,
+                dataset_name TEXT NOT NULL,
+                model TEXT NOT NULL,
+                baseline_correct INTEGER,
+                baseline_sabotaged INTEGER,
+                baseline_weak INTEGER,
+                baseline_wrong INTEGER,
+                target_layers VARCHAR,
+                finetune_run_id TEXT,
+                adapter_path TEXT,
+                result_correct INTEGER,
+                result_sabotaged INTEGER,
+                result_weak INTEGER,
+                result_wrong INTEGER,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                duration_seconds REAL
+            )
+        """)
+        self._conn.execute("""
             CREATE TABLE IF NOT EXISTS neuron_profiles (
                 id VARCHAR PRIMARY KEY,
                 trace_id VARCHAR,
@@ -150,6 +170,24 @@ class TraceDB:
                 diff_activations VARCHAR,
                 label VARCHAR,
                 created_at VARCHAR
+            )
+        """)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS probes (
+                id TEXT PRIMARY KEY,
+                dataset_name TEXT NOT NULL,
+                model TEXT NOT NULL,
+                layer INTEGER NOT NULL,
+                extraction_point TEXT NOT NULL,
+                num_clean INTEGER,
+                num_sabotaged INTEGER,
+                cohens_d REAL,
+                auc_roc REAL,
+                probe_accuracy REAL,
+                direction_alignment REAL,
+                cross_dataset TEXT,
+                cross_auc_roc REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
 
@@ -623,6 +661,80 @@ class TraceDB:
             scan_before=json_mod.loads(row[13]) if row[13] else None,
             scan_after=json_mod.loads(row[14]) if row[14] else None,
             created_at=row[15],
+        )
+
+    def save_experiment(self, experiment: dict) -> None:
+        """Save an experiment record to the database."""
+        self._conn.execute(
+            "INSERT INTO experiments VALUES"
+            " (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                experiment["id"],
+                experiment["dataset_name"],
+                experiment["model"],
+                experiment.get("baseline_correct"),
+                experiment.get("baseline_sabotaged"),
+                experiment.get("baseline_weak"),
+                experiment.get("baseline_wrong"),
+                experiment.get("target_layers"),
+                experiment.get("finetune_run_id"),
+                experiment.get("adapter_path"),
+                experiment.get("result_correct"),
+                experiment.get("result_sabotaged"),
+                experiment.get("result_weak"),
+                experiment.get("result_wrong"),
+                experiment.get("created_at"),
+                experiment.get("duration_seconds"),
+            ],
+        )
+
+    def load_experiment(self, experiment_id: str) -> dict | None:
+        """Load an experiment record by ID."""
+        row = self._conn.execute(
+            "SELECT * FROM experiments WHERE id = ?",
+            [experiment_id],
+        ).fetchone()
+        if row is None:
+            return None
+        return {
+            "id": row[0],
+            "dataset_name": row[1],
+            "model": row[2],
+            "baseline_correct": row[3],
+            "baseline_sabotaged": row[4],
+            "baseline_weak": row[5],
+            "baseline_wrong": row[6],
+            "target_layers": row[7],
+            "finetune_run_id": row[8],
+            "adapter_path": row[9],
+            "result_correct": row[10],
+            "result_sabotaged": row[11],
+            "result_weak": row[12],
+            "result_wrong": row[13],
+            "created_at": row[14],
+            "duration_seconds": row[15],
+        }
+
+    def save_probe(self, probe_id: str, result) -> None:
+        """Save a probe analysis result to the database."""
+        self._conn.execute(
+            "INSERT INTO probes VALUES"
+            " (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            [
+                probe_id,
+                result.dataset_name,
+                result.model_name,
+                result.layer,
+                result.extraction_point,
+                result.num_clean,
+                result.num_sabotaged,
+                result.cohens_d,
+                result.auc_roc,
+                result.probe_accuracy,
+                result.direction_alignment,
+                result.cross_dataset,
+                result.cross_auc_roc,
+            ],
         )
 
     def close(self) -> None:
