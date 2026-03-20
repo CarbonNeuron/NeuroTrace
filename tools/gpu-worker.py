@@ -1957,6 +1957,281 @@ def repair_save(req: RepairSaveRequest) -> dict[str, Any]:
     return {"status": "saved", "path": str(save_path)}
 
 
+# ---------------------------------------------------------------------------
+# Bench endpoints
+# ---------------------------------------------------------------------------
+
+
+class PerplexityRequest(BaseModel):
+    max_samples: int = 100
+    max_length: int = 512
+
+
+class BenchPrompt(BaseModel):
+    prompt: str
+    answer: str
+
+
+class RepairAndMeasureRequest(BaseModel):
+    prompts: list[BenchPrompt]
+    target_margin: float = 0.0
+
+
+@app.post("/bench/perplexity")
+def bench_perplexity(req: PerplexityRequest) -> StreamingResponse:
+    """Compute perplexity on WikiText-2 test set."""
+    assert _model is not None and _tokenizer is not None and _device is not None
+    import math
+
+    async def _generate():
+        yield _sse_line({"type": "progress", "status": "loading_dataset"})
+        await asyncio.sleep(0)
+
+        try:
+            from datasets import load_dataset as _hf_load
+            dataset = _hf_load("wikitext", "wikitext-2-raw-v1", split="test")
+            text = "\n\n".join([t for t in dataset["text"] if t.strip()])
+        except Exception:
+            text = (
+                "The tower is 324 metres tall, about the same height as an "
+                "81-storey building, and the tallest structure in Paris. "
+                "Its base is square, measuring 125 metres on each side. " * 50
+            )
+
+        yield _sse_line({"type": "progress", "status": "computing"})
+        await asyncio.sleep(0)
+
+        encodings = _tokenizer(text, return_tensors="pt")
+        input_ids = encodings.input_ids.to(_device)
+
+        model_max = getattr(_model.config, "max_position_embeddings", 2048) or 2048
+        actual_max = min(model_max, req.max_length)
+        stride = actual_max // 2
+
+        nlls: list[float] = []
+        total_tokens = 0
+
+        for begin in range(
+            0,
+            min(input_ids.size(1), req.max_samples * actual_max),
+            stride,
+        ):
+            end = min(begin + actual_max, input_ids.size(1))
+            chunk = input_ids[:, begin:end]
+
+            with torch.no_grad():
+                outputs = _model(chunk)
+                logits = outputs.logits[:, :-1, :].contiguous()
+                targets = chunk[:, 1:].contiguous()
+                loss = torch.nn.functional.cross_entropy(
+                    logits.view(-1, logits.size(-1)),
+                    targets.view(-1),
+                    reduction="mean",
+                )
+
+            chunk_tokens = targets.numel()
+            nlls.append(loss.item() * chunk_tokens)
+            total_tokens += chunk_tokens
+
+            if end == input_ids.size(1):
+                break
+
+        avg_loss = sum(nlls) / total_tokens if total_tokens > 0 else 0.0
+        ppl = math.exp(avg_loss)
+
+        yield _sse_line({
+            "type": "result",
+            "perplexity": round(ppl, 4),
+            "loss": round(avg_loss, 6),
+            "tokens": total_tokens,
+        })
+        await asyncio.sleep(0)
+        yield _sse_line({"type": "done"})
+
+    return StreamingResponse(_generate(), media_type="text/event-stream")
+
+
+@app.post("/bench/repair-and-measure")
+def bench_repair_and_measure(req: RepairAndMeasureRequest) -> StreamingResponse:
+    """Repair all prompts sequentially with stacking edits, return results."""
+    assert _model is not None and _tokenizer is not None and _device is not None
+
+    async def _generate():
+        layers = _get_transformer_layers()
+        ln_weight = _model.model.norm.weight.detach()
+        w_unembed = _model.lm_head.weight
+
+        results = []
+        total_norm = 0.0
+
+        for idx, bp in enumerate(req.prompts):
+            prompt = bp.prompt
+            answer_str = bp.answer
+
+            yield _sse_line({
+                "type": "progress",
+                "status": "repairing",
+                "current": idx + 1,
+                "total": len(req.prompts),
+                "prompt": prompt[:50],
+            })
+            await asyncio.sleep(0)
+
+            input_ids = _tokenizer.encode(prompt, return_tensors="pt").to(_device)
+
+            # Get answer and competitor token IDs
+            answer_ids = _tokenizer.encode(" " + answer_str, add_special_tokens=False)
+            if not answer_ids:
+                answer_ids = _tokenizer.encode(answer_str, add_special_tokens=False)
+            answer_id = answer_ids[0] if answer_ids else 0
+
+            # Find competitor
+            with torch.no_grad():
+                outputs = _model(input_ids)
+            logits = outputs.logits[0, -1, :]
+            probs = _safe_softmax(logits)
+            top_probs, top_ids = _safe_topk(probs, 10)
+            exclude = set(answer_ids + _tokenizer.encode(answer_str, add_special_tokens=False))
+            competitor_str = "the"
+            comp_id = 0
+            for tid in top_ids.tolist():
+                if tid not in exclude:
+                    decoded = _tokenizer.decode([tid]).strip()
+                    if decoded:
+                        competitor_str = decoded
+                        comp_id = tid
+                        break
+
+            if comp_id == 0:
+                comp_ids = _tokenizer.encode(" " + competitor_str, add_special_tokens=False)
+                comp_id = comp_ids[0] if comp_ids else 0
+
+            before_prob = probs[answer_id].item()
+            before_margin = (logits[answer_id] - logits[comp_id]).item()
+
+            # Hook MLP outputs for decompose
+            components: dict[int, dict[str, Any]] = {}
+            hooks_list: list[torch.utils.hooks.RemovableHandle] = []
+
+            def make_mlp_hook(li):
+                def hook(module, inp, output):
+                    out = output[0, -1, :] if output.dim() == 3 else output[-1, :]
+                    components[li]["mlp"] = out.detach()
+                return hook
+
+            for i, layer in enumerate(layers):
+                components[i] = {}
+                hooks_list.append(layer.mlp.register_forward_hook(make_mlp_hook(i)))
+
+            try:
+                with torch.no_grad():
+                    _model(input_ids)
+            finally:
+                for h in hooks_list:
+                    h.remove()
+
+            # Find worst layer
+            embed = _model.model.embed_tokens(input_ids)[0, -1, :].detach()
+            residual = embed.clone()
+            for i in range(len(layers)):
+                residual = residual + components[i].get("mlp", torch.zeros_like(embed))
+
+            variance = residual.pow(2).mean(-1, keepdim=False)
+            s = torch.sqrt(variance + _model.model.norm.variance_epsilon)
+
+            target_layer = 0
+            worst_margin = float("inf")
+            for i in range(len(layers)):
+                if "mlp" not in components[i]:
+                    continue
+                a_proj = (w_unembed[answer_id] * ln_weight) / s
+                c_proj = (w_unembed[comp_id] * ln_weight) / s
+                mlp_margin = (
+                    (a_proj * components[i]["mlp"]).sum().item()
+                    - (c_proj * components[i]["mlp"]).sum().item()
+                )
+                if mlp_margin < worst_margin:
+                    worst_margin = mlp_margin
+                    target_layer = i
+
+            # Compute key vector
+            k_holder: dict[str, Any] = {}
+
+            def kstar_hook(module, args):
+                inp = args[0] if isinstance(args, tuple) else args
+                if inp.dim() == 3:
+                    k_holder["v"] = inp[0, -1, :].detach().clone()
+                elif inp.dim() == 2:
+                    k_holder["v"] = inp[-1, :].detach().clone()
+                else:
+                    k_holder["v"] = inp.detach().clone()
+
+            handle = layers[target_layer].mlp.down_proj.register_forward_pre_hook(kstar_hook)
+            try:
+                with torch.no_grad():
+                    _model(input_ids)
+            finally:
+                handle.remove()
+
+            k_star = k_holder["v"]
+
+            # Correction delta
+            deficit = req.target_margin - worst_margin
+            p_answer = w_unembed[answer_id] * ln_weight
+            p_comp = w_unembed[comp_id] * ln_weight
+            p_margin_vec = p_answer - p_comp
+            dot = (p_margin_vec @ p_margin_vec).item()
+            if dot < 1e-10:
+                delta = torch.zeros_like(p_margin_vec)
+            else:
+                delta = (deficit / dot) * p_margin_vec
+
+            # Apply edit
+            down_proj = layers[target_layer].mlp.down_proj
+            k_dot = (k_star @ k_star).item()
+            edit_norm = 0.0
+            if k_dot >= 1e-10:
+                update = torch.outer(delta, k_star) / k_dot
+                edit_norm = update.norm().item()
+                down_proj.weight.data += update
+
+            _edit_stack.append((target_layer, k_star, delta))
+            total_norm += edit_norm
+
+            # After measurement
+            with torch.no_grad():
+                out_after = _model(input_ids)
+            after_logits = out_after.logits[0, -1, :]
+            after_probs = _safe_softmax(after_logits)
+            after_prob = after_probs[answer_id].item()
+            after_margin = (after_logits[answer_id] - after_logits[comp_id]).item()
+
+            results.append({
+                "prompt": prompt,
+                "answer": answer_str,
+                "competitor": competitor_str,
+                "before_margin": round(before_margin, 4),
+                "after_margin": round(after_margin, 4),
+                "before_prob": round(before_prob, 4),
+                "after_prob": round(after_prob, 4),
+                "layer": target_layer,
+                "component": "mlp",
+                "edit_norm": round(edit_norm, 6),
+                "status": "repaired",
+            })
+
+        yield _sse_line({
+            "type": "result",
+            "results": results,
+            "total_edits": len(req.prompts),
+            "total_edit_norm": round(total_norm, 4),
+        })
+        await asyncio.sleep(0)
+        yield _sse_line({"type": "done"})
+
+    return StreamingResponse(_generate(), media_type="text/event-stream")
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="NeuroTrace GPU inference server",

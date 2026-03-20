@@ -300,6 +300,40 @@ class RemoteWorker:
                 if line.startswith("data: "):
                     yield json.loads(line[6:])
 
+    def perplexity_stream(
+        self,
+        max_samples: int = 100,
+        max_length: int = 512,
+    ) -> Generator[dict, None, None]:
+        """Stream perplexity computation results via SSE."""
+        with self.client.stream(
+            "POST",
+            f"{self.base_url}/bench/perplexity",
+            json={"max_samples": max_samples, "max_length": max_length},
+            timeout=600.0,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line.startswith("data: "):
+                    yield json.loads(line[6:])
+
+    def repair_and_measure_stream(
+        self,
+        prompts: list[dict],
+        target_margin: float = 0.0,
+    ) -> Generator[dict, None, None]:
+        """Stream repair-and-measure results via SSE."""
+        with self.client.stream(
+            "POST",
+            f"{self.base_url}/bench/repair-and-measure",
+            json={"prompts": prompts, "target_margin": target_margin},
+            timeout=600.0,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line.startswith("data: "):
+                    yield json.loads(line[6:])
+
     def repair_undo(self) -> dict:
         """Undo the last repair edit on the worker."""
         r = self.client.post(f"{self.base_url}/repair/undo")

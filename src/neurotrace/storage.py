@@ -448,6 +448,57 @@ class TraceDB:
         """)
 
         self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS bench_runs (
+                id TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                model_name TEXT NOT NULL,
+                datasets TEXT NOT NULL,
+                total_edits INTEGER,
+                baseline_ppl REAL,
+                combined_ppl REAL
+            )
+        """)
+        self._conn.execute(
+            "CREATE SEQUENCE IF NOT EXISTS bench_domain_seq START 1"
+        )
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS bench_domain_results (
+                id INTEGER DEFAULT nextval('bench_domain_seq'),
+                run_id TEXT NOT NULL,
+                dataset TEXT NOT NULL,
+                baseline_correct INTEGER,
+                baseline_total INTEGER,
+                repaired_correct INTEGER,
+                repaired_total INTEGER,
+                baseline_ppl REAL,
+                repaired_ppl REAL,
+                edit_count INTEGER,
+                total_edit_norm REAL
+            )
+        """)
+        self._conn.execute(
+            "CREATE SEQUENCE IF NOT EXISTS bench_prompt_seq START 1"
+        )
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS bench_prompt_results (
+                id INTEGER DEFAULT nextval('bench_prompt_seq'),
+                run_id TEXT NOT NULL,
+                dataset TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                baseline_correct BOOLEAN,
+                repaired_correct BOOLEAN,
+                before_margin REAL,
+                after_margin REAL,
+                before_prob REAL,
+                after_prob REAL,
+                layer INTEGER,
+                component TEXT,
+                edit_norm REAL
+            )
+        """)
+
+        self._conn.execute("""
             CREATE TABLE IF NOT EXISTS fingerprint_runs (
                 id TEXT PRIMARY KEY,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1840,6 +1891,98 @@ class TraceDB:
             " FROM repair_runs ORDER BY created_at DESC"
         ).fetchall()
         cols = ["id", "created_at", "dataset", "model_name", "prompt_count"]
+        return [dict(zip(cols, r)) for r in rows]
+
+    def write_bench_run(
+        self,
+        run_id: str,
+        model_name: str,
+        datasets: str,
+        total_edits: int,
+        baseline_ppl: float,
+        combined_ppl: float,
+    ) -> None:
+        """Write a bench run to the database."""
+        self._conn.execute(
+            "INSERT INTO bench_runs VALUES"
+            " (?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)",
+            [run_id, model_name, datasets, total_edits, baseline_ppl, combined_ppl],
+        )
+
+    def write_bench_domain_result(
+        self,
+        run_id: str,
+        dataset: str,
+        baseline_correct: int,
+        baseline_total: int,
+        repaired_correct: int,
+        repaired_total: int,
+        baseline_ppl: float,
+        repaired_ppl: float,
+        edit_count: int,
+        total_edit_norm: float,
+    ) -> None:
+        """Write a bench domain result to the database."""
+        self._conn.execute(
+            "INSERT INTO bench_domain_results"
+            " (run_id, dataset, baseline_correct, baseline_total,"
+            "  repaired_correct, repaired_total,"
+            "  baseline_ppl, repaired_ppl,"
+            "  edit_count, total_edit_norm)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                run_id, dataset, baseline_correct, baseline_total,
+                repaired_correct, repaired_total,
+                baseline_ppl, repaired_ppl,
+                edit_count, total_edit_norm,
+            ],
+        )
+
+    def write_bench_prompt_result(
+        self,
+        run_id: str,
+        dataset: str,
+        prompt: str,
+        answer: str,
+        baseline_correct: bool,
+        repaired_correct: bool,
+        before_margin: float,
+        after_margin: float,
+        before_prob: float,
+        after_prob: float,
+        layer: int | None,
+        component: str | None,
+        edit_norm: float | None,
+    ) -> None:
+        """Write a bench prompt result to the database."""
+        self._conn.execute(
+            "INSERT INTO bench_prompt_results"
+            " (run_id, dataset, prompt, answer,"
+            "  baseline_correct, repaired_correct,"
+            "  before_margin, after_margin,"
+            "  before_prob, after_prob,"
+            "  layer, component, edit_norm)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                run_id, dataset, prompt, answer,
+                baseline_correct, repaired_correct,
+                before_margin, after_margin,
+                before_prob, after_prob,
+                layer, component, edit_norm,
+            ],
+        )
+
+    def list_bench_runs(self) -> list[dict]:
+        """List all bench runs."""
+        rows = self._conn.execute(
+            "SELECT id, created_at, model_name, datasets, total_edits,"
+            " baseline_ppl, combined_ppl"
+            " FROM bench_runs ORDER BY created_at DESC"
+        ).fetchall()
+        cols = [
+            "id", "created_at", "model_name", "datasets",
+            "total_edits", "baseline_ppl", "combined_ppl",
+        ]
         return [dict(zip(cols, r)) for r in rows]
 
     def close(self) -> None:
