@@ -21,10 +21,13 @@ class AblationSpec:
     zero_heads: list[tuple[int, int]]  # (layer, head)
     scale_layers: list[tuple[int, float]]  # (layer, factor)
     zero_mlp: list[int] = None  # type: ignore[assignment]
+    scale_mlp: list[tuple[int, float]] = None  # type: ignore[assignment]
 
     def __post_init__(self):
         if self.zero_mlp is None:
             self.zero_mlp = []
+        if self.scale_mlp is None:
+            self.scale_mlp = []
 
     def to_json(self) -> str:
         return json.dumps({
@@ -32,6 +35,7 @@ class AblationSpec:
             "zero_heads": [[l, h] for l, h in self.zero_heads],
             "scale_layers": [[l, f] for l, f in self.scale_layers],
             "zero_mlp": self.zero_mlp,
+            "scale_mlp": [[ly, f] for ly, f in self.scale_mlp],
         })
 
     def describe(self) -> str:
@@ -50,6 +54,11 @@ class AblationSpec:
             )
         if self.zero_mlp:
             parts.append(f"zero-mlp={','.join(map(str, self.zero_mlp))}")
+        if self.scale_mlp:
+            parts.append(
+                "scale-mlp="
+                + ",".join(f"{ly}:{f}" for ly, f in self.scale_mlp)
+            )
         return "; ".join(parts)
 
 
@@ -134,6 +143,7 @@ class AblationHookManager:
             zero_head_map.setdefault(layer_idx, set()).add(head_idx)
         scale_layer_map = dict(self._spec.scale_layers)
         zero_mlp_set = set(self._spec.zero_mlp)
+        scale_mlp_map = dict(self._spec.scale_mlp)
 
         for i, layer in enumerate(layers):
             # Full layer zeroing or scaling
@@ -157,6 +167,13 @@ class AblationHookManager:
             if i in zero_mlp_set:
                 mlp = self._arch.get_mlp(layer)
                 handle = mlp.register_forward_hook(self._make_mlp_zero_hook())
+                self._handles.append(handle)
+
+            # MLP sublayer scaling
+            if i in scale_mlp_map:
+                mlp = self._arch.get_mlp(layer)
+                factor = scale_mlp_map[i]
+                handle = mlp.register_forward_hook(self._make_mlp_scale_hook(factor))
                 self._handles.append(handle)
 
     @staticmethod
@@ -214,6 +231,16 @@ class AblationHookManager:
             if isinstance(output, tuple):
                 return (torch.zeros_like(output[0]),) + output[1:]
             return torch.zeros_like(output)
+
+        return hook
+
+    @staticmethod
+    def _make_mlp_scale_hook(factor: float):
+        """Hook that scales the MLP sublayer output."""
+        def hook(module, input, output):
+            if isinstance(output, tuple):
+                return (output[0] * factor,) + output[1:]
+            return output * factor
 
         return hook
 

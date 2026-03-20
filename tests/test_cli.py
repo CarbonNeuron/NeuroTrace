@@ -466,3 +466,98 @@ def test_compare_json_output(tinyllama_model, tmp_path):
     assert "token_legend" in data
     assert "layer_metrics" in data
     assert "trace_a_top1_str" in data["layer_metrics"][0]
+
+
+# --- Sweep command tests ---
+
+
+def test_sweep_requires_sweep_flag(tmp_path):
+    """Sweep command should error without a --sweep-* flag."""
+    db_path = str(tmp_path / "test.db")
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "sweep", "--db", db_path, "--model", "test",
+            "--prompt", "hello",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "Exactly one --sweep-* flag" in result.output
+
+
+def test_sweep_rejects_multiple_sweep_flags(tmp_path):
+    """Sweep command should error with multiple --sweep-* flags."""
+    db_path = str(tmp_path / "test.db")
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "sweep", "--db", db_path, "--model", "test",
+            "--prompt", "hello",
+            "--sweep-scale-mlp", "20:0.1:0.9:0.1",
+            "--sweep-zero-mlp", "18,19,20",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "Only one --sweep-* flag" in result.output
+
+
+@pytest.mark.model_download
+def test_sweep_scale_mlp(tinyllama_model, tmp_path):
+    """Sweep scale-mlp runs multiple ablations and produces summary."""
+    db_path = str(tmp_path / "test.db")
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "sweep", "--db", db_path, "--model", TINYLLAMA,
+            "--prompt", "The capital of France is",
+            "--sweep-scale-mlp", "10:0.3:0.7:0.2",
+            "--seed", "42",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "Sweep" in result.output
+
+
+@pytest.mark.model_download
+def test_sweep_json_output(tinyllama_model, tmp_path):
+    """Sweep command --json produces valid JSON."""
+    db_path = str(tmp_path / "test.db")
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "sweep", "--db", db_path, "--model", TINYLLAMA,
+            "--prompt", "The capital of France is",
+            "--sweep-scale-mlp", "10:0.3:0.7:0.2",
+            "--seed", "42", "--json",
+        ],
+    )
+    assert result.exit_code == 0
+    output = result.output[result.output.index("{"):]
+    data = json.loads(output)
+    assert "sweep_description" in data
+    assert "results" in data
+    assert len(data["results"]) == 3  # 0.3, 0.5, 0.7
+
+
+@pytest.mark.model_download
+def test_sweep_zero_heads(tinyllama_model, tmp_path):
+    """Sweep zero-heads runs one ablation per head."""
+    db_path = str(tmp_path / "test.db")
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "sweep", "--db", db_path, "--model", TINYLLAMA,
+            "--prompt", "Hello",
+            "--sweep-zero-heads", "10:0-2",
+            "--seed", "42", "--json",
+        ],
+    )
+    assert result.exit_code == 0
+    output = result.output[result.output.index("{"):]
+    data = json.loads(output)
+    assert len(data["results"]) == 3  # heads 0, 1, 2

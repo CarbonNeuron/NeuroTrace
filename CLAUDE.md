@@ -13,6 +13,8 @@ uv run pytest tests/test_ablate.py -v -m "not model_download"       # one file, 
 make install           # install neurotrace CLI to ~/.local/bin via uv tool
 ```
 
+**Always use `make install` to install the CLI.** Do not run `uv tool install` directly — the Makefile has the correct flags (`--force`, `--reinstall`, extras, etc.).
+
 ## Architecture
 
 NeuroTrace captures activations from transformer forward passes, stores them in DuckDB, and provides CLI commands for analysis and ablation.

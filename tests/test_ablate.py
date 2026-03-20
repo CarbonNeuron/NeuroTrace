@@ -73,6 +73,17 @@ def test_ablation_spec_to_json_with_zero_mlp():
     assert data["zero_mlp"] == [20, 21]
 
 
+def test_ablation_spec_to_json_with_scale_mlp():
+    spec = AblationSpec(
+        zero_layers=[],
+        zero_heads=[],
+        scale_layers=[],
+        scale_mlp=[(20, 0.5), (21, 0.3)],
+    )
+    data = json.loads(spec.to_json())
+    assert data["scale_mlp"] == [[20, 0.5], [21, 0.3]]
+
+
 def test_ablation_spec_describe():
     spec = AblationSpec(
         zero_layers=[20],
@@ -95,10 +106,27 @@ def test_ablation_spec_describe_zero_mlp():
     assert "zero-mlp=20" in desc
 
 
+def test_ablation_spec_describe_scale_mlp():
+    spec = AblationSpec(
+        zero_layers=[],
+        zero_heads=[],
+        scale_layers=[],
+        scale_mlp=[(20, 0.5)],
+    )
+    desc = spec.describe()
+    assert "scale-mlp=20:0.5" in desc
+
+
 def test_ablation_spec_default_zero_mlp():
     """zero_mlp defaults to empty list."""
     spec = AblationSpec(zero_layers=[], zero_heads=[], scale_layers=[])
     assert spec.zero_mlp == []
+
+
+def test_ablation_spec_default_scale_mlp():
+    """scale_mlp defaults to empty list."""
+    spec = AblationSpec(zero_layers=[], zero_heads=[], scale_layers=[])
+    assert spec.scale_mlp == []
 
 
 # --- Storage integration tests ---
@@ -222,6 +250,35 @@ def test_ablate_zero_mlp_accepted(tmp_path):
     assert "At least one intervention" not in (result.output or "")
 
 
+def test_ablate_scale_mlp_accepted(tmp_path):
+    """CLI should accept --scale-mlp as a valid intervention."""
+    db_path = str(tmp_path / "test.db")
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "ablate", "--db", db_path, "--model", "nonexistent",
+            "--prompt", "hello", "--scale-mlp", "20:0.5",
+        ],
+    )
+    assert "At least one intervention" not in (result.output or "")
+
+
+def test_ablate_conflict_zero_and_scale_mlp(tmp_path):
+    """CLI should error when same layer is in both --zero-mlp and --scale-mlp."""
+    db_path = str(tmp_path / "test.db")
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "ablate", "--db", db_path, "--model", "nonexistent",
+            "--prompt", "hello", "--zero-mlp", "20", "--scale-mlp", "20:0.5",
+        ],
+    )
+    assert result.exit_code != 0
+    assert "Layer 20 appears in both --zero-mlp and --scale-mlp" in result.output
+
+
 def test_ablate_baseline_resolve(tmp_path):
     """CLI resolves --baseline trace IDs."""
     db_path = str(tmp_path / "test.db")
@@ -264,12 +321,52 @@ def test_mlp_hooks_registered_and_cleaned(tinyllama_model):
 
 
 @pytest.mark.model_download
+def test_scale_mlp_hooks_registered_and_cleaned(tinyllama_model):
+    """Scale MLP hooks are registered and properly cleaned up."""
+    model, _ = tinyllama_model
+    from neurotrace.models import get_architecture
+
+    arch = get_architecture(model.config.model_type)
+    spec = AblationSpec(
+        zero_layers=[], zero_heads=[], scale_layers=[],
+        scale_mlp=[(0, 0.5), (5, 0.3)],
+    )
+
+    manager = AblationHookManager(model, arch, spec)
+    assert manager.num_hooks >= 2
+
+    manager.cleanup()
+    assert manager.num_hooks == 0
+
+
+@pytest.mark.model_download
 def test_zero_mlp_changes_output(tinyllama_model):
     """Zeroing a MLP sublayer produces different output than baseline."""
     model, tokenizer = tinyllama_model
     from neurotrace.ablate import run_ablation
 
     spec = AblationSpec(zero_layers=[], zero_heads=[], scale_layers=[], zero_mlp=[10])
+    result = run_ablation(
+        model, tokenizer,
+        prompt="The capital of France is",
+        spec=spec,
+        seed=42,
+    )
+    # Ablated output should differ from baseline at some layers
+    changed = [lc for lc in result.layer_comparisons if lc.changed]
+    assert len(changed) > 0
+
+
+@pytest.mark.model_download
+def test_scale_mlp_changes_output(tinyllama_model):
+    """Scaling a MLP sublayer produces different output than baseline."""
+    model, tokenizer = tinyllama_model
+    from neurotrace.ablate import run_ablation
+
+    spec = AblationSpec(
+        zero_layers=[], zero_heads=[], scale_layers=[],
+        scale_mlp=[(10, 0.1)],
+    )
     result = run_ablation(
         model, tokenizer,
         prompt="The capital of France is",

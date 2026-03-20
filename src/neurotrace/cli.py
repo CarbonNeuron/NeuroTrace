@@ -882,12 +882,19 @@ def compare(
     help="Zero MLP sublayer outputs. E.g. '20' or '20,21'.",
 )
 @click.option(
+    "--scale-mlp", default=None,
+    help="Scale MLP sublayer outputs. E.g. '20:0.5' or '20:0.3,21:0.7'.",
+)
+@click.option(
     "--baseline", default=None,
     help="Baseline trace ID, label, or prefix. If omitted, runs a clean trace.",
 )
 @click.option("--label", default=None, help="Label for the ablated trace.")
 @click.option("--seed", default=42, type=int, help="Random seed.")
-def ablate(db, model, prompt, zero_layers, zero_heads, scale_layer, zero_mlp, baseline, label, seed):
+def ablate(
+    db, model, prompt, zero_layers, zero_heads, scale_layer,
+    zero_mlp, scale_mlp, baseline, label, seed,
+):
     """Run inference with targeted components disabled and compare to baseline."""
     from neurotrace.ablate import (
         AblationSpec,
@@ -902,13 +909,28 @@ def ablate(db, model, prompt, zero_layers, zero_heads, scale_layer, zero_mlp, ba
     zh = parse_zero_heads(zero_heads) if zero_heads else []
     sl = parse_scale_layers(scale_layer) if scale_layer else []
     zm = parse_zero_layers(zero_mlp) if zero_mlp else []
+    sm = parse_scale_layers(scale_mlp) if scale_mlp else []
 
-    if not zl and not zh and not sl and not zm:
+    if not zl and not zh and not sl and not zm and not sm:
         raise click.UsageError(
-            "At least one intervention required: --zero-layers, --zero-heads, --scale-layer, or --zero-mlp."
+            "At least one intervention required: "
+            "--zero-layers, --zero-heads, --scale-layer, --zero-mlp, or --scale-mlp."
         )
 
-    spec = AblationSpec(zero_layers=zl, zero_heads=zh, scale_layers=sl, zero_mlp=zm)
+    # Conflict check: same layer in both --zero-mlp and --scale-mlp
+    zm_set = set(zm)
+    sm_set = {ly for ly, _ in sm}
+    conflict = zm_set & sm_set
+    if conflict:
+        layers_str = ", ".join(str(x) for x in sorted(conflict))
+        raise click.UsageError(
+            f"Layer {layers_str} appears in both --zero-mlp and --scale-mlp"
+        )
+
+    spec = AblationSpec(
+        zero_layers=zl, zero_heads=zh, scale_layers=sl,
+        zero_mlp=zm, scale_mlp=sm,
+    )
 
     with Progress(
         SpinnerColumn(),
@@ -985,6 +1007,7 @@ def ablate(db, model, prompt, zero_layers, zero_heads, scale_layer, zero_mlp, ba
             or any(l == lc.layer_index for l, _ in spec.zero_heads)
             or any(l == lc.layer_index for l, _ in spec.scale_layers)
             or lc.layer_index in spec.zero_mlp
+            or any(l == lc.layer_index for l, _ in spec.scale_mlp)
         )
         if is_intervened and lc.changed:
             marker += " \u2190"
@@ -1273,3 +1296,323 @@ def report(
 
     if open_browser:
         webbrowser.open(f"file://{os.path.abspath(output)}")
+
+
+def _parse_sweep_range(value: str) -> tuple[int, list[float]]:
+    """Parse 'L:start:end:step' into (layer, [values]).
+
+    Returns the layer index and a list of float values from start to end (inclusive)
+    stepping by step.
+    """
+    parts = value.split(":")
+    if len(parts) != 4:
+        raise click.BadParameter(
+            f"Expected format L:start:end:step, got {value!r}"
+        )
+    layer = int(parts[0])
+    start = float(parts[1])
+    end = float(parts[2])
+    step = float(parts[3])
+    values = []
+    v = start
+    while v <= end + step * 0.001:  # small epsilon for float rounding
+        values.append(round(v, 6))
+        v += step
+    return layer, values
+
+
+def _parse_sweep_zero_heads(value: str) -> tuple[int, list[int]]:
+    """Parse 'L:start-end' into (layer, [head_indices])."""
+    parts = value.split(":")
+    if len(parts) != 2:
+        raise click.BadParameter(
+            f"Expected format L:start-end, got {value!r}"
+        )
+    layer = int(parts[0])
+    head_range = parts[1].split("-")
+    if len(head_range) != 2:
+        raise click.BadParameter(
+            f"Expected format L:start-end, got {value!r}"
+        )
+    start = int(head_range[0])
+    end = int(head_range[1])
+    return layer, list(range(start, end + 1))
+
+
+@cli.command()
+@click.option("--db", required=True, help="Path to DuckDB database file.")
+@click.option("--model", required=True, help="HuggingFace model name or path.")
+@click.option("--prompt", required=True, help="Prompt text to trace.")
+@click.option(
+    "--baseline", default=None,
+    help="Baseline trace ID, label, or prefix. If omitted, runs a clean trace.",
+)
+@click.option("--label", default=None, help="Base label for sweep traces.")
+@click.option("--seed", default=42, type=int, help="Random seed.")
+@click.option(
+    "--sweep-scale-mlp", default=None,
+    help="Sweep MLP scale factor. Format: L:start:end:step (e.g. '20:0.1:0.9:0.1').",
+)
+@click.option(
+    "--sweep-zero-heads", "sweep_zero_heads_opt", default=None,
+    help="Sweep zero-heads one at a time. Format: L:start-end (e.g. '20:0-31').",
+)
+@click.option(
+    "--sweep-zero-mlp", default=None,
+    help="Sweep zero-mlp one layer at a time. Format: L1,L2,L3 (e.g. '18,19,20').",
+)
+@click.option(
+    "--sweep-scale-layer", default=None,
+    help="Sweep layer scale factor. Format: L:start:end:step (e.g. '20:0.1:0.9:0.1').",
+)
+@click.option(
+    "--zero-layers", default=None,
+    help="Fixed intervention: zero entire layer outputs. E.g. '20' or '20,21'.",
+)
+@click.option(
+    "--zero-heads", default=None,
+    help="Fixed intervention: zero specific attention heads. E.g. '20:7,20:12'.",
+)
+@click.option(
+    "--scale-layer", default=None,
+    help="Fixed intervention: scale layer contributions. E.g. '20:0.5,21:2.0'.",
+)
+@click.option(
+    "--zero-mlp", default=None,
+    help="Fixed intervention: zero MLP sublayer outputs. E.g. '20' or '20,21'.",
+)
+@click.option(
+    "--scale-mlp", default=None,
+    help="Fixed intervention: scale MLP sublayer outputs. E.g. '20:0.5'.",
+)
+@click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
+def sweep(
+    db, model, prompt, baseline, label, seed,
+    sweep_scale_mlp, sweep_zero_heads_opt, sweep_zero_mlp, sweep_scale_layer,
+    zero_layers, zero_heads, scale_layer, zero_mlp, scale_mlp,
+    output_json,
+):
+    """Run multiple ablations in a single model load, sweeping a parameter range."""
+    from neurotrace.ablate import (
+        AblationSpec,
+        parse_scale_layers,
+        parse_zero_heads,
+        parse_zero_layers,
+        run_ablation,
+    )
+
+    # Count sweep flags
+    sweep_flags = [sweep_scale_mlp, sweep_zero_heads_opt, sweep_zero_mlp, sweep_scale_layer]
+    active_sweeps = [f for f in sweep_flags if f is not None]
+    if len(active_sweeps) == 0:
+        raise click.UsageError("Exactly one --sweep-* flag is required.")
+    if len(active_sweeps) > 1:
+        raise click.UsageError("Only one --sweep-* flag per invocation.")
+
+    # Parse fixed interventions
+    fixed_zl = parse_zero_layers(zero_layers) if zero_layers else []
+    fixed_zh = parse_zero_heads(zero_heads) if zero_heads else []
+    fixed_sl = parse_scale_layers(scale_layer) if scale_layer else []
+    fixed_zm = parse_zero_layers(zero_mlp) if zero_mlp else []
+    fixed_sm = parse_scale_layers(scale_mlp) if scale_mlp else []
+
+    # Build sweep specs: list of (description_value, AblationSpec)
+    sweep_specs: list[tuple[str, AblationSpec]] = []
+    sweep_description = ""
+    sweep_target_layer = -1
+
+    if sweep_scale_mlp:
+        target_layer, values = _parse_sweep_range(sweep_scale_mlp)
+        sweep_target_layer = target_layer
+        sweep_description = f"scale-mlp layer {target_layer} ({values[0]} → {values[-1]}, step {values[1] - values[0] if len(values) > 1 else 0})"
+        for v in values:
+            sm = fixed_sm + [(target_layer, v)]
+            spec = AblationSpec(
+                zero_layers=fixed_zl, zero_heads=fixed_zh,
+                scale_layers=fixed_sl, zero_mlp=fixed_zm, scale_mlp=sm,
+            )
+            sweep_specs.append((str(v), spec))
+
+    elif sweep_scale_layer:
+        target_layer, values = _parse_sweep_range(sweep_scale_layer)
+        sweep_target_layer = target_layer
+        sweep_description = f"scale-layer layer {target_layer} ({values[0]} → {values[-1]}, step {values[1] - values[0] if len(values) > 1 else 0})"
+        for v in values:
+            sl = fixed_sl + [(target_layer, v)]
+            spec = AblationSpec(
+                zero_layers=fixed_zl, zero_heads=fixed_zh,
+                scale_layers=sl, zero_mlp=fixed_zm, scale_mlp=fixed_sm,
+            )
+            sweep_specs.append((str(v), spec))
+
+    elif sweep_zero_heads_opt:
+        target_layer, heads = _parse_sweep_zero_heads(sweep_zero_heads_opt)
+        sweep_target_layer = target_layer
+        sweep_description = f"zero-heads layer {target_layer} (head {heads[0]} → {heads[-1]})"
+        for h in heads:
+            zh = fixed_zh + [(target_layer, h)]
+            spec = AblationSpec(
+                zero_layers=fixed_zl, zero_heads=zh,
+                scale_layers=fixed_sl, zero_mlp=fixed_zm, scale_mlp=fixed_sm,
+            )
+            sweep_specs.append((f"h{h}", spec))
+
+    elif sweep_zero_mlp:
+        layers = parse_zero_layers(sweep_zero_mlp)
+        sweep_target_layer = layers[0] if layers else -1
+        sweep_description = f"zero-mlp layers {','.join(map(str, layers))}"
+        for l_idx in layers:
+            zm = fixed_zm + [l_idx]
+            spec = AblationSpec(
+                zero_layers=fixed_zl, zero_heads=fixed_zh,
+                scale_layers=fixed_sl, zero_mlp=zm, scale_mlp=fixed_sm,
+            )
+            sweep_specs.append((f"L{l_idx}", spec))
+
+    if not sweep_specs:
+        raise click.UsageError("Sweep produced no configurations.")
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task("Loading model...", total=None)
+        from neurotrace.models import load_model
+
+        model_obj, tokenizer = load_model(model)
+        progress.update(task, description="Model loaded.")
+
+        db_conn = TraceDB(db)
+
+        # Resolve or run baseline
+        baseline_trace = None
+        if baseline is not None:
+            try:
+                baseline_id = _resolve_trace_id(db_conn, baseline)
+                baseline_trace = db_conn.read_trace(baseline_id)
+                progress.update(
+                    task, description=f"Loaded baseline {baseline_id[:8]}.",
+                )
+            except ValueError as e:
+                db_conn.close()
+                raise click.ClickException(str(e))
+        else:
+            progress.update(task, description="Running baseline trace...")
+            from neurotrace.tracer import Tracer
+
+            tracer = Tracer(model_obj, tokenizer)
+            baseline_label = f"{label}-baseline" if label else None
+            baseline_trace = tracer.trace(prompt, label=baseline_label, seed=seed)
+            db_conn.write_trace(baseline_trace)
+            if not output_json:
+                console.print(
+                    f"[green]Baseline stored: {baseline_trace.metadata.trace_id[:8]}[/green]"
+                )
+
+        # Run sweep
+        results: list[dict] = []
+        for i, (sweep_val, spec) in enumerate(sweep_specs):
+            desc = f"Sweep {i + 1}/{len(sweep_specs)}: {sweep_val}..."
+            progress.update(task, description=desc)
+
+            trace_label = f"{label}-{sweep_val}" if label else f"sweep-{sweep_val}"
+            ablation_result = run_ablation(
+                model_obj, tokenizer, prompt, spec,
+                baseline=baseline_trace, label=trace_label, seed=seed,
+            )
+
+            # Store ablated trace
+            db_conn.write_trace(
+                ablation_result.ablated_trace,
+                interventions=spec.to_json(),
+            )
+
+            # Collect summary data
+            trace_id = ablation_result.ablated_trace.metadata.trace_id
+
+            # Get predictions at layers surrounding the intervention
+            layer_preds = {}
+            for lc in ablation_result.layer_comparisons:
+                layer_preds[lc.layer_index] = {
+                    "token": lc.ablated_top1,
+                    "prob": lc.ablated_top1_prob,
+                }
+
+            results.append({
+                "sweep_value": sweep_val,
+                "trace_id": trace_id,
+                "final_token": ablation_result.ablated_final_token,
+                "final_prob": ablation_result.ablated_final_prob,
+                "layer_preds": layer_preds,
+                "spec": spec.describe(),
+            })
+
+        progress.update(task, description="Done.")
+        db_conn.close()
+
+    # Determine display layers: target ± 1 and final
+    all_layers = set()
+    for r in results:
+        all_layers.update(r["layer_preds"].keys())
+    all_layers_sorted = sorted(all_layers)
+
+    # Pick layers to show: target-1, target, target+1, and last layer
+    display_layers = set()
+    if sweep_target_layer >= 0:
+        for offset in [-1, 0, 1]:
+            candidate = sweep_target_layer + offset
+            if candidate in all_layers:
+                display_layers.add(candidate)
+    if all_layers_sorted:
+        display_layers.add(all_layers_sorted[-1])
+    display_layers_sorted = sorted(display_layers)
+
+    if output_json:
+        json_output = {
+            "sweep_description": sweep_description,
+            "baseline_trace_id": baseline_trace.metadata.trace_id,
+            "results": [
+                {
+                    "sweep_value": r["sweep_value"],
+                    "trace_id": r["trace_id"],
+                    "final_token": r["final_token"],
+                    "final_prob": r["final_prob"],
+                    "interventions": r["spec"],
+                    "layer_predictions": {
+                        str(l): r["layer_preds"].get(l, {})
+                        for l in display_layers_sorted
+                    },
+                }
+                for r in results
+            ],
+        }
+        click.echo(json.dumps(json_output, indent=2, default=str))
+        return
+
+    # Rich table output
+    console.print(f"\n[bold]Sweep: {sweep_description}[/bold]")
+    console.print(
+        f"[dim]Baseline: {baseline_trace.metadata.trace_id[:8]}[/dim]\n"
+    )
+
+    table = Table()
+    table.add_column("Value", justify="right")
+    table.add_column("Trace ID", style="cyan", no_wrap=True)
+    for l_idx in display_layers_sorted:
+        col_name = f"Layer {l_idx}"
+        if l_idx == all_layers_sorted[-1]:
+            col_name = "Final"
+        table.add_column(col_name)
+
+    for r in results:
+        row = [r["sweep_value"], r["trace_id"][:8]]
+        for l_idx in display_layers_sorted:
+            pred = r["layer_preds"].get(l_idx)
+            if pred:
+                row.append(f"{pred['token']} ({pred['prob']:.2f})")
+            else:
+                row.append("")
+        table.add_row(*row)
+
+    console.print(table)
