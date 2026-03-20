@@ -4062,3 +4062,211 @@ def _heatmap_remote(remote_url, prompts, seed):
             progress.update(outer_task, advance=1)
 
     return cells
+
+
+@cli.command("probe-universal")
+@click.option("--db", required=True, help="Path to DuckDB database file.")
+@click.option(
+    "--heatmap-run",
+    default="latest",
+    help="Heatmap run ID, or 'latest' (default), or 'all' to combine all runs.",
+)
+@click.option(
+    "--layer-range",
+    default="14-21",
+    help="Layer range for activation extraction (e.g. '14-21').",
+)
+@click.option("--output", default=None, help="Output directory for probe files.")
+@click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
+@click.option(
+    "--model", default=None,
+    help="HuggingFace model name (auto from heatmap if omitted).",
+)
+@click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
+@click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option("--seed", default=42, type=int, help="Random seed.")
+def probe_universal(
+    db,
+    heatmap_run,
+    layer_range,
+    output,
+    output_json,
+    model,
+    device,
+    adapter,
+    seed,
+):
+    """Train a universal vulnerability probe across all domains using heatmap data."""
+    import uuid
+    from datetime import datetime
+
+    from neurotrace.probe_universal import (
+        build_labels_from_heatmap_runs,
+        extract_multilayer_activations,
+        save_universal_probe,
+        train_universal_probe,
+    )
+
+    # Parse layer range
+    try:
+        parts = layer_range.split("-")
+        layer_start, layer_end = int(parts[0]), int(parts[1])
+    except (ValueError, IndexError):
+        raise click.UsageError(
+            f"Invalid --layer-range: {layer_range!r}. "
+            "Use 'START-END'."
+        )
+
+    db_conn = TraceDB(db)
+
+    # Resolve heatmap runs
+    if heatmap_run == "all":
+        runs = db_conn.get_all_heatmap_runs()
+        if not runs:
+            raise click.ClickException("No heatmap runs found in database.")
+    elif heatmap_run == "latest":
+        run_id = db_conn.get_latest_heatmap_run_id()
+        runs = [db_conn.read_heatmap_run(run_id)]
+    else:
+        runs = [db_conn.read_heatmap_run(heatmap_run)]
+
+    run_ids = [r["run_id"] for r in runs]
+    model_name = model or runs[0]["model_name"]
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task("Building labels from heatmap data...", total=None)
+
+        # Build labels
+        from neurotrace.probe_universal import label_from_heatmap
+
+        prompts, labels, domains = build_labels_from_heatmap_runs(runs)
+        n_excluded = sum(
+            1 for r in runs
+            for info in label_from_heatmap(r["cells"]).values()
+            if not info["baseline_correct"]
+        )
+
+        n_vuln = int(labels.sum())
+        n_robust = int((~labels).sum())
+        err_console.print(
+            f"  Samples: {len(prompts)} "
+            f"({n_vuln} vulnerable, {n_robust} robust, "
+            f"{n_excluded} excluded)"
+        )
+
+        if n_vuln < 2 or n_robust < 2:
+            raise click.ClickException(
+                f"Need at least 2 vulnerable and 2 robust samples. "
+                f"Got {n_vuln} vulnerable, {n_robust} robust."
+            )
+
+        # Load model
+        progress.update(task, description="Loading model...")
+        from neurotrace.models import load_model
+
+        device = _resolve_device(device)
+        model_obj, tokenizer = load_model(model_name, device=device)
+        model_obj = _maybe_load_adapter(model_obj, adapter)
+
+        # Extract activations
+        progress.update(
+            task,
+            description=(
+                f"Extracting activations "
+                f"(layers {layer_start}-{layer_end}, "
+                f"{len(prompts)} prompts)..."
+            ),
+        )
+        activations = extract_multilayer_activations(
+            model_obj, tokenizer, prompts, layer_start, layer_end, seed=seed
+        )
+
+        # Train probe
+        progress.update(task, description="Training universal probe (LOO CV)...")
+        result = train_universal_probe(activations, labels, domains)
+
+        # Fill in metadata
+        result.heatmap_run_ids = run_ids
+        result.model_name = model_name
+        result.layer_range = (layer_start, layer_end)
+        result.n_excluded = n_excluded
+        result.prompts = prompts
+
+        # Save outputs
+        if output is None:
+            timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            output = f"probes/universal-{timestamp}"
+
+        progress.update(task, description="Saving outputs...")
+        save_universal_probe(result, output)
+
+        # Save to DB
+        probe_id = str(uuid.uuid4())
+        db_conn.save_universal_probe(probe_id, result, output)
+        db_conn.close()
+
+        progress.update(task, description="Done.")
+
+    if output_json:
+        json_output = {
+            "probe_id": probe_id,
+            "heatmap_run_ids": run_ids,
+            "model": model_name,
+            "layer_range": [layer_start, layer_end],
+            "n_samples": result.n_samples,
+            "n_vulnerable": result.n_vulnerable,
+            "n_robust": result.n_robust,
+            "n_excluded": result.n_excluded,
+            "auc_roc": result.auc_roc,
+            "cohens_d": result.cohens_d,
+            "accuracy": result.accuracy,
+            "per_domain_auc": result.per_domain_auc,
+            "confusion_matrix": result.confusion_matrix,
+            "top_features": result.top_features[:10],
+            "output_dir": output,
+        }
+        click.echo(json.dumps(json_output, indent=2, default=str))
+        return
+
+    # Rich output
+    console.print("\n[bold]Universal Vulnerability Probe[/bold]")
+    console.print(
+        f"Layers {layer_start}-{layer_end} | "
+        f"{result.n_vulnerable} vulnerable, {result.n_robust} robust, "
+        f"{result.n_excluded} excluded"
+    )
+    console.print(f"Heatmap runs: {len(run_ids)} | Domains: {len(set(domains))}\n")
+
+    console.print("[bold]Overall Metrics:[/bold]")
+    console.print(f"  AUC-ROC:   {result.auc_roc:.4f}")
+    console.print(f"  Cohen's d: {result.cohens_d:.4f}")
+    console.print(f"  Accuracy:  {result.accuracy:.1%}")
+
+    cm = result.confusion_matrix
+    console.print("\n[bold]Confusion Matrix:[/bold]")
+    console.print(f"  TP={cm['tp']}  FP={cm['fp']}")
+    console.print(f"  FN={cm['fn']}  TN={cm['tn']}")
+
+    if result.per_domain_auc:
+        console.print("\n[bold]Per-Domain AUC:[/bold]")
+        table = Table()
+        table.add_column("Domain")
+        table.add_column("AUC-ROC", justify="right")
+        for domain, auc in sorted(result.per_domain_auc.items()):
+            style = "green" if auc >= 0.8 else ("yellow" if auc >= 0.6 else "red")
+            table.add_row(domain, f"{auc:.4f}", style=style)
+        console.print(table)
+
+    console.print("\n[bold]Top Features:[/bold]")
+    feat_table = Table()
+    feat_table.add_column("Feature Index", justify="right")
+    feat_table.add_column("Importance", justify="right")
+    for feat in result.top_features[:10]:
+        feat_table.add_row(str(feat["feature_index"]), f"{feat['importance']:.4f}")
+    console.print(feat_table)
+
+    console.print(f"\n[green]Probe saved to {output}/[/green]")

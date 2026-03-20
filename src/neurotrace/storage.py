@@ -216,6 +216,23 @@ class TraceDB:
             )
         """)
 
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS universal_probes (
+                id TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                heatmap_run_ids JSON NOT NULL,
+                layer_range TEXT NOT NULL,
+                n_samples INTEGER NOT NULL,
+                n_vulnerable INTEGER NOT NULL,
+                n_robust INTEGER NOT NULL,
+                auc_roc REAL,
+                cohens_d REAL,
+                accuracy REAL,
+                per_domain_auc JSON,
+                model_path TEXT
+            )
+        """)
+
     def write_trace(
         self, result: TraceResult, interventions: str | None = None
     ) -> None:
@@ -826,6 +843,63 @@ class TraceDB:
             "num_layers", "num_prompts", "created_at", "cells", "summaries",
         ]
         return dict(zip(cols, row))
+
+    def list_heatmap_runs(self) -> list[dict]:
+        """List all heatmap runs."""
+        rows = self._conn.execute(
+            "SELECT run_id, dataset_name, model_name, adapter_path,"
+            " num_layers, num_prompts, created_at"
+            " FROM heatmap_runs ORDER BY created_at DESC"
+        ).fetchall()
+        cols = [
+            "run_id", "dataset_name", "model_name", "adapter_path",
+            "num_layers", "num_prompts", "created_at",
+        ]
+        return [dict(zip(cols, r)) for r in rows]
+
+    def get_latest_heatmap_run_id(self) -> str:
+        """Return the run_id of the most recent heatmap run."""
+        row = self._conn.execute(
+            "SELECT run_id FROM heatmap_runs ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            raise ValueError("No heatmap runs in database")
+        return row[0]
+
+    def get_all_heatmap_runs(self) -> list[dict]:
+        """Return all heatmap runs with full data (including cells JSON)."""
+        rows = self._conn.execute(
+            "SELECT * FROM heatmap_runs ORDER BY created_at DESC"
+        ).fetchall()
+        cols = [
+            "run_id", "dataset_name", "model_name", "adapter_path",
+            "num_layers", "num_prompts", "created_at", "cells", "summaries",
+        ]
+        return [dict(zip(cols, r)) for r in rows]
+
+    def save_universal_probe(
+        self, probe_id: str, result, output_path: str | None = None,
+    ) -> None:
+        """Save a universal probe result to the database."""
+        import json as json_mod
+
+        self._conn.execute(
+            "INSERT INTO universal_probes VALUES"
+            " (?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                probe_id,
+                json_mod.dumps(result.heatmap_run_ids),
+                f"{result.layer_range[0]}-{result.layer_range[1]}",
+                result.n_samples,
+                result.n_vulnerable,
+                result.n_robust,
+                result.auc_roc,
+                result.cohens_d,
+                result.accuracy,
+                json_mod.dumps(result.per_domain_auc),
+                output_path,
+            ],
+        )
 
     def close(self) -> None:
         self._conn.close()
