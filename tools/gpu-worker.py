@@ -270,6 +270,12 @@ class ForwardMlpDeltasRequest(BaseModel):
     seed: int = 42
 
 
+class ForwardMlpDeltasAllPositionsRequest(BaseModel):
+    prompt: str
+    layers: list[int] | None = None
+    seed: int = 42
+
+
 class AttributeGradientsRequest(BaseModel):
     prompts: list[str]
     layer: int
@@ -703,6 +709,89 @@ def forward_mlp_deltas(req: ForwardMlpDeltasRequest) -> StreamingResponse:
             await asyncio.sleep(0)
 
         yield _sse_line({"type": "done", "total": total})
+
+    return StreamingResponse(
+        _generate(), media_type="text/event-stream"
+    )
+
+
+@app.post("/forward-mlp-deltas-all-positions")
+def forward_mlp_deltas_all_positions(
+    req: ForwardMlpDeltasAllPositionsRequest,
+) -> StreamingResponse:
+    """Return MLP deltas at all token positions for all layers via SSE."""
+    assert _model is not None and _tokenizer is not None and _device is not None
+
+    import base64
+
+    import numpy as np
+
+    async def _generate():
+        model_layers = _get_transformer_layers()
+        target_layers = (
+            req.layers
+            if req.layers is not None
+            else list(range(len(model_layers)))
+        )
+
+        torch.manual_seed(req.seed)
+        inputs = _tokenizer(req.prompt, return_tensors="pt").to(_device)
+        num_positions = inputs["input_ids"].shape[1]
+
+        captured_in: dict[int, torch.Tensor] = {}
+        captured_out: dict[int, torch.Tensor] = {}
+        hooks: list[torch.utils.hooks.RemovableHandle] = []
+
+        for layer_idx in target_layers:
+            def _make_hook(li: int):
+                def hook_fn(
+                    module: torch.nn.Module,
+                    input: Any,
+                    output: Any,
+                ) -> None:
+                    inp = input[0] if isinstance(input, tuple) else input
+                    out = output if not isinstance(output, tuple) else output[0]
+                    # Capture all positions: [batch, seq_len, hidden_dim]
+                    captured_in[li] = inp[0].detach().cpu().float()
+                    captured_out[li] = out[0].detach().cpu().float()
+                return hook_fn
+
+            if layer_idx < len(model_layers):
+                mlp = model_layers[layer_idx].mlp
+                h = mlp.register_forward_hook(_make_hook(layer_idx))
+                hooks.append(h)
+
+        try:
+            with torch.no_grad():
+                _model(**inputs)
+        finally:
+            for h in hooks:
+                h.remove()
+
+        # Stream layer by layer
+        for li in target_layers:
+            if li not in captured_in:
+                continue
+            # Compute deltas: [num_positions, hidden_dim]
+            deltas = (captured_out[li] - captured_in[li]).numpy().astype(np.float16)
+            encoded = base64.b64encode(deltas.tobytes()).decode("ascii")
+
+            yield _sse_line({
+                "type": "layer-deltas",
+                "layer": li,
+                "num_positions": int(deltas.shape[0]),
+                "shape": list(deltas.shape),
+                "dtype": "float16",
+                "deltas": encoded,
+            })
+
+            await asyncio.sleep(0)
+
+        yield _sse_line({
+            "type": "done",
+            "layers_completed": len(target_layers),
+            "positions": int(num_positions),
+        })
 
     return StreamingResponse(
         _generate(), media_type="text/event-stream"

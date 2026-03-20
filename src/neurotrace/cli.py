@@ -5580,3 +5580,418 @@ def _attribute_remote(
         progress.update(task, description="Done.")
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# token-trace command
+# ---------------------------------------------------------------------------
+
+
+@cli.command("token-trace")
+@click.option("--model", default=None, help="HuggingFace model name (local mode).")
+@click.option("--db", required=True, help="Path to DuckDB database file.")
+@click.option("--prompt", "prompt_text", default=None, help="Single prompt to trace.")
+@click.option("--answer", default=None, help="Expected answer token.")
+@click.option("--subject", default=None, help="Subject entity in prompt.")
+@click.option(
+    "--dataset-builtin", default=None,
+    help="Built-in dataset name (e.g. 'capitals').",
+)
+@click.option(
+    "--dataset", "dataset_path", default=None,
+    type=click.Path(exists=True),
+    help="Path to JSONL/JSON dataset file.",
+)
+@click.option(
+    "--layers", "layer_spec", default=None,
+    help="Comma-separated layer indices (default: all).",
+)
+@click.option(
+    "--remote", default=None,
+    help="GPU worker URL (e.g., http://172.30.0.1:8877).",
+)
+@click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
+@click.option("--html", "html_path", default=None, help="HTML report output path.")
+@click.option("--json", "output_json", is_flag=True, help="JSON output.")
+@click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option("--seed", default=42, type=int, help="Random seed.")
+def token_trace(
+    model,
+    db,
+    prompt_text,
+    answer,
+    subject,
+    dataset_builtin,
+    dataset_path,
+    layer_spec,
+    remote,
+    device,
+    html_path,
+    output_json,
+    adapter,
+    seed,
+):
+    """Full position x layer MLP delta analysis (token-trace)."""
+    import uuid
+    from datetime import datetime, timezone
+
+    from neurotrace.token_trace import (
+        TokenTraceRun,
+        aggregate_by_position_type,
+        generate_token_trace_html_batch,
+        generate_token_trace_html_single,
+        token_trace_run_to_dict,
+    )
+
+    if remote is None and model is None:
+        raise click.UsageError("Must provide --model (local mode) or --remote.")
+
+    if prompt_text is None and dataset_builtin is None and dataset_path is None:
+        raise click.UsageError(
+            "Must provide --prompt, --dataset-builtin, or --dataset."
+        )
+
+    # Build prompt list
+    prompts: list[dict] = []
+    dataset_name = None
+
+    if prompt_text is not None:
+        if answer is None:
+            raise click.UsageError("--answer is required with --prompt.")
+        prompts = [{"prompt": prompt_text, "answer": answer, "subject": subject}]
+    elif dataset_builtin is not None:
+        from neurotrace.datasets import get_builtin_dataset
+
+        prompts = get_builtin_dataset(dataset_builtin)
+        dataset_name = dataset_builtin
+    elif dataset_path is not None:
+        from neurotrace.datasets import load_dataset
+
+        prompts = load_dataset(dataset_path)
+        dataset_name = dataset_path
+
+    # Load commitment data for competitor projections
+    db_conn = TraceDB(db)
+    commitment_data: dict[str, dict] = {}
+    try:
+        for run_info in db_conn.list_commitment_runs():
+            results = db_conn.read_commitment_results(run_info["run_id"])
+            for r in results:
+                commitment_data[r["prompt"]] = {
+                    "competitor_token": r["competitor_token"] or "",
+                }
+    except Exception:
+        pass
+
+    run_id = str(uuid.uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    if remote is not None:
+        model_name, all_results, layers = _token_trace_remote(
+            remote, prompts, layer_spec, commitment_data, seed, model,
+        )
+    else:
+        model_name, all_results, layers = _token_trace_local(
+            model, prompts, layer_spec, commitment_data, seed,
+            device, adapter,
+        )
+
+    # Build run
+    run = TokenTraceRun(
+        run_id=run_id,
+        dataset=dataset_name,
+        model_name=model_name,
+        layers=layers,
+        prompt_count=len(all_results),
+        results=all_results,
+        created_at=created_at,
+    )
+
+    # Save to DB
+    db_conn.write_token_trace_run(
+        run_id=run_id,
+        dataset=dataset_name,
+        model_name=model_name,
+        layers=json.dumps(layers),
+        prompt_count=len(all_results),
+    )
+    for result in all_results:
+        for entry in result.entries:
+            db_conn.write_token_trace_result(
+                run_id=run_id,
+                prompt=result.prompt,
+                layer=entry.layer,
+                token_position=entry.position,
+                token_text=entry.token,
+                is_subject=entry.is_subject,
+                is_last=entry.is_last,
+                answer_projection=entry.answer_projection,
+                competitor_projection=entry.competitor_projection,
+                delta_magnitude=entry.delta_magnitude,
+            )
+    db_conn.close()
+
+    # HTML output
+    if html_path:
+        import os
+
+        os.makedirs(os.path.dirname(html_path) or ".", exist_ok=True)
+        if len(all_results) == 1:
+            html = generate_token_trace_html_single(all_results[0], run)
+        else:
+            from neurotrace.datasets import RELATION_KEYWORDS
+
+            relation_kw = RELATION_KEYWORDS.get(dataset_name or "", set())
+            html = generate_token_trace_html_batch(run, relation_kw or None)
+        with open(html_path, "w") as f:
+            f.write(html)
+        console.print(f"[green]Report saved to {html_path}[/green]")
+
+    # JSON output
+    result_dict = token_trace_run_to_dict(run)
+    if output_json:
+        click.echo(json.dumps(result_dict, indent=2))
+        return
+
+    # Terminal output
+    if len(all_results) == 1:
+        r = all_results[0]
+        console.print(
+            f'\n[bold]Token-Trace:[/bold] "{r.prompt}" → {r.answer}\n'
+        )
+
+        # Table: tokens x layers
+        table = Table(title="Answer projection per position × layer")
+        table.add_column("", style="dim")
+        tokens_list: list[str] = []
+        seen: set[int] = set()
+        for e in r.entries:
+            if e.position not in seen:
+                tokens_list.append(e.token.strip()[:10] or "▁")
+                seen.add(e.position)
+        for tok in tokens_list:
+            table.add_column(tok, justify="right")
+
+        for layer in layers:
+            row = [f"L{layer}"]
+            for pos in range(len(tokens_list)):
+                match = [
+                    e for e in r.entries
+                    if e.layer == layer and e.position == pos
+                ]
+                if match:
+                    val = match[0].answer_projection
+                    row.append(f"{val:+.2f}")
+                else:
+                    row.append("—")
+            table.add_row(*row)
+
+        console.print(table)
+
+        peak = max(r.entries, key=lambda e: e.answer_projection)
+        trough = min(r.entries, key=lambda e: e.answer_projection)
+        console.print(
+            f'\nPeak: "{peak.token.strip()}" @ L{peak.layer} '
+            f'({peak.answer_projection:+.4f})'
+        )
+        console.print(
+            f'Min:  "{trough.token.strip()}" @ L{trough.layer} '
+            f'({trough.answer_projection:+.4f})'
+        )
+    elif len(all_results) > 1:
+        console.print(
+            f"\n[bold]Token-Trace Summary:[/bold] "
+            f"{dataset_name or 'custom'} ({len(all_results)} prompts) × "
+            f"{len(layers)} layers\n"
+        )
+
+        from neurotrace.datasets import RELATION_KEYWORDS
+
+        relation_kw = RELATION_KEYWORDS.get(dataset_name or "", set())
+        agg = aggregate_by_position_type(all_results, layers, relation_kw or None)
+
+        import numpy as np
+
+        table = Table(title="Position-type analysis (aggregated)")
+        table.add_column("Position")
+        table.add_column("Avg Proj", justify="right")
+        table.add_column("Peak Layer", justify="right")
+        table.add_column("Role")
+
+        for pos_type in ["subject", "relation", "other", "last"]:
+            if pos_type not in agg:
+                continue
+            layer_data = agg[pos_type]
+            means = [
+                layer_data[li]["mean"]
+                for li in layers if li in layer_data
+            ]
+            if not means:
+                continue
+            avg = float(np.mean(means))
+            peak_l = max(
+                (li for li in layers if li in layer_data),
+                key=lambda li: layer_data[li]["mean"],
+            )
+            role = "Negligible"
+            if avg > 0.01:
+                role = "Positive (factual signal)"
+            elif avg < -0.01:
+                role = "Suppression"
+
+            table.add_row(
+                pos_type,
+                f"{avg:+.4f}",
+                f"L{peak_l}",
+                role,
+            )
+
+        console.print(table)
+    else:
+        console.print("[yellow]No token-trace results computed.[/yellow]")
+
+
+def _token_trace_local(
+    model_name, prompts, layer_spec, commitment_data, seed,
+    device_str, adapter,
+):
+    """Run token-trace locally."""
+    from neurotrace.models import get_architecture, get_lm_head_and_norm, load_model
+    from neurotrace.token_trace import run_token_trace_local
+
+    device_str = _resolve_device(device_str)
+    all_results = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task("Loading model...", total=None)
+        model_obj, tokenizer = load_model(model_name, device=device_str)
+        model_obj = _maybe_load_adapter(model_obj, adapter)
+        arch = get_architecture(model_obj.config.model_type)
+
+        lm_head, _ = get_lm_head_and_norm(model_obj)
+        lm_head_weight = lm_head.weight.data.cpu().float().numpy()
+
+        num_layers = len(arch.get_layers(model_obj))
+        if layer_spec:
+            layers = [int(x.strip()) for x in layer_spec.split(",")]
+        else:
+            layers = list(range(num_layers))
+
+        progress.update(
+            task,
+            description=f"Token-trace: {len(prompts)} prompts × {len(layers)} layers",
+            total=len(prompts),
+        )
+
+        for i, entry in enumerate(prompts):
+            progress.update(
+                task, completed=i,
+                description=f"Processing {i + 1}/{len(prompts)}...",
+            )
+            result = run_token_trace_local(
+                model_obj, tokenizer, arch,
+                prompt=entry["prompt"],
+                answer=entry["answer"],
+                subject=entry.get("subject"),
+                layers=layers,
+                lm_head_weight=lm_head_weight,
+                commitment_data=commitment_data,
+                seed=seed,
+            )
+            all_results.append(result)
+
+        progress.update(task, description="Done.", completed=len(prompts))
+
+    return model_name, all_results, layers
+
+
+def _token_trace_remote(
+    remote_url, prompts, layer_spec, commitment_data, seed, model_name_hint,
+):
+    """Run token-trace via remote GPU worker."""
+    import base64
+
+    import numpy as np
+
+    from neurotrace.models import get_lm_head_and_norm, load_model
+    from neurotrace.remote import RemoteWorker
+    from neurotrace.token_trace import run_token_trace_remote
+
+    worker = RemoteWorker(remote_url)
+    health = worker.health()
+    device_name = health.get("device_name", health.get("device", "unknown"))
+    model_name = health["model"]
+    num_layers = health["num_layers"]
+
+    err_console.print(f"GPU: {device_name} via {remote_url}")
+
+    if layer_spec:
+        layers = [int(x.strip()) for x in layer_spec.split(",")]
+    else:
+        layers = list(range(num_layers))
+
+    all_results = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task("Loading tokenizer & lm_head...", total=None)
+        model_obj, tokenizer = load_model(model_name, device="cpu")
+        lm_head, _ = get_lm_head_and_norm(model_obj)
+        lm_head_weight = lm_head.weight.data.cpu().float().numpy()
+
+        progress.update(
+            task,
+            description=f"Token-trace: {len(prompts)} prompts × {len(layers)} layers",
+            total=len(prompts),
+        )
+
+        for i, entry in enumerate(prompts):
+            progress.update(
+                task, completed=i,
+                description=f"Token-trace {i + 1}/{len(prompts)}...",
+            )
+
+            prompt_text = entry["prompt"]
+
+            # Fetch all-position MLP deltas from remote
+            all_position_deltas: dict[int, np.ndarray] = {}
+            for event in worker.forward_mlp_deltas_all_positions_stream(
+                prompt_text, layers, seed=seed,
+            ):
+                etype = event.get("type")
+                if etype == "layer-deltas":
+                    layer_idx = event["layer"]
+                    shape = event["shape"]
+                    dtype = (
+                        np.float16
+                        if event.get("dtype") == "float16"
+                        else np.float32
+                    )
+                    arr = np.frombuffer(
+                        base64.b64decode(event["deltas"]),
+                        dtype=dtype,
+                    ).astype(np.float32).reshape(shape).copy()
+                    all_position_deltas[layer_idx] = arr
+
+            result = run_token_trace_remote(
+                all_position_deltas=all_position_deltas,
+                tokenizer=tokenizer,
+                prompt=prompt_text,
+                answer=entry["answer"],
+                subject=entry.get("subject"),
+                layers=layers,
+                lm_head_weight=lm_head_weight,
+                commitment_data=commitment_data,
+            )
+            all_results.append(result)
+
+        progress.update(task, description="Done.", completed=len(prompts))
+
+    return model_name, all_results, layers

@@ -332,6 +332,35 @@ class TraceDB:
             )
         """)
 
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS token_trace_runs (
+                run_id TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                dataset TEXT,
+                model_name TEXT NOT NULL,
+                layers JSON NOT NULL,
+                prompt_count INTEGER NOT NULL
+            )
+        """)
+        self._conn.execute(
+            "CREATE SEQUENCE IF NOT EXISTS token_trace_seq START 1"
+        )
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS token_trace_results (
+                id INTEGER DEFAULT nextval('token_trace_seq'),
+                run_id TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                layer INTEGER NOT NULL,
+                token_position INTEGER NOT NULL,
+                token_text TEXT NOT NULL,
+                is_subject BOOLEAN NOT NULL,
+                is_last BOOLEAN NOT NULL,
+                answer_projection REAL NOT NULL,
+                competitor_projection REAL,
+                delta_magnitude REAL NOT NULL
+            )
+        """)
+
     def write_trace(
         self, result: TraceResult, interventions: str | None = None
     ) -> None:
@@ -1275,6 +1304,61 @@ class TraceDB:
         cols = [
             "run_id", "created_at", "layer", "target_direction",
             "method", "model_name", "dataset",
+        ]
+        return [dict(zip(cols, r)) for r in rows]
+
+    def write_token_trace_run(
+        self,
+        run_id: str,
+        dataset: str | None,
+        model_name: str,
+        layers: str,
+        prompt_count: int,
+    ) -> None:
+        """Write a token-trace run to the database."""
+        self._conn.execute(
+            "INSERT INTO token_trace_runs VALUES"
+            " (?, CURRENT_TIMESTAMP, ?, ?, ?, ?)",
+            [run_id, dataset, model_name, layers, prompt_count],
+        )
+
+    def write_token_trace_result(
+        self,
+        run_id: str,
+        prompt: str,
+        layer: int,
+        token_position: int,
+        token_text: str,
+        is_subject: bool,
+        is_last: bool,
+        answer_projection: float,
+        competitor_projection: float | None,
+        delta_magnitude: float,
+    ) -> None:
+        """Write a single token-trace result to the database."""
+        self._conn.execute(
+            "INSERT INTO token_trace_results"
+            " (run_id, prompt, layer, token_position, token_text,"
+            "  is_subject, is_last, answer_projection,"
+            "  competitor_projection, delta_magnitude)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                run_id, prompt, layer, token_position, token_text,
+                is_subject, is_last, answer_projection,
+                competitor_projection, delta_magnitude,
+            ],
+        )
+
+    def list_token_trace_runs(self) -> list[dict]:
+        """List all token-trace runs."""
+        rows = self._conn.execute(
+            "SELECT run_id, created_at, dataset, model_name,"
+            " layers, prompt_count"
+            " FROM token_trace_runs ORDER BY created_at DESC"
+        ).fetchall()
+        cols = [
+            "run_id", "created_at", "dataset", "model_name",
+            "layers", "prompt_count",
         ]
         return [dict(zip(cols, r)) for r in rows]
 
