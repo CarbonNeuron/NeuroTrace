@@ -1827,3 +1827,292 @@ def scan(
                         f"Severity: {severity:.2f} (prob drop from peak)"
                     )
                 console.print()
+
+
+@cli.command()
+@click.option("--db", required=True, help="Path to DuckDB database file.")
+@click.option("--model", required=True, help="HuggingFace model name or path.")
+@click.option("--prompt", required=True, help="Target prompt.")
+@click.option("--layer", required=True, type=int, help="MLP layer to analyze.")
+@click.option(
+    "--contrast", default=None,
+    help="Contrast prompt (model gets this right).",
+)
+@click.option("--top-n", default=20, type=int, help="Top N neurons.")
+@click.option(
+    "--save-profile", default=None, help="Label to save profile.",
+)
+@click.option(
+    "--ablate", "ablate_mode", is_flag=True,
+    help="Enable ablation mode.",
+)
+@click.option(
+    "--neurons", "neuron_str", default=None,
+    help="Neuron indices: '0,1,2' or '100-200'.",
+)
+@click.option(
+    "--from-profile", default=None,
+    help="Use top-N neurons from a saved profile.",
+)
+@click.option(
+    "--group-size", default=1, type=int,
+    help="Ablate in groups of N (default: 1).",
+)
+@click.option("--baseline", default=None, help="Baseline trace ID for comparison.")
+@click.option("--label", default=None, help="Label prefix for ablation traces.")
+@click.option("--seed", default=42, type=int, help="Random seed.")
+@click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
+def neurons(
+    db, model, prompt, layer, contrast, top_n, save_profile,
+    ablate_mode, neuron_str, from_profile, group_size,
+    baseline, label, seed, output_json,
+):
+    """Neuron-level MLP attribution: profile or ablate individual neurons."""
+    if ablate_mode:
+        _neurons_ablate(
+            db, model, prompt, layer, top_n, neuron_str, from_profile,
+            group_size, baseline, label, seed, output_json,
+        )
+    else:
+        _neurons_profile(
+            db, model, prompt, layer, contrast, top_n,
+            save_profile, seed, output_json,
+        )
+
+
+def _neurons_profile(
+    db, model, prompt, layer, contrast, top_n,
+    save_profile, seed, output_json,
+):
+    """Profile mode: capture and rank MLP intermediate neuron activations."""
+    from neurotrace.neurons import profile_neurons
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task("Loading model...", total=None)
+        from neurotrace.models import load_model
+
+        model_obj, tokenizer = load_model(model)
+        progress.update(task, description="Profiling neurons...")
+
+        profile = profile_neurons(
+            model_obj, tokenizer, prompt, layer,
+            top_n=top_n, contrast_prompt=contrast,
+            seed=seed, label=save_profile,
+        )
+
+        if save_profile:
+            progress.update(task, description="Saving profile...")
+            db_conn = TraceDB(db)
+            db_conn.save_neuron_profile(profile)
+            db_conn.close()
+
+        progress.update(task, description="Done.")
+
+    if output_json:
+        output = {
+            "profile_id": profile.profile_id,
+            "layer": profile.layer,
+            "prompt": profile.prompt,
+            "contrast_prompt": profile.contrast_prompt,
+            "model": profile.model_name,
+            "neurons": [
+                {
+                    "index": idx,
+                    "target_activation": t_act,
+                    "contrast_activation": c_act,
+                    "diff_activation": d_act,
+                    "abs_diff": abs(d_act) if d_act is not None else abs(t_act),
+                }
+                for idx, t_act, c_act, d_act in zip(
+                    profile.neuron_indices,
+                    profile.target_activations,
+                    profile.contrast_activations
+                    or [None] * len(profile.neuron_indices),
+                    profile.diff_activations
+                    or [None] * len(profile.neuron_indices),
+                )
+            ],
+        }
+        click.echo(json.dumps(output, indent=2, default=str))
+        return
+
+    # Rich table output
+    console.print(
+        f"\n[bold]Neuron Profile:[/bold] Layer {profile.layer} MLP"
+    )
+    console.print(f"[bold]Prompt:[/bold] {profile.prompt}")
+    if profile.contrast_prompt:
+        console.print(f"[bold]Contrast:[/bold] {profile.contrast_prompt}")
+    console.print()
+
+    table = Table(title=f"Top {top_n} Neurons (Layer {layer} MLP)")
+    table.add_column("Neuron", justify="right", style="cyan")
+    table.add_column("Target Act", justify="right")
+    if profile.contrast_activations:
+        table.add_column("Contrast Act", justify="right")
+    if profile.diff_activations:
+        table.add_column("Diff", justify="right")
+        table.add_column("Abs Diff", justify="right")
+
+    for i, idx in enumerate(profile.neuron_indices):
+        row = [str(idx), f"{profile.target_activations[i]:.4f}"]
+        if profile.contrast_activations:
+            row.append(f"{profile.contrast_activations[i]:.4f}")
+        if profile.diff_activations:
+            d = profile.diff_activations[i]
+            row.append(f"{d:+.4f}")
+            row.append(f"{abs(d):.4f}")
+        table.add_row(*row)
+
+    console.print(table)
+
+    if save_profile:
+        console.print(
+            f"\n[green]Profile saved as {save_profile!r}"
+            f" (id: {profile.profile_id[:8]})[/green]"
+        )
+
+
+def _neurons_ablate(
+    db, model, prompt, layer, top_n, neuron_str, from_profile,
+    group_size, baseline, label, seed, output_json,
+):
+    """Ablate mode: zero specific neurons and measure prediction impact."""
+    from neurotrace.neurons import ablate_neurons, parse_neurons
+
+    # Determine which neurons to ablate
+    if neuron_str is None and from_profile is None:
+        raise click.UsageError(
+            "Ablation mode requires --neurons or --from-profile."
+        )
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task("Loading model...", total=None)
+        from neurotrace.models import load_model
+
+        model_obj, tokenizer = load_model(model)
+        progress.update(task, description="Model loaded.")
+
+        db_conn = TraceDB(db)
+
+        # Resolve neuron indices
+        if from_profile:
+            progress.update(task, description="Loading profile...")
+            profile = db_conn.load_neuron_profile(from_profile)
+            if profile is None:
+                db_conn.close()
+                raise click.ClickException(
+                    f"Profile not found: {from_profile}"
+                )
+            neuron_indices = profile.neuron_indices[:top_n]
+        else:
+            neuron_indices = parse_neurons(neuron_str)
+
+        # Build groups
+        if group_size <= 0:
+            group_size = 1
+        neuron_groups = []
+        for i in range(0, len(neuron_indices), group_size):
+            neuron_groups.append(neuron_indices[i:i + group_size])
+
+        # Resolve baseline
+        baseline_trace = None
+        if baseline is not None:
+            try:
+                baseline_id = _resolve_trace_id(db_conn, baseline)
+                baseline_trace = db_conn.read_trace(baseline_id)
+                progress.update(
+                    task, description=f"Loaded baseline {baseline_id[:8]}."
+                )
+            except ValueError as e:
+                db_conn.close()
+                raise click.ClickException(str(e))
+
+        # Run ablations
+        progress.update(
+            task,
+            description=f"Ablating {len(neuron_groups)} group(s)...",
+        )
+        baseline_created, results = ablate_neurons(
+            model_obj, tokenizer, prompt, layer,
+            neuron_groups=neuron_groups,
+            baseline=baseline_trace,
+            label_prefix=label,
+            seed=seed,
+        )
+
+        # Store traces
+        progress.update(task, description="Storing traces...")
+        if baseline_created is not None:
+            db_conn.write_trace(baseline_created)
+
+        for r in results:
+            interventions = json.dumps({
+                "zero_neurons": {"layer": layer, "neurons": r.neurons}
+            })
+            db_conn.write_trace(r.trace, interventions=interventions)
+
+        db_conn.close()
+        progress.update(task, description="Done.")
+
+    if output_json:
+        output = {
+            "layer": layer,
+            "prompt": prompt,
+            "results": [
+                {
+                    "neurons": r.neurons,
+                    "baseline_top1": r.baseline_top1,
+                    "baseline_top1_prob": r.baseline_top1_prob,
+                    "ablated_top1": r.ablated_top1,
+                    "ablated_top1_prob": r.ablated_top1_prob,
+                    "changed": r.changed,
+                    "trace_id": r.trace.metadata.trace_id,
+                }
+                for r in results
+            ],
+        }
+        click.echo(json.dumps(output, indent=2, default=str))
+        return
+
+    # Rich table output
+    console.print(
+        f"\n[bold]Neuron Ablation:[/bold] Layer {layer} MLP"
+    )
+    console.print(f"[bold]Prompt:[/bold] {prompt}\n")
+
+    table = Table(title="Neuron Ablation Results")
+    table.add_column("Neuron(s)", justify="right", style="cyan")
+    table.add_column("Baseline Top-1")
+    table.add_column("Ablated Top-1")
+    table.add_column("Changed?")
+
+    for r in results:
+        neurons_str = ",".join(map(str, r.neurons))
+        if len(neurons_str) > 20:
+            neurons_str = neurons_str[:17] + "..."
+        style = "green" if r.changed else None
+        marker = "\u2713 YES" if r.changed else ""
+        table.add_row(
+            neurons_str,
+            f"{r.baseline_top1} ({r.baseline_top1_prob:.3f})",
+            f"{r.ablated_top1} ({r.ablated_top1_prob:.3f})",
+            marker,
+            style=style,
+        )
+
+    console.print(table)
+
+    changed_count = sum(1 for r in results if r.changed)
+    console.print(
+        f"\n[bold]Summary:[/bold] {changed_count}/{len(results)}"
+        f" ablation(s) changed the top-1 prediction."
+    )

@@ -116,6 +116,24 @@ class TraceDB:
                 PRIMARY KEY (trace_id, position)
             )
         """)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS neuron_profiles (
+                id VARCHAR PRIMARY KEY,
+                trace_id VARCHAR,
+                contrast_trace_id VARCHAR,
+                layer INTEGER NOT NULL,
+                component VARCHAR NOT NULL,
+                prompt VARCHAR NOT NULL,
+                contrast_prompt VARCHAR,
+                model VARCHAR NOT NULL,
+                neuron_indices VARCHAR NOT NULL,
+                target_activations VARCHAR NOT NULL,
+                contrast_activations VARCHAR,
+                diff_activations VARCHAR,
+                label VARCHAR,
+                created_at VARCHAR
+            )
+        """)
 
     def write_trace(
         self, result: TraceResult, interventions: str | None = None
@@ -466,6 +484,70 @@ class TraceDB:
         if row is None:
             return None
         return row[0]
+
+    def save_neuron_profile(self, profile) -> None:
+        """Save a NeuronProfile to the database."""
+        import json
+
+        self._conn.execute(
+            "INSERT INTO neuron_profiles VALUES"
+            " (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                profile.profile_id,
+                profile.trace_id,
+                profile.contrast_trace_id,
+                profile.layer,
+                profile.component,
+                profile.prompt,
+                profile.contrast_prompt,
+                profile.model_name,
+                json.dumps(profile.neuron_indices),
+                json.dumps(profile.target_activations),
+                json.dumps(profile.contrast_activations)
+                if profile.contrast_activations else None,
+                json.dumps(profile.diff_activations)
+                if profile.diff_activations else None,
+                profile.label,
+                profile.created_at,
+            ],
+        )
+
+    def load_neuron_profile(self, label: str):
+        """Load a NeuronProfile by label. Returns None if not found."""
+        import json
+
+        from neurotrace.neurons import NeuronProfile
+
+        row = self._conn.execute(
+            "SELECT * FROM neuron_profiles"
+            " WHERE label = ? ORDER BY created_at DESC LIMIT 1",
+            [label],
+        ).fetchone()
+        if row is None:
+            # Try by ID
+            row = self._conn.execute(
+                "SELECT * FROM neuron_profiles WHERE id = ?",
+                [label],
+            ).fetchone()
+        if row is None:
+            return None
+
+        return NeuronProfile(
+            profile_id=row[0],
+            trace_id=row[1],
+            contrast_trace_id=row[2],
+            layer=row[3],
+            component=row[4],
+            prompt=row[5],
+            contrast_prompt=row[6],
+            model_name=row[7],
+            neuron_indices=json.loads(row[8]),
+            target_activations=json.loads(row[9]),
+            contrast_activations=json.loads(row[10]) if row[10] else None,
+            diff_activations=json.loads(row[11]) if row[11] else None,
+            label=row[12],
+            created_at=row[13],
+        )
 
     def close(self) -> None:
         self._conn.close()
