@@ -371,6 +371,32 @@ class RemoteWorker:
         r.raise_for_status()
         return r.json()
 
+    def reload_stream(
+        self,
+        model: str | None = None,
+        dtype: str | None = None,
+    ) -> Generator[dict, None, None]:
+        """Stream model reload progress via SSE.
+
+        Yields parsed event dicts with types: progress, done, error.
+        """
+        payload: dict = {}
+        if model is not None:
+            payload["model"] = model
+        if dtype is not None:
+            payload["dtype"] = dtype
+
+        with self.client.stream(
+            "POST",
+            f"{self.base_url}/reload",
+            json=payload,
+            timeout=600.0,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line.startswith("data: "):
+                    yield json.loads(line[6:])
+
     def worker_update_stream(self) -> Generator[dict, None, None]:
         """Stream worker update progress via SSE.
 

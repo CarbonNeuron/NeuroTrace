@@ -248,6 +248,7 @@ _tokenizer: AutoTokenizer | None = None
 _device: torch.device | None = None
 _model_name: str = ""
 _num_layers: int = 0
+_dtype: str = "auto"
 # adapter_id -> path on disk
 _adapters: dict[str, Path] = {}
 # Stack of (layer, k_star, delta) for undo
@@ -382,6 +383,11 @@ class RepairSaveRequest(BaseModel):
     path: str
 
 
+class ReloadRequest(BaseModel):
+    model: str | None = None
+    dtype: str | None = None
+
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
@@ -451,6 +457,7 @@ def health() -> dict[str, Any]:
     return {
         "status": "ok",
         "model": _model_name,
+        "dtype": _dtype,
         "device": str(_device),
         "device_name": _device_display_name(_device),
         "num_layers": _num_layers,
@@ -489,6 +496,7 @@ async def version() -> dict[str, Any]:
         "device": str(_device),
         "device_name": _device_display_name(_device),
         "model": _model_name,
+        "dtype": _dtype,
         "model_config": _get_model_config(),
         "uptime_seconds": int(time.time() - START_TIME),
     }
@@ -547,6 +555,57 @@ async def update() -> StreamingResponse:
             )
 
     return StreamingResponse(stream(), media_type="text/event-stream")
+
+
+@app.post("/reload")
+async def reload(req: ReloadRequest) -> StreamingResponse:
+    async def _generate():
+        global _model, _tokenizer, _device, _model_name, _num_layers, _dtype, _edit_stack
+
+        new_model = req.model or _model_name
+        new_dtype = req.dtype or _dtype
+
+        if new_model == _model_name and new_dtype == _dtype:
+            yield _sse_event("done", {"model": _model_name, "dtype": _dtype, "message": "No change needed."})
+            return
+
+        # Unload current model
+        yield _sse_event("progress", {"status": "unloading", "message": f"Unloading {_model_name}..."})
+        del _model
+        del _tokenizer
+        _model = None
+        _tokenizer = None
+        _edit_stack.clear()
+
+        import gc
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        await asyncio.sleep(0)
+
+        # Load new model
+        yield _sse_event("progress", {"status": "loading", "message": f"Loading {new_model} ({new_dtype})..."})
+
+        try:
+            _load_model(new_model, _device, cache_dir=None, dtype=new_dtype)
+        except Exception as e:
+            yield _sse_event("error", {"message": str(e)})
+            return
+
+        await asyncio.sleep(0)
+
+        vram_mb = 0
+        if torch.cuda.is_available():
+            vram_mb = torch.cuda.memory_allocated() // (1024 * 1024)
+
+        yield _sse_event("done", {
+            "model": _model_name,
+            "dtype": _dtype,
+            "vram_mb": vram_mb,
+        })
+
+    return StreamingResponse(_generate(), media_type="text/event-stream")
 
 
 @app.post("/format")
@@ -1412,23 +1471,27 @@ def download_adapter(adapter_id: str) -> StreamingResponse:
 # ---------------------------------------------------------------------------
 
 
-def _load_model(model_name: str, device: torch.device, cache_dir: str | None) -> None:
-    global _model, _tokenizer, _device, _model_name, _num_layers
+def _load_model(model_name: str, device: torch.device, cache_dir: str | None, dtype: str = "auto") -> None:
+    global _model, _tokenizer, _device, _model_name, _num_layers, _dtype
+
+    dtype_map = {"float16": torch.float16, "float32": torch.float32, "bfloat16": torch.bfloat16, "auto": "auto"}
+    torch_dtype = dtype_map.get(dtype, "auto")
 
     log.info("Loading tokenizer: %s", model_name)
     _tokenizer = AutoTokenizer.from_pretrained(
         model_name, token=False, cache_dir=cache_dir
     )
 
-    log.info("Loading model: %s", model_name)
+    log.info("Loading model: %s (dtype=%s)", model_name, dtype)
     _model = AutoModelForCausalLM.from_pretrained(
-        model_name, torch_dtype=torch.float32, token=False, cache_dir=cache_dir
+        model_name, torch_dtype=torch_dtype, token=False, cache_dir=cache_dir
     )
     _model = _model.to(device)
     _model.eval()
 
     _device = device
     _model_name = model_name
+    _dtype = dtype
     _num_layers = len(_model.model.layers)
 
     log.info(
@@ -2449,6 +2512,11 @@ def main() -> None:
     parser.add_argument(
         "--cache-dir", default=None, help="Model cache directory"
     )
+    parser.add_argument(
+        "--dtype", default="auto",
+        choices=["auto", "float16", "float32", "bfloat16"],
+        help="Model dtype. auto = use model's native dtype.",
+    )
     args = parser.parse_args()
 
     if args.list_devices:
@@ -2461,7 +2529,7 @@ def main() -> None:
         parser.error("--device-index and --device-name are mutually exclusive")
 
     device = _resolve_device(args.device, args.device_index, args.device_name)
-    _load_model(args.model, device, args.cache_dir)
+    _load_model(args.model, device, args.cache_dir, args.dtype)
 
     log.info("Starting server on %s:%d", args.host, args.port)
     uvicorn.run(app, host=args.host, port=args.port, log_level="info")

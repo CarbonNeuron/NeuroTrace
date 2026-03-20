@@ -48,7 +48,7 @@ def _decode_tokens(tokenizer, token_ids: list[int]) -> list[dict]:
 
 
 @click.command()
-@click.option("--model", required=True, help="HuggingFace model name or path.")
+@click.option("--model", default=None, help="HuggingFace model name or path.")
 @click.option("--prompt", default=None, help="Prompt text to trace.")
 @click.option(
     "--prompts-file",
@@ -67,6 +67,9 @@ def _decode_tokens(tokenizer, token_ids: list[int]) -> list[dict]:
 )
 @click.option("--layer-stride", default=1, type=int, help="Layer stride for capture.")
 @click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option(
+    "--remote", default=None, help="GPU worker URL (e.g., http://172.30.0.1:8877)."
+)
 @click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
 def trace(
     model,
@@ -78,6 +81,7 @@ def trace(
     capture_mode,
     layer_stride,
     adapter,
+    remote,
     device,
 ):
     """Run a forward-pass trace and store results."""
@@ -85,6 +89,8 @@ def trace(
         raise click.UsageError("Must provide either --prompt or --prompts-file.")
     if prompt is not None and prompts_file is not None:
         raise click.UsageError("Cannot provide both --prompt and --prompts-file.")
+    if remote is None and model is None:
+        raise click.UsageError("Must provide --model (local mode) or --remote.")
 
     # Collect prompts
     if prompts_file is not None:
@@ -92,6 +98,90 @@ def trace(
             prompts = [line.strip() for line in f if line.strip()]
     else:
         prompts = [prompt]
+
+    if remote is not None:
+        import uuid
+        from datetime import datetime, timezone
+
+        from neurotrace.remote import RemoteWorker
+        from neurotrace.types import LayerSnapshot, TraceMetadata, TraceResult
+
+        worker = RemoteWorker(remote)
+        health = worker.health()
+        model_name = health["model"]
+        err_console.print(
+            f"GPU: {health.get('device_name', 'unknown')} via {remote}"
+        )
+
+        db_conn = TraceDB(db)
+        try:
+            for i, p in enumerate(prompts):
+                err_console.print(
+                    f"Tracing prompt {i + 1}/{len(prompts)}..."
+                )
+                trace_result_data = worker.trace(p, seed=seed)
+
+                # Build layer snapshots with just top-1 predictions
+                layer_snapshots = []
+                for layer_data in trace_result_data["layers"]:
+                    top_tokens = layer_data["top_tokens"]
+                    top1_id = 0  # We don't have token IDs from remote
+                    top1_prob = (
+                        top_tokens[0]["prob"] if top_tokens else 0.0
+                    )
+                    snap = LayerSnapshot(
+                        layer_index=layer_data["layer"],
+                        residual_in=None,
+                        residual_out=None,
+                        attention_weights=None,
+                        attention_output=None,
+                        mlp_in=None,
+                        mlp_out=None,
+                        ln_values=None,
+                        residual_in_norm=0.0,
+                        residual_out_norm=0.0,
+                        attention_entropy=[],
+                        mlp_activation_mag=0.0,
+                        top1_token=top1_id,
+                        top1_prob=top1_prob,
+                    )
+                    layer_snapshots.append(snap)
+
+                # Build metadata
+                meta = TraceMetadata(
+                    trace_id=str(uuid.uuid4()),
+                    model_name=model_name,
+                    model_revision="remote",
+                    prompt=p,
+                    token_ids=[],
+                    tokens=[],
+                    num_layers=trace_result_data["num_layers"],
+                    num_heads=0,
+                    hidden_size=0,
+                    param_count=0,
+                    device="remote",
+                    dtype="remote",
+                    random_seed=seed,
+                    label=label,
+                    capture_mode="remote",
+                    layer_stride=1,
+                    timestamp=datetime.now(timezone.utc).isoformat(),
+                )
+
+                result = TraceResult(
+                    metadata=meta,
+                    layer_snapshots=layer_snapshots,
+                    token_predictions=[],
+                    final_logits=None,
+                )
+
+                db_conn.write_trace(result)
+                console.print(
+                    f"[green]Stored trace {result.metadata.trace_id}[/green]"
+                )
+        finally:
+            db_conn.close()
+        return
 
     with Progress(
         SpinnerColumn(),
@@ -429,9 +519,13 @@ def diff(
 @click.option("--track", default=None, help="Token string to track across all layers.")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
 @click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option(
+    "--remote", default=None, help="GPU worker URL (e.g., http://172.30.0.1:8877)."
+)
 @click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
 def predict(
-    db, trace_id, top_k, changes_only, layers, track, output_json, adapter, device
+    db, trace_id, top_k, changes_only, layers, track,
+    output_json, adapter, remote, device,
 ):
     """Show top-K token predictions at every layer from a stored trace."""
     import torch
@@ -462,7 +556,14 @@ def predict(
         layer_filter = set(int(x.strip()) for x in layers.split(","))
 
     # Load model for lm_head projection and tokenizer
-    model_name = result.metadata.model_name
+    if remote is not None:
+        from neurotrace.remote import RemoteWorker
+
+        worker = RemoteWorker(remote)
+        health = worker.health()
+        model_name = health["model"]
+    else:
+        model_name = result.metadata.model_name
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -603,7 +704,7 @@ def predict(
 
 
 @click.command()
-@click.option("--model", required=True, help="HuggingFace model name or path.")
+@click.option("--model", default=None, help="HuggingFace model name or path.")
 @click.option(
     "--tokens",
     default=None,
@@ -617,12 +718,24 @@ def predict(
     help="Trace ID — decode all unique top-1 tokens.",
 )
 @click.option("--db", default=None, help="Path to DuckDB database file.")
-def decode(model, tokens, from_trace, db):
+@click.option(
+    "--remote", default=None, help="GPU worker URL (e.g., http://172.30.0.1:8877)."
+)
+def decode(model, tokens, from_trace, db, remote):
     """Decode token IDs to human-readable strings."""
     if not tokens and from_trace is None:
         raise click.UsageError("Must provide --tokens or --from-trace.")
     if from_trace is not None and db is None:
         raise click.UsageError("--from-trace requires --db.")
+    if remote is None and model is None:
+        raise click.UsageError("Must provide --model (local mode) or --remote.")
+
+    if remote is not None:
+        from neurotrace.remote import RemoteWorker
+
+        worker = RemoteWorker(remote)
+        health = worker.health()
+        model = health["model"]
 
     token_ids = list(tokens)
 
@@ -669,7 +782,7 @@ def decode(model, tokens, from_trace, db):
 
 
 @click.command()
-@click.option("--model", required=True, help="HuggingFace model name or path.")
+@click.option("--model", default=None, help="HuggingFace model name or path.")
 @click.option("--prompt-a", required=True, help="First prompt.")
 @click.option("--prompt-b", required=True, help="Second prompt.")
 @click.option("--db", required=True, help="Path to DuckDB database file.")
@@ -678,6 +791,9 @@ def decode(model, tokens, from_trace, db):
 @click.option("--flagged-only", is_flag=True, help="Show only flagged layers.")
 @click.option("--head-detail", is_flag=True, help="Show critical head details.")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
+@click.option(
+    "--remote", default=None, help="GPU worker URL (e.g., http://172.30.0.1:8877)."
+)
 @click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
 def compare(
     model,
@@ -689,12 +805,26 @@ def compare(
     flagged_only,
     head_detail,
     output_json,
+    remote,
     device,
 ):
     """Trace two prompts, diff them, and show decoded results."""
     from neurotrace.analyzer import compute_diff
     from neurotrace.models import load_model
     from neurotrace.tracer import Tracer
+
+    if remote is None and model is None:
+        raise click.UsageError("Must provide --model (local mode) or --remote.")
+
+    if remote is not None:
+        from neurotrace.remote import RemoteWorker
+
+        worker = RemoteWorker(remote)
+        health = worker.health()
+        model = health["model"]
+        err_console.print(
+            f"GPU: {health.get('device_name', 'unknown')} via {remote}"
+        )
 
     capture_mode = "light" if light else "full"
     db_conn = TraceDB(db)

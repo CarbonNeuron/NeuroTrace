@@ -12,7 +12,8 @@ from neurotrace.storage import TraceDB
 
 @click.command()
 @click.option("--db", required=True, help="Path to DuckDB database file.")
-@click.option("--model", required=True, help="HuggingFace model name or path.")
+@click.option("--model", default=None, help="HuggingFace model name or path.")
+@click.option("--remote", default=None, help="GPU worker URL (e.g., http://172.30.0.1:8877).")
 @click.option(
     "--dataset-builtin",
     required=True,
@@ -37,6 +38,7 @@ from neurotrace.storage import TraceDB
 def experiment(
     db,
     model,
+    remote,
     dataset_builtin,
     target_layers,
     output_dir,
@@ -47,6 +49,17 @@ def experiment(
     device,
 ):
     """Run a full diagnostic pipeline: scan, ablate, finetune, verify."""
+    if remote is None and model is None:
+        raise click.UsageError("Must provide --model (local mode) or --remote.")
+
+    if remote is not None:
+        from neurotrace.remote import RemoteWorker
+        worker = RemoteWorker(remote)
+        health = worker.health()
+        if model is None:
+            model = health["model"]
+        err_console.print(f"GPU: {health.get('device_name', 'unknown')} via {remote}")
+
     import os
     import time
     import uuid

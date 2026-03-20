@@ -53,7 +53,7 @@ def _parse_sweep_zero_heads(value: str) -> tuple[int, list[int]]:
 
 @click.command()
 @click.option("--db", required=True, help="Path to DuckDB database file.")
-@click.option("--model", required=True, help="HuggingFace model name or path.")
+@click.option("--model", default=None, help="HuggingFace model name or path.")
 @click.option("--prompt", required=True, help="Prompt text to trace.")
 @click.option(
     "--zero-layers",
@@ -88,6 +88,7 @@ def _parse_sweep_zero_heads(value: str) -> tuple[int, list[int]]:
 @click.option("--label", default=None, help="Label for the ablated trace.")
 @click.option("--seed", default=42, type=int, help="Random seed.")
 @click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option("--remote", default=None, help="GPU worker URL (e.g., http://172.30.0.1:8877).")
 @click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
 def ablate(
     db,
@@ -102,9 +103,23 @@ def ablate(
     label,
     seed,
     adapter,
+    remote,
     device,
 ):
     """Run inference with targeted components disabled and compare to baseline."""
+    if remote is None and model is None:
+        raise click.UsageError("Must provide --model (local mode) or --remote.")
+
+    if remote is not None:
+        from neurotrace.remote import RemoteWorker
+        worker = RemoteWorker(remote)
+        health = worker.health()
+        model = health["model"]
+        err_console.print(
+            f"[dim]Note: ablate uses local model loading."
+            f" Model resolved from worker: {model}[/dim]"
+        )
+
     from neurotrace.ablate import (
         AblationSpec,
         parse_scale_layers,
@@ -255,7 +270,7 @@ def ablate(
 
 @click.command()
 @click.option("--db", required=True, help="Path to DuckDB database file.")
-@click.option("--model", required=True, help="HuggingFace model name or path.")
+@click.option("--model", default=None, help="HuggingFace model name or path.")
 @click.option("--prompt", required=True, help="Prompt text to trace.")
 @click.option(
     "--baseline",
@@ -312,6 +327,7 @@ def ablate(
 )
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
 @click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option("--remote", default=None, help="GPU worker URL (e.g., http://172.30.0.1:8877).")
 @click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
 def sweep(
     db,
@@ -331,9 +347,23 @@ def sweep(
     scale_mlp,
     output_json,
     adapter,
+    remote,
     device,
 ):
     """Run multiple ablations in a single model load, sweeping a parameter range."""
+    if remote is None and model is None:
+        raise click.UsageError("Must provide --model (local mode) or --remote.")
+
+    if remote is not None:
+        from neurotrace.remote import RemoteWorker
+        worker = RemoteWorker(remote)
+        health = worker.health()
+        model = health["model"]
+        err_console.print(
+            f"[dim]Note: sweep uses local model loading."
+            f" Model resolved from worker: {model}[/dim]"
+        )
+
     from neurotrace.ablate import (
         AblationSpec,
         parse_scale_layers,
@@ -594,9 +624,140 @@ def sweep(
     console.print(table)
 
 
+def _scan_remote(
+    remote_url, dataset, dataset_name, seed,
+    sabotage_threshold, final_threshold,
+    save_traces, save_flagged, details, output_json, db,
+):
+    """Run scan via remote GPU worker."""
+    from neurotrace.remote import RemoteWorker
+    from neurotrace.scan import PromptResult, ScanResult
+
+    worker = RemoteWorker(remote_url)
+    health = worker.health()
+    model_name = health["model"]
+    device_name = health.get("device_name", health.get("device", "unknown"))
+    err_console.print(f"GPU: {device_name} via {remote_url}")
+
+    prompt_results = []
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task("Scanning...", total=len(dataset))
+
+        for i, entry in enumerate(dataset):
+            desc = (
+                f"Scanning {i+1}/{len(dataset)}:"
+                f" {entry['prompt'][:40]}..."
+            )
+            progress.update(task, completed=i, description=desc)
+
+            trace_data = worker.trace(entry["prompt"], seed=seed, top_k=5)
+
+            # Extract per-layer predictions for the expected answer
+            answer = entry["answer"]
+            ranks = []
+            probs = []
+
+            for layer_data in trace_data["layers"]:
+                top_tokens = layer_data["top_tokens"]
+                # Find answer rank and prob
+                found = False
+                for rank_idx, tt in enumerate(top_tokens):
+                    token_text = tt["token"].strip().lstrip("\u2581").lower()
+                    if answer.strip().lower().startswith(token_text) and token_text:
+                        ranks.append(rank_idx + 1)
+                        probs.append(tt["prob"])
+                        found = True
+                        break
+                if not found:
+                    ranks.append(999)
+                    probs.append(0.0)
+
+            # Final prediction
+            final_token = trace_data["final_token"]
+            final_prob = trace_data["final_prob"]
+
+            # Find final rank
+            final_layers = trace_data["layers"]
+            if final_layers:
+                final_rank = 1  # It's the final prediction
+            else:
+                final_rank = 999
+
+            # Compute peak prob and layer
+            peak_prob = max(probs) if probs else 0.0
+            peak_layer = probs.index(peak_prob) if probs and peak_prob > 0 else None
+
+            # Compute commitment layer (first layer where answer prob > threshold)
+            commitment_layer = None
+            for li, p in enumerate(probs):
+                if p > 0.1:
+                    commitment_layer = li
+                    break
+
+            # Detect sabotage layers
+            sabotage_layers = []
+            if peak_prob > 0:
+                for li, p in enumerate(probs):
+                    if li > 0 and peak_layer is not None and li > peak_layer:
+                        drop = (peak_prob - p) / peak_prob
+                        if drop >= sabotage_threshold:
+                            sabotage_layers.append(li)
+
+            # Classify
+            final_token_clean = final_token.strip().lstrip("\u2581").lower()
+            answer_clean = answer.strip().lower()
+
+            flags = []
+            if answer_clean.startswith(final_token_clean) and final_token_clean:
+                if sabotage_layers:
+                    status = "sabotaged"
+                    flags.append("sabotage_detected")
+                elif final_prob < final_threshold:
+                    status = "weak"
+                    flags.append("weak_confidence")
+                else:
+                    status = "correct"
+            else:
+                if sabotage_layers:
+                    status = "sabotaged"
+                    flags.append("sabotage_detected")
+                    flags.append("wrong_final")
+                else:
+                    status = "wrong"
+                    flags.append("wrong_final")
+
+            prompt_results.append(PromptResult(
+                prompt=entry["prompt"],
+                answer=answer,
+                final_token=final_token,
+                final_prob=final_prob,
+                final_rank=final_rank,
+                peak_prob=peak_prob,
+                peak_layer=peak_layer,
+                commitment_layer=commitment_layer,
+                sabotage_layers=sabotage_layers,
+                flags=flags,
+                status=status,
+                ranks=ranks,
+                probs=probs,
+            ))
+
+        progress.update(task, description="Done.", completed=len(dataset))
+
+    return ScanResult(
+        model_name=model_name,
+        dataset_name=dataset_name,
+        prompt_results=prompt_results,
+    )
+
+
 @click.command()
 @click.option("--db", required=True, help="Path to DuckDB database file.")
-@click.option("--model", required=True, help="HuggingFace model name or path.")
+@click.option("--model", default=None, help="HuggingFace model name or path.")
 @click.option(
     "--dataset",
     "dataset_path",
@@ -634,6 +795,7 @@ def sweep(
 @click.option("--details", is_flag=True, help="Show layer details for flagged prompts.")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
 @click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option("--remote", default=None, help="GPU worker URL (e.g., http://172.30.0.1:8877).")
 @click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
 def scan(
     db,
@@ -648,11 +810,15 @@ def scan(
     details,
     output_json,
     adapter,
+    remote,
     device,
 ):
     """Scan a dataset for sabotaged predictions."""
     from neurotrace.datasets import get_builtin_dataset, load_dataset
     from neurotrace.scan import run_scan
+
+    if remote is None and model is None:
+        raise click.UsageError("Must provide --model (local mode) or --remote.")
 
     if dataset_path is None and dataset_builtin is None:
         raise click.UsageError("Must provide either --dataset or --dataset-builtin.")
@@ -667,44 +833,55 @@ def scan(
         dataset = load_dataset(dataset_path)
         dataset_name = dataset_path
 
-    with Progress(
-        SpinnerColumn(),
-        TextColumn("[progress.description]{task.description}"),
-        console=err_console,
-    ) as progress:
-        task = progress.add_task("Loading model...", total=None)
-        from neurotrace.models import load_model
-
-        device = _resolve_device(device)
-        model_obj, tokenizer = load_model(model, device=device)
-        model_obj = _maybe_load_adapter(model_obj, adapter)
-        progress.update(task, description="Model loaded.")
-
+    if remote is not None:
         db_conn = None
         if save_traces or save_flagged:
             db_conn = TraceDB(db)
-
-        def progress_cb(i, total, prompt):
-            desc = f"Scanning {i + 1}/{total}: {prompt[:40]}..."
-            progress.update(task, description=desc)
-
-        scan_result = run_scan(
-            model_obj,
-            tokenizer,
-            dataset,
-            dataset_name,
-            seed=seed,
-            sabotage_threshold=sabotage_threshold,
-            final_threshold=final_threshold,
-            save_traces=save_traces,
-            save_flagged=save_flagged,
-            db=db_conn,
-            progress_callback=progress_cb,
+        scan_result = _scan_remote(
+            remote, dataset, dataset_name, seed, sabotage_threshold, final_threshold,
+            save_traces, save_flagged, details, output_json, db_conn,
         )
-
-        progress.update(task, description="Done.")
         if db_conn:
             db_conn.close()
+    else:
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=err_console,
+        ) as progress:
+            task = progress.add_task("Loading model...", total=None)
+            from neurotrace.models import load_model
+
+            device = _resolve_device(device)
+            model_obj, tokenizer = load_model(model, device=device)
+            model_obj = _maybe_load_adapter(model_obj, adapter)
+            progress.update(task, description="Model loaded.")
+
+            db_conn = None
+            if save_traces or save_flagged:
+                db_conn = TraceDB(db)
+
+            def progress_cb(i, total, prompt):
+                desc = f"Scanning {i + 1}/{total}: {prompt[:40]}..."
+                progress.update(task, description=desc)
+
+            scan_result = run_scan(
+                model_obj,
+                tokenizer,
+                dataset,
+                dataset_name,
+                seed=seed,
+                sabotage_threshold=sabotage_threshold,
+                final_threshold=final_threshold,
+                save_traces=save_traces,
+                save_flagged=save_flagged,
+                db=db_conn,
+                progress_callback=progress_cb,
+            )
+
+            progress.update(task, description="Done.")
+            if db_conn:
+                db_conn.close()
 
     if output_json:
         output = {
@@ -1152,7 +1329,7 @@ def _run_eval_scan(
 
 @click.command()
 @click.option("--db", required=True, help="Path to DuckDB database file.")
-@click.option("--model", required=True, help="HuggingFace model name or path.")
+@click.option("--model", default=None, help="HuggingFace model name or path.")
 @click.option("--prompt", required=True, help="Target prompt.")
 @click.option("--layer", required=True, type=int, help="MLP layer to analyze.")
 @click.option(
@@ -1194,6 +1371,7 @@ def _run_eval_scan(
 @click.option("--seed", default=42, type=int, help="Random seed.")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
 @click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option("--remote", default=None, help="GPU worker URL (e.g., http://172.30.0.1:8877).")
 @click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
 def neurons(
     db,
@@ -1212,9 +1390,23 @@ def neurons(
     seed,
     output_json,
     adapter,
+    remote,
     device,
 ):
     """Neuron-level MLP attribution: profile or ablate individual neurons."""
+    if remote is None and model is None:
+        raise click.UsageError("Must provide --model (local mode) or --remote.")
+
+    if remote is not None:
+        from neurotrace.remote import RemoteWorker
+        worker = RemoteWorker(remote)
+        health = worker.health()
+        model = health["model"]
+        err_console.print(
+            f"[dim]Note: neurons uses local model loading."
+            f" Model resolved from worker: {model}[/dim]"
+        )
+
     if ablate_mode:
         _neurons_ablate(
             db,
