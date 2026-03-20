@@ -2888,6 +2888,7 @@ def _neurons_profile(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         console=err_console,
+        disable=output_json,
     ) as progress:
         task = progress.add_task("Loading model...", total=None)
         from neurotrace.models import load_model
@@ -3005,6 +3006,7 @@ def _neurons_ablate(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         console=err_console,
+        disable=output_json,
     ) as progress:
         task = progress.add_task("Loading model...", total=None)
         from neurotrace.models import load_model
@@ -3446,6 +3448,7 @@ def circuit(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
         console=err_console,
+        disable=output_json,
     ) as progress:
         task = progress.add_task("Loading model...", total=None)
         from neurotrace.models import load_model

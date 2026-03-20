@@ -1,5 +1,7 @@
 """Model loading and architecture detection for NeuroTrace."""
 
+import contextlib
+import io
 from dataclasses import dataclass, field
 
 import torch
@@ -59,12 +61,15 @@ def load_model(
     dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.nn.Module, AutoTokenizer]:
     """Load a HuggingFace model and tokenizer."""
-    tokenizer = AutoTokenizer.from_pretrained(model_name, token=False)
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        dtype=dtype,
-        token=False,
-    )
+    # Suppress tqdm progress bars and HF hub warnings that write to stderr
+    # and corrupt --json CLI output when stderr is captured (e.g. CliRunner).
+    with contextlib.redirect_stderr(io.StringIO()):
+        tokenizer = AutoTokenizer.from_pretrained(model_name, token=False)
+        model = AutoModelForCausalLM.from_pretrained(
+            model_name,
+            dtype=dtype,
+            token=False,
+        )
     model = model.to(device)
     model.eval()
     return model, tokenizer
