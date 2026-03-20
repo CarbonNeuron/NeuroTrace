@@ -1474,7 +1474,22 @@ def download_adapter(adapter_id: str) -> StreamingResponse:
 def _load_model(model_name: str, device: torch.device, cache_dir: str | None, dtype: str = "auto") -> None:
     global _model, _tokenizer, _device, _model_name, _num_layers, _dtype
 
-    dtype_map = {"float16": torch.float16, "float32": torch.float32, "bfloat16": torch.bfloat16, "auto": "auto"}
+    # DirectML does not support bfloat16; force float16 when auto
+    if dtype == "auto" and device.type == "privateuseone":
+        dtype = "float16"
+        log.info("DirectML detected — forcing dtype=float16")
+    elif dtype == "bfloat16" and device.type == "privateuseone":
+        dtype = "float16"
+        log.warning(
+            "DirectML does not support bfloat16 — falling back to float16"
+        )
+
+    dtype_map = {
+        "float16": torch.float16,
+        "float32": torch.float32,
+        "bfloat16": torch.bfloat16,
+        "auto": "auto",
+    }
     torch_dtype = dtype_map.get(dtype, "auto")
 
     log.info("Loading tokenizer: %s", model_name)
