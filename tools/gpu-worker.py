@@ -208,12 +208,7 @@ app = FastAPI(title="NeuroTrace GPU Worker", version="1.0.0")
 
 START_TIME = time.time()
 
-try:
-    REPO_DIR = subprocess.check_output(
-        ["git", "rev-parse", "--show-toplevel"], text=True
-    ).strip()
-except Exception:
-    REPO_DIR = os.path.dirname(os.path.abspath(__file__))
+REPO_DIR = str(Path(__file__).resolve().parent.parent)
 
 
 def get_git_info() -> dict[str, Any]:
