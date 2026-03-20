@@ -165,6 +165,70 @@ def test_remote_finetune_parses_sse_stream():
 # 5. Connection error propagation
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 5a. Model config endpoint
+# ---------------------------------------------------------------------------
+
+def test_remote_get_model_config():
+    """Mock httpx.Client.get and verify get_model_config() parses the JSON."""
+    with patch("httpx.Client") as mock_cls:
+        mock_client = mock_cls.return_value
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "num_hidden_layers": 28,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 8,
+            "hidden_size": 3072,
+            "intermediate_size": 8192,
+            "vocab_size": 128256,
+        }
+        mock_client.get.return_value = mock_response
+
+        from neurotrace.remote import RemoteWorker
+
+        worker = RemoteWorker("http://localhost:8877")
+        config = worker.get_model_config()
+
+        assert config["num_hidden_layers"] == 28
+        assert config["hidden_size"] == 3072
+        mock_client.get.assert_called_once_with(
+            "http://localhost:8877/model/config"
+        )
+        mock_response.raise_for_status.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# 5b. Format prompt endpoint
+# ---------------------------------------------------------------------------
+
+def test_remote_format_prompt():
+    """Mock httpx.Client.post and verify format_prompt() sends messages."""
+    with patch("httpx.Client") as mock_cls:
+        mock_client = mock_cls.return_value
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "formatted": "<|im_start|>user\nHello<|im_end|>\n<|im_start|>assistant\n",
+            "num_tokens": 12,
+        }
+        mock_client.post.return_value = mock_response
+
+        from neurotrace.remote import RemoteWorker
+
+        worker = RemoteWorker("http://localhost:8877")
+        result = worker.format_prompt([{"role": "user", "content": "Hello"}])
+
+        assert "formatted" in result
+        assert result["num_tokens"] == 12
+        mock_client.post.assert_called_once_with(
+            "http://localhost:8877/format",
+            json={"messages": [{"role": "user", "content": "Hello"}]},
+        )
+
+
+# ---------------------------------------------------------------------------
+# 6. Connection error propagation
+# ---------------------------------------------------------------------------
+
 def test_remote_connection_error():
     """Verify httpx.ConnectError propagates from RemoteWorker.health()."""
     with patch("httpx.Client") as mock_cls:

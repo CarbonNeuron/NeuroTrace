@@ -91,9 +91,18 @@ def analyze_circuit(attn_result: AttentionTraceResult) -> CircuitAnalysis:
     else:
         circuit_type = "mixed"
 
-    gatekeeper_present = any(
-        h["layer"] == 21 and h["head"] == 29 for h in active
-    )
+    # Gatekeeper = top head in the last quarter of layers with dominant projection.
+    # Model-agnostic: instead of hardcoding layer/head, check if the top head
+    # is in the last quarter of layers and contributes >50% of total attention.
+    if active and total_attention > 0:
+        max_layer = max(h["layer"] for h in active)
+        last_quarter_start = max_layer * 3 // 4
+        gatekeeper_present = (
+            active[0]["layer"] >= last_quarter_start
+            and active[0]["projection"] / total_attention > 0.5
+        )
+    else:
+        gatekeeper_present = False
 
     return CircuitAnalysis(
         active_heads=active,

@@ -114,16 +114,26 @@ class TestAnalyzeCircuit:
         assert circuit.circuit_type == "distributed"
 
     def test_gatekeeper_detection(self):
+        # Top head at layer 21 (last quarter of 0-21) with >50% of total
         entries = _make_attn_entries({(21, 29): 0.5, (10, 5): 0.3})
         result = AttentionTraceResult(prompt="test", answer="Berlin", entries=entries)
         circuit = analyze_circuit(result)
         assert circuit.gatekeeper_present is True
 
     def test_no_gatekeeper(self):
-        entries = _make_attn_entries({(10, 5): 0.5, (15, 3): 0.3})
+        # Both heads are similar in strength, top head not dominant
+        entries = _make_attn_entries({(10, 5): 0.5, (15, 3): 0.45})
         result = AttentionTraceResult(prompt="test", answer="Berlin", entries=entries)
         circuit = analyze_circuit(result)
         assert circuit.gatekeeper_present is False
+
+    def test_gatekeeper_model_agnostic(self):
+        """Gatekeeper detection works for arbitrary layer counts."""
+        # 28-layer model: top head at layer 25 with dominant projection
+        entries = _make_attn_entries({(25, 5): 0.8, (10, 3): 0.15})
+        result = AttentionTraceResult(prompt="test", answer="Berlin", entries=entries)
+        circuit = analyze_circuit(result)
+        assert circuit.gatekeeper_present is True
 
     def test_no_active_heads(self):
         entries = _make_attn_entries({(0, 0): 0.05, (1, 1): -0.1})

@@ -562,6 +562,14 @@ def list_builtin_datasets() -> list[str]:
     return list(_BUILTIN_DATASETS.keys())
 
 
+def format_prompt(raw_prompt: str, tokenizer) -> str:
+    """Wrap a raw completion prompt in the model's chat template."""
+    messages = [{"role": "user", "content": raw_prompt}]
+    return tokenizer.apply_chat_template(
+        messages, tokenize=False, add_generation_prompt=True,
+    )
+
+
 def load_dataset(path: str) -> list[dict]:
     """Load a dataset from a JSON file."""
     with open(path) as f:

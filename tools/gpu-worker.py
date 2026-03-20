@@ -259,8 +259,18 @@ _edit_stack: list[tuple[int, Any, Any]] = []
 # ---------------------------------------------------------------------------
 
 
+class ChatMessage(BaseModel):
+    role: str
+    content: str
+
+
+class FormatRequest(BaseModel):
+    messages: list[ChatMessage]
+
+
 class TraceRequest(BaseModel):
-    prompt: str
+    prompt: str | None = None
+    messages: list[ChatMessage] | None = None
     seed: int = 42
     top_k: int = 5
 
@@ -288,7 +298,8 @@ class AblationItem(BaseModel):
 
 
 class BatchAblateRequest(BaseModel):
-    prompt: str
+    prompt: str | None = None
+    messages: list[ChatMessage] | None = None
     ablations: list[AblationItem]
     seed: int = 42
     top_k: int = 1
@@ -313,13 +324,15 @@ class ForwardMlpDeltasRequest(BaseModel):
 
 
 class ForwardMlpDeltasAllPositionsRequest(BaseModel):
-    prompt: str
+    prompt: str | None = None
+    messages: list[ChatMessage] | None = None
     layers: list[int] | None = None
     seed: int = 42
 
 
 class AttentionContributionsRequest(BaseModel):
-    prompt: str
+    prompt: str | None = None
+    messages: list[ChatMessage] | None = None
     layers: list[int] | None = None
     seed: int = 42
 
@@ -354,7 +367,8 @@ class VerifyPrompt(BaseModel):
 
 
 class RepairRequest(BaseModel):
-    prompt: str
+    prompt: str | None = None
+    messages: list[ChatMessage] | None = None
     answer: str
     competitor: str | None = None
     target_layer: int | None = None
@@ -371,6 +385,22 @@ class RepairSaveRequest(BaseModel):
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
+
+
+def _resolve_prompt(
+    prompt: str | None,
+    messages: list[ChatMessage] | None,
+) -> str:
+    """Resolve a prompt from either raw string or chat messages."""
+    assert _tokenizer is not None
+    if messages is not None:
+        msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
+        return _tokenizer.apply_chat_template(
+            msg_dicts, tokenize=False, add_generation_prompt=True,
+        )
+    if prompt is not None:
+        return prompt
+    raise HTTPException(status_code=400, detail="Either 'prompt' or 'messages' is required")
 
 
 def _get_transformer_layers() -> torch.nn.ModuleList:
@@ -427,6 +457,27 @@ def health() -> dict[str, Any]:
     }
 
 
+def _get_model_config() -> dict[str, Any]:
+    """Return model config dict for the loaded model."""
+    assert _model is not None
+    cfg = _model.config
+    return {
+        "num_hidden_layers": getattr(cfg, "num_hidden_layers", _num_layers),
+        "num_attention_heads": getattr(cfg, "num_attention_heads", 0),
+        "num_key_value_heads": getattr(cfg, "num_key_value_heads", 0),
+        "hidden_size": getattr(cfg, "hidden_size", 0),
+        "intermediate_size": getattr(cfg, "intermediate_size", 0),
+        "vocab_size": getattr(cfg, "vocab_size", 0),
+    }
+
+
+@app.get("/model/config")
+def model_config() -> dict[str, Any]:
+    """Return the full model config dict."""
+    assert _model is not None
+    return _get_model_config()
+
+
 @app.get("/version")
 async def version() -> dict[str, Any]:
     assert _device is not None
@@ -438,6 +489,7 @@ async def version() -> dict[str, Any]:
         "device": str(_device),
         "device_name": _device_display_name(_device),
         "model": _model_name,
+        "model_config": _get_model_config(),
         "uptime_seconds": int(time.time() - START_TIME),
     }
 
@@ -497,12 +549,25 @@ async def update() -> StreamingResponse:
     return StreamingResponse(stream(), media_type="text/event-stream")
 
 
+@app.post("/format")
+def format_prompt(req: FormatRequest) -> dict[str, Any]:
+    """Format chat messages using the model's chat template."""
+    assert _tokenizer is not None
+    msg_dicts = [{"role": m.role, "content": m.content} for m in req.messages]
+    formatted = _tokenizer.apply_chat_template(
+        msg_dicts, tokenize=False, add_generation_prompt=True,
+    )
+    num_tokens = len(_tokenizer.encode(formatted))
+    return {"formatted": formatted, "num_tokens": num_tokens}
+
+
 @app.post("/trace", response_model=TraceResponse)
 def trace(req: TraceRequest) -> TraceResponse:
     assert _model is not None and _tokenizer is not None and _device is not None
 
+    prompt = _resolve_prompt(req.prompt, req.messages)
     torch.manual_seed(req.seed)
-    inputs = _tokenizer(req.prompt, return_tensors="pt").to(_device)
+    inputs = _tokenizer(prompt, return_tensors="pt").to(_device)
 
     layers = _get_transformer_layers()
     layer_results: list[LayerTrace] = []
@@ -546,7 +611,7 @@ def trace(req: TraceRequest) -> TraceResponse:
     layer_results.sort(key=lambda lr: lr.layer)
 
     return TraceResponse(
-        prompt=req.prompt,
+        prompt=prompt,
         num_layers=_num_layers,
         final_token=final_token,
         final_prob=final_prob,
@@ -560,7 +625,8 @@ def batch_ablate(req: BatchAblateRequest) -> StreamingResponse:
 
     async def _generate():
         total = len(req.ablations)
-        inputs = _tokenizer(req.prompt, return_tensors="pt").to(_device)
+        prompt = _resolve_prompt(req.prompt, req.messages)
+        inputs = _tokenizer(prompt, return_tensors="pt").to(_device)
 
         for idx, ablation in enumerate(req.ablations):
             description = (
@@ -872,8 +938,9 @@ def forward_mlp_deltas_all_positions(
             else list(range(len(model_layers)))
         )
 
+        prompt = _resolve_prompt(req.prompt, req.messages)
         torch.manual_seed(req.seed)
-        inputs = _tokenizer(req.prompt, return_tensors="pt").to(_device)
+        inputs = _tokenizer(prompt, return_tensors="pt").to(_device)
         num_positions = inputs["input_ids"].shape[1]
 
         captured_in: dict[int, torch.Tensor] = {}
@@ -955,8 +1022,9 @@ def attention_contributions(
             else list(range(len(model_layers)))
         )
 
+        prompt = _resolve_prompt(req.prompt, req.messages)
         torch.manual_seed(req.seed)
-        inputs = _tokenizer(req.prompt, return_tensors="pt").to(_device)
+        inputs = _tokenizer(prompt, return_tensors="pt").to(_device)
 
         num_heads = _model.config.num_attention_heads
         hidden_dim = _model.config.hidden_size
@@ -1532,7 +1600,8 @@ def fingerprint(req: FingerprintRequest) -> StreamingResponse:
 
 
 class DecomposeRequest(BaseModel):
-    prompt: str
+    prompt: str | None = None
+    messages: list[ChatMessage] | None = None
     tokens: list[str]
     seed: int = 42
 
@@ -1545,9 +1614,10 @@ def decompose(req: DecomposeRequest) -> StreamingResponse:
     async def _generate():
         yield _sse_line({"type": "progress", "status": "computing"})
 
+        prompt = _resolve_prompt(req.prompt, req.messages)
         torch.manual_seed(req.seed)
         input_ids = _tokenizer.encode(
-            req.prompt, return_tensors="pt"
+            prompt, return_tensors="pt"
         ).to(_device)
 
         # Resolve target token IDs
@@ -1650,7 +1720,7 @@ def decompose(req: DecomposeRequest) -> StreamingResponse:
 
         yield _sse_line({
             "type": "decomposition",
-            "prompt": req.prompt,
+            "prompt": prompt,
             "decompositions": decompositions,
         })
 
@@ -1670,7 +1740,7 @@ def repair(req: RepairRequest) -> StreamingResponse:
     async def _generate():
         torch.manual_seed(req.seed)
         layers = _get_transformer_layers()
-        prompt = req.prompt
+        prompt = _resolve_prompt(req.prompt, req.messages)
         answer = req.answer
         competitor = req.competitor
 

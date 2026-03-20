@@ -6,7 +6,12 @@ import pytest
 from click.testing import CliRunner
 
 from neurotrace.cli import cli
-from neurotrace.datasets import CAPITALS, get_builtin_dataset, load_dataset
+from neurotrace.datasets import (
+    CAPITALS,
+    format_prompt,
+    get_builtin_dataset,
+    load_dataset,
+)
 from neurotrace.scan import (
     PromptResult,
     ScanResult,
@@ -105,6 +110,25 @@ def test_load_dataset_validates_fields(tmp_path):
     path.write_text(json.dumps(data))
     with pytest.raises(ValueError, match="missing.*answer"):
         load_dataset(str(path))
+
+
+# --- format_prompt tests ---
+
+
+def test_format_prompt_wraps_in_chat_template():
+    """format_prompt wraps a raw prompt in chat messages format."""
+    class MockTokenizer:
+        def apply_chat_template(self, messages, tokenize, add_generation_prompt):
+            assert len(messages) == 1
+            assert messages[0]["role"] == "user"
+            assert tokenize is False
+            assert add_generation_prompt is True
+            return f"<|user|>\n{messages[0]['content']}\n<|assistant|>\n"
+
+    result = format_prompt("The capital of France is", MockTokenizer())
+    assert "<|user|>" in result
+    assert "The capital of France is" in result
+    assert "<|assistant|>" in result
 
 
 # --- Sabotage detection tests ---

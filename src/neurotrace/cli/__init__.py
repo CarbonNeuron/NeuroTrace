@@ -41,8 +41,12 @@ def _maybe_load_adapter(model, adapter_path: str | None):
 
 
 @click.group()
-def cli() -> None:
+@click.option("--model", default=None, help="Model name (from worker if --remote)")
+@click.pass_context
+def cli(ctx: click.Context, model: str | None) -> None:
     """NeuroTrace: interpretability toolkit for tracing transformer inference."""
+    ctx.ensure_object(dict)
+    ctx.obj["model"] = model
 
 
 # Import and register commands from submodules

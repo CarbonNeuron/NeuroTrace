@@ -24,6 +24,23 @@ class RemoteWorker:
         r.raise_for_status()
         return r.json()
 
+    def get_model_config(self) -> dict:
+        """Fetch model config from GPU worker."""
+        r = self.client.get(f"{self.base_url}/model/config")
+        r.raise_for_status()
+        return r.json()
+
+    def format_prompt(self, messages: list[dict]) -> dict:
+        """Format chat messages using the model's chat template.
+
+        Returns dict with 'formatted' (str) and 'num_tokens' (int).
+        """
+        r = self.client.post(
+            f"{self.base_url}/format", json={"messages": messages},
+        )
+        r.raise_for_status()
+        return r.json()
+
     def trace(self, prompt: str, seed: int = 42, top_k: int = 5) -> dict:
         """Run a single trace on the remote worker."""
         r = self.client.post(f"{self.base_url}/trace", json={
