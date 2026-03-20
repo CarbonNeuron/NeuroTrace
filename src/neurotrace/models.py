@@ -59,10 +59,11 @@ def load_model(
     dtype: torch.dtype = torch.float32,
 ) -> tuple[torch.nn.Module, AutoTokenizer]:
     """Load a HuggingFace model and tokenizer."""
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
+    tokenizer = AutoTokenizer.from_pretrained(model_name, token=False)
     model = AutoModelForCausalLM.from_pretrained(
         model_name,
         dtype=dtype,
+        token=False,
     )
     model = model.to(device)
     model.eval()

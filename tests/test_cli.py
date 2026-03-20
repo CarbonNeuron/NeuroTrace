@@ -159,6 +159,204 @@ def test_prompts_file(tmp_path):
     assert "nonexistent" in result.output or result.exit_code != 0
 
 
+def test_predict_no_residuals(tmp_path):
+    """predict should error gracefully when residuals aren't stored."""
+    db_path = str(tmp_path / "test.db")
+    # Write a trace with residual_out=None
+    meta = TraceMetadata(
+        trace_id="no-res",
+        model_name="test-model",
+        model_revision="abc",
+        prompt="hello",
+        token_ids=[1],
+        tokens=["hello"],
+        num_layers=1,
+        num_heads=1,
+        hidden_size=4,
+        param_count=100,
+        device="cpu",
+        dtype="float32",
+        random_seed=42,
+        label="no-res",
+        capture_mode="light",
+        layer_stride=1,
+        timestamp="2026-03-20T00:00:00",
+    )
+    snap = LayerSnapshot(
+        layer_index=0,
+        residual_in=None,
+        residual_out=None,
+        attention_weights=None,
+        attention_output=None,
+        mlp_in=None,
+        mlp_out=None,
+        ln_values=None,
+        residual_in_norm=2.0,
+        residual_out_norm=2.0,
+        attention_entropy=[0.5],
+        mlp_activation_mag=1.0,
+        top1_token=42,
+        top1_prob=0.8,
+    )
+    result = TraceResult(
+        metadata=meta,
+        layer_snapshots=[snap],
+        token_predictions=[],
+        final_logits=np.zeros((1, 100), dtype=np.float32),
+    )
+    db = TraceDB(db_path)
+    db.write_trace(result)
+    db.close()
+
+    runner = CliRunner()
+    result = runner.invoke(
+        cli, ["predict", "--db", db_path, "--trace-id", "no-res"]
+    )
+    assert result.exit_code != 0
+    assert "Residuals not stored" in result.output
+
+
+@pytest.mark.model_download
+def test_predict_basic(tinyllama_model, tmp_path):
+    """predict shows per-layer top-K predictions from a stored trace."""
+    db_path = str(tmp_path / "test.db")
+    runner = CliRunner()
+    # First create a trace
+    runner.invoke(
+        cli,
+        [
+            "trace", "--model", TINYLLAMA,
+            "--prompt", "The capital of France is",
+            "--db", db_path, "--label", "predict-test",
+        ],
+    )
+    # Run predict
+    result = runner.invoke(
+        cli,
+        ["predict", "--db", db_path, "--trace-id", "predict-test", "--top-k", "3"],
+    )
+    assert result.exit_code == 0
+    assert "Layer" in result.output
+
+
+@pytest.mark.model_download
+def test_predict_changes_only(tinyllama_model, tmp_path):
+    """--changes-only filters to layers where top-1 changed."""
+    db_path = str(tmp_path / "test.db")
+    runner = CliRunner()
+    runner.invoke(
+        cli,
+        [
+            "trace", "--model", TINYLLAMA,
+            "--prompt", "The capital of France is",
+            "--db", db_path, "--label", "changes-test",
+        ],
+    )
+    result = runner.invoke(
+        cli,
+        [
+            "predict", "--db", db_path, "--trace-id", "changes-test",
+            "--changes-only",
+        ],
+    )
+    assert result.exit_code == 0
+
+
+@pytest.mark.model_download
+def test_predict_track_token(tinyllama_model, tmp_path):
+    """--track shows a specific token's rank at every layer."""
+    db_path = str(tmp_path / "test.db")
+    runner = CliRunner()
+    runner.invoke(
+        cli,
+        [
+            "trace", "--model", TINYLLAMA,
+            "--prompt", "The capital of France is",
+            "--db", db_path, "--label", "track-test",
+        ],
+    )
+    result = runner.invoke(
+        cli,
+        [
+            "predict", "--db", db_path, "--trace-id", "track-test",
+            "--track", "Paris",
+        ],
+    )
+    assert result.exit_code == 0
+    assert "rank" in result.output
+
+
+@pytest.mark.model_download
+def test_predict_json_output(tinyllama_model, tmp_path):
+    """--json produces valid JSON output."""
+    db_path = str(tmp_path / "test.db")
+    runner = CliRunner()
+    runner.invoke(
+        cli,
+        [
+            "trace", "--model", TINYLLAMA,
+            "--prompt", "Hello",
+            "--db", db_path, "--label", "json-pred",
+        ],
+    )
+    result = runner.invoke(
+        cli,
+        [
+            "predict", "--db", db_path, "--trace-id", "json-pred",
+            "--json", "--top-k", "3",
+        ],
+    )
+    assert result.exit_code == 0
+    # Extract JSON array from output (progress bars may precede it)
+    output = result.output
+    # Find the JSON array start — look for newline + [
+    idx = output.rfind("\n[")
+    if idx >= 0:
+        output = output[idx + 1:]
+    else:
+        output = output[output.index("["):]
+    data = json.loads(output)
+    assert isinstance(data, list)
+    assert len(data) > 0
+    assert "layer_index" in data[0]
+    assert "top_k_ids" in data[0]
+    assert "top_k_strings" in data[0]
+    assert "annotations" in data[0]
+
+
+@pytest.mark.model_download
+def test_predict_layers_filter(tinyllama_model, tmp_path):
+    """--layers filters to specific layer indices."""
+    db_path = str(tmp_path / "test.db")
+    runner = CliRunner()
+    runner.invoke(
+        cli,
+        [
+            "trace", "--model", TINYLLAMA,
+            "--prompt", "Hello",
+            "--db", db_path, "--label", "layers-pred",
+        ],
+    )
+    result = runner.invoke(
+        cli,
+        [
+            "predict", "--db", db_path, "--trace-id", "layers-pred",
+            "--json", "--layers", "0,5,10",
+        ],
+    )
+    assert result.exit_code == 0
+    # Extract JSON array from output (progress bars may precede it)
+    output = result.output
+    idx = output.rfind("\n[")
+    if idx >= 0:
+        output = output[idx + 1:]
+    else:
+        output = output[output.index("["):]
+    data = json.loads(output)
+    layer_indices = {e["layer_index"] for e in data}
+    assert layer_indices == {0, 5, 10}
+
+
 @pytest.mark.model_download
 def test_decode_specific_tokens(tinyllama_model):
     runner = CliRunner()

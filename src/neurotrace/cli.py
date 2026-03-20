@@ -380,13 +380,50 @@ def diff(
 
 
 @cli.command()
-@click.option("--model", required=True, help="HuggingFace model name or path.")
-@click.option("--prompt", required=True, help="Prompt text.")
+@click.option("--db", required=True, help="Path to DuckDB database file.")
+@click.option("--trace-id", required=True, help="Trace ID, label, or 'latest'.")
 @click.option(
-    "--top-k", default=5, type=int, help="Number of top predictions per position."
+    "--top-k", default=5, type=int, help="Top predictions per layer."
 )
-def predict(model, prompt, top_k):
-    """Show per-position token predictions (no DB write)."""
+@click.option(
+    "--changes-only", is_flag=True, help="Only show layers where top-1 changed."
+)
+@click.option("--layers", default=None, help="Comma-separated layer indices to show.")
+@click.option(
+    "--track", default=None, help="Token string to track across all layers."
+)
+@click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
+def predict(db, trace_id, top_k, changes_only, layers, track, output_json):
+    """Show top-K token predictions at every layer from a stored trace."""
+    import torch
+
+    db_conn = TraceDB(db)
+    try:
+        trace_id = _resolve_trace_id(db_conn, trace_id)
+        result = db_conn.read_trace(trace_id)
+    except ValueError as e:
+        db_conn.close()
+        raise click.ClickException(str(e))
+    finally:
+        db_conn.close()
+
+    # Check that residual_out vectors are available
+    has_residuals = any(
+        snap.residual_out is not None for snap in result.layer_snapshots
+    )
+    if not has_residuals:
+        raise click.ClickException(
+            "Residuals not stored in this trace. "
+            "Re-trace with current version (layer_stride=1) to enable predict."
+        )
+
+    # Parse --layers filter
+    layer_filter = None
+    if layers is not None:
+        layer_filter = set(int(x.strip()) for x in layers.split(","))
+
+    # Load model for lm_head projection and tokenizer
+    model_name = result.metadata.model_name
     with Progress(
         SpinnerColumn(),
         TextColumn("[progress.description]{task.description}"),
@@ -394,28 +431,137 @@ def predict(model, prompt, top_k):
     ) as progress:
         task = progress.add_task("Loading model...", total=None)
         from neurotrace.models import load_model
-        from neurotrace.tracer import Tracer
 
-        model_obj, tokenizer = load_model(model)
-        progress.update(task, description="Running forward pass...")
+        model_obj, tokenizer = load_model(model_name)
+        progress.update(task, description="Projecting layers...")
 
-        tracer = Tracer(model_obj, tokenizer, capture_mode="light")
-        result = tracer.trace(prompt, top_k=top_k)
-        progress.update(task, description="Done.")
+    lm_head = model_obj.lm_head
+    final_ln = None
+    if hasattr(model_obj, "model") and hasattr(model_obj.model, "norm"):
+        final_ln = model_obj.model.norm
 
-    tokens = result.metadata.tokens
-    for pred in result.token_predictions:
-        pos = pred.position
-        token_str = tokens[pos] if pos < len(tokens) else "?"
-        console.print(
-            f"\n[bold]Position {pos}[/bold] (input: [cyan]{repr(token_str)}[/cyan])"
-        )
-        for tok, prob, s in zip(
-            pred.top_k_tokens, pred.top_k_probs, pred.top_k_strings
-        ):
-            bar_len = int(prob * 40)
-            bar = "#" * bar_len
-            console.print(f"  {prob:6.3f} [green]{bar}[/green] {repr(s)} (id={tok})")
+    # Resolve --track token to ID
+    track_token_id = None
+    if track is not None:
+        vocab = tokenizer.get_vocab()
+        # Try exact match first, then with leading space (common BPE pattern)
+        candidates = [track, f"\u2581{track}", f" {track}"]
+        for candidate in candidates:
+            if candidate in vocab:
+                track_token_id = vocab[candidate]
+                break
+        if track_token_id is None:
+            # Encode the string and take the first token
+            encoded = tokenizer.encode(track, add_special_tokens=False)
+            if encoded:
+                track_token_id = encoded[0]
+            else:
+                raise click.ClickException(f"Could not resolve token: {track!r}")
+
+    # Project each layer's residual_out through lm_head
+    layer_predictions = []
+    prev_ranking = {}  # token_id -> rank in previous layer
+
+    for snap in result.layer_snapshots:
+        if snap.residual_out is None:
+            continue
+        if layer_filter is not None and snap.layer_index not in layer_filter:
+            continue
+
+        with torch.no_grad():
+            res_tensor = torch.tensor(
+                snap.residual_out, dtype=torch.float32
+            ).unsqueeze(0)
+            if final_ln is not None:
+                res_tensor = final_ln(res_tensor)
+            layer_logits = lm_head(res_tensor.squeeze(0))
+            # Use last token position
+            layer_probs = torch.softmax(layer_logits[-1], dim=-1)
+
+            topk_result = torch.topk(layer_probs, k=top_k)
+            topk_ids = topk_result.indices.tolist()
+            topk_probs = topk_result.values.tolist()
+            topk_strings = [tokenizer.decode(tid) for tid in topk_ids]
+
+        # Build current ranking map
+        current_ranking = {tid: rank for rank, tid in enumerate(topk_ids)}
+
+        # Compute rank change annotations
+        annotations = []
+        for rank, tid in enumerate(topk_ids):
+            if not prev_ranking:
+                annotations.append("")
+            elif tid not in prev_ranking:
+                annotations.append("NEW")
+            elif prev_ranking[tid] == rank:
+                annotations.append("--")
+            elif prev_ranking[tid] > rank:
+                annotations.append(f"^ from #{prev_ranking[tid] + 1}")
+            else:
+                annotations.append(f"v from #{prev_ranking[tid] + 1}")
+
+        # Track specific token
+        track_info = None
+        if track_token_id is not None:
+            track_prob = float(layer_probs[track_token_id].item())
+            # Find rank (search full sorted probs)
+            track_rank = int((layer_probs >= track_prob).sum().item())
+            track_info = {
+                "token_id": track_token_id,
+                "token_str": tokenizer.decode(track_token_id),
+                "rank": track_rank,
+                "prob": track_prob,
+            }
+
+        entry = {
+            "layer_index": snap.layer_index,
+            "top_k_ids": topk_ids,
+            "top_k_probs": topk_probs,
+            "top_k_strings": topk_strings,
+            "annotations": annotations,
+            "track": track_info,
+        }
+
+        # For --changes-only: skip if top-1 didn't change
+        if changes_only and prev_ranking:
+            prev_top1 = next(
+                (tid for tid, r in prev_ranking.items() if r == 0), None
+            )
+            if prev_top1 == topk_ids[0]:
+                # Update prev_ranking but skip display
+                prev_ranking = current_ranking
+                continue
+
+        layer_predictions.append(entry)
+        prev_ranking = current_ranking
+
+    if output_json:
+        click.echo(json.dumps(layer_predictions, indent=2, default=str))
+        return
+
+    # Rich output
+    if not layer_predictions:
+        console.print("[dim]No layers to display.[/dim]")
+        return
+
+    for entry in layer_predictions:
+        console.print(f"\n[bold]Layer {entry['layer_index']}[/bold] " + "-" * 50)
+        for rank, (tid, prob, s, ann) in enumerate(zip(
+            entry["top_k_ids"],
+            entry["top_k_probs"],
+            entry["top_k_strings"],
+            entry["annotations"],
+        )):
+            ann_str = f"  [dim]{ann}[/dim]" if ann else ""
+            console.print(
+                f"  {rank + 1}. {repr(s):20s} ({prob:.3f}){ann_str}"
+            )
+        if entry["track"] is not None:
+            t = entry["track"]
+            console.print(
+                f"  [yellow]>> {repr(t['token_str'])}: "
+                f"rank #{t['rank']}, prob {t['prob']:.4f}[/yellow]"
+            )
 
 
 def _slugify(text: str, max_len: int = 30) -> str:
@@ -493,7 +639,7 @@ def decode(model, tokens, from_trace, db):
         task = progress.add_task("Loading tokenizer...", total=None)
         from transformers import AutoTokenizer
 
-        tokenizer = AutoTokenizer.from_pretrained(model)
+        tokenizer = AutoTokenizer.from_pretrained(model, token=False)
         progress.update(task, description="Done.")
 
     decoded = _decode_tokens(tokenizer, token_ids)
@@ -713,3 +859,417 @@ def compare(
     for tid in sorted(token_lookup.keys()):
         legend_table.add_row(str(tid), repr(token_lookup[tid]))
     console.print(legend_table)
+
+
+@cli.command()
+@click.option("--db", required=True, help="Path to DuckDB database file.")
+@click.option("--model", required=True, help="HuggingFace model name or path.")
+@click.option("--prompt", required=True, help="Prompt text to trace.")
+@click.option(
+    "--zero-layers", default=None,
+    help="Zero entire layer outputs. E.g. '20' or '20,21'.",
+)
+@click.option(
+    "--zero-heads", default=None,
+    help="Zero specific attention heads. E.g. '20:7,20:12'.",
+)
+@click.option(
+    "--scale-layer", default=None,
+    help="Scale layer contributions. E.g. '20:0.5,21:2.0'.",
+)
+@click.option(
+    "--zero-mlp", default=None,
+    help="Zero MLP sublayer outputs. E.g. '20' or '20,21'.",
+)
+@click.option(
+    "--baseline", default=None,
+    help="Baseline trace ID, label, or prefix. If omitted, runs a clean trace.",
+)
+@click.option("--label", default=None, help="Label for the ablated trace.")
+@click.option("--seed", default=42, type=int, help="Random seed.")
+def ablate(db, model, prompt, zero_layers, zero_heads, scale_layer, zero_mlp, baseline, label, seed):
+    """Run inference with targeted components disabled and compare to baseline."""
+    from neurotrace.ablate import (
+        AblationSpec,
+        parse_scale_layers,
+        parse_zero_heads,
+        parse_zero_layers,
+        run_ablation,
+    )
+
+    # Parse interventions
+    zl = parse_zero_layers(zero_layers) if zero_layers else []
+    zh = parse_zero_heads(zero_heads) if zero_heads else []
+    sl = parse_scale_layers(scale_layer) if scale_layer else []
+    zm = parse_zero_layers(zero_mlp) if zero_mlp else []
+
+    if not zl and not zh and not sl and not zm:
+        raise click.UsageError(
+            "At least one intervention required: --zero-layers, --zero-heads, --scale-layer, or --zero-mlp."
+        )
+
+    spec = AblationSpec(zero_layers=zl, zero_heads=zh, scale_layers=sl, zero_mlp=zm)
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task("Loading model...", total=None)
+        from neurotrace.models import load_model
+
+        model_obj, tokenizer = load_model(model)
+        progress.update(task, description="Model loaded.")
+
+        # Load baseline if provided
+        baseline_trace = None
+        db_conn = TraceDB(db)
+        if baseline is not None:
+            try:
+                baseline_id = _resolve_trace_id(db_conn, baseline)
+                baseline_trace = db_conn.read_trace(baseline_id)
+                progress.update(
+                    task,
+                    description=f"Loaded baseline {baseline_id[:8]}.",
+                )
+            except ValueError as e:
+                db_conn.close()
+                raise click.ClickException(str(e))
+
+        progress.update(task, description="Running ablation...")
+        result = run_ablation(
+            model_obj, tokenizer, prompt, spec,
+            baseline=baseline_trace, label=label, seed=seed,
+        )
+        progress.update(task, description="Storing traces...")
+
+        # Store baseline if we created it
+        if baseline is None:
+            db_conn.write_trace(result.baseline_trace)
+            console.print(
+                f"[green]Baseline stored: {result.baseline_trace.metadata.trace_id[:8]}[/green]"
+            )
+
+        # Store ablated trace with interventions metadata
+        db_conn.write_trace(result.ablated_trace, interventions=spec.to_json())
+        console.print(
+            f"[green]Ablated stored: {result.ablated_trace.metadata.trace_id[:8]}[/green]"
+        )
+        db_conn.close()
+
+    # Print summary
+    console.print(
+        f"\n[bold]Baseline:[/bold] {result.baseline_final_token!r}"
+        f" (p={result.baseline_final_prob:.2f})"
+    )
+    console.print(
+        f"[bold]Ablated:[/bold]  {result.ablated_final_token!r}"
+        f" (p={result.ablated_final_prob:.2f})"
+    )
+    console.print(f"[dim]Interventions: {spec.describe()}[/dim]\n")
+
+    # Layer comparison table
+    table = Table(title="Layer Comparison")
+    table.add_column("Layer", justify="right")
+    table.add_column("Baseline Top-1")
+    table.add_column("Ablated Top-1")
+    table.add_column("Cos Sim", justify="right")
+    table.add_column("Changed?")
+
+    for lc in result.layer_comparisons:
+        style = "red" if lc.changed else None
+        marker = "\u2713" if lc.changed else ""
+        # Mark intervened layers
+        is_intervened = (
+            lc.layer_index in spec.zero_layers
+            or any(l == lc.layer_index for l, _ in spec.zero_heads)
+            or any(l == lc.layer_index for l, _ in spec.scale_layers)
+            or lc.layer_index in spec.zero_mlp
+        )
+        if is_intervened and lc.changed:
+            marker += " \u2190"
+        table.add_row(
+            str(lc.layer_index),
+            f"{lc.baseline_top1} ({lc.baseline_top1_prob:.2f})",
+            f"{lc.ablated_top1} ({lc.ablated_top1_prob:.2f})",
+            f"{lc.cosine_similarity:.4f}",
+            marker,
+            style=style,
+        )
+
+    console.print(table)
+
+    # Summary line
+    changed_count = sum(1 for lc in result.layer_comparisons if lc.changed)
+    console.print(
+        f"\n[bold]Summary:[/bold] Ablating ({spec.describe()}) changed prediction"
+        f" from {result.baseline_final_token!r} (p={result.baseline_final_prob:.2f})"
+        f" to {result.ablated_final_token!r} (p={result.ablated_final_prob:.2f})."
+        f" {changed_count}/{len(result.layer_comparisons)} layers changed top-1."
+    )
+
+
+def _compute_layer_predictions(
+    result,
+    top_k: int = 5,
+):
+    """Project residual_out at each layer through lm_head to get top-k predictions.
+
+    Returns (layer_predictions, token_tracks) or (None, None) if residuals missing.
+    """
+    import torch
+
+    has_residuals = any(
+        s.residual_out is not None for s in result.layer_snapshots
+    )
+    if not has_residuals:
+        return None, None
+
+    from neurotrace.models import load_model
+
+    try:
+        model_obj, tokenizer = load_model(result.metadata.model_name)
+    except (OSError, ValueError):
+        return None, None
+    lm_head = model_obj.lm_head
+    final_ln = None
+    if hasattr(model_obj, "model") and hasattr(model_obj.model, "norm"):
+        final_ln = model_obj.model.norm
+
+    layer_preds = []
+    prev_ranking: dict[int, int] = {}
+    # Store full prob vectors to build token tracks later
+    prob_vectors: dict[int, torch.Tensor] = {}
+
+    for snap in result.layer_snapshots:
+        if snap.residual_out is None:
+            continue
+
+        with torch.no_grad():
+            res = torch.tensor(
+                snap.residual_out, dtype=torch.float32
+            ).unsqueeze(0)
+            if final_ln is not None:
+                res = final_ln(res)
+            logits = lm_head(res.squeeze(0))
+            probs = torch.softmax(logits[-1], dim=-1)
+
+            topk = torch.topk(probs, k=top_k)
+            topk_ids = topk.indices.tolist()
+            topk_probs = topk.values.tolist()
+            topk_strings = [tokenizer.decode(tid) for tid in topk_ids]
+
+        current_ranking = {tid: rank for rank, tid in enumerate(topk_ids)}
+        annotations = []
+        for rank, tid in enumerate(topk_ids):
+            if not prev_ranking:
+                annotations.append("")
+            elif tid not in prev_ranking:
+                annotations.append("NEW")
+            elif prev_ranking[tid] == rank:
+                annotations.append("--")
+            elif prev_ranking[tid] > rank:
+                annotations.append(f"^ #{prev_ranking[tid] + 1}")
+            else:
+                annotations.append(f"v #{prev_ranking[tid] + 1}")
+
+        layer_preds.append({
+            "layer_index": snap.layer_index,
+            "top_k_ids": topk_ids,
+            "top_k_probs": topk_probs,
+            "top_k_strings": topk_strings,
+            "annotations": annotations,
+        })
+
+        prob_vectors[snap.layer_index] = probs
+        prev_ranking = current_ranking
+
+    # Token tracking: top-3 final tokens
+    token_tracks = []
+    if layer_preds:
+        final = layer_preds[-1]
+        for i in range(min(3, len(final["top_k_ids"]))):
+            tid = final["top_k_ids"][i]
+            tok_str = final["top_k_strings"][i]
+            track_probs = []
+            for lp in layer_preds:
+                pv = prob_vectors.get(lp["layer_index"])
+                if pv is not None:
+                    track_probs.append(float(pv[tid].item()))
+                else:
+                    track_probs.append(0.0)
+            token_tracks.append({
+                "token": tok_str,
+                "token_id": tid,
+                "probs": track_probs,
+                "layers": [lp["layer_index"] for lp in layer_preds],
+            })
+
+    return layer_preds, token_tracks
+
+
+@cli.command()
+@click.option("--db", required=True, help="Path to DuckDB database file.")
+@click.option(
+    "--trace-id", default=None, help="Single trace report: trace ID or label."
+)
+@click.option(
+    "--trace-a", default=None, help="Comparison report: first trace ID."
+)
+@click.option(
+    "--trace-b", default=None, help="Comparison report: second trace ID."
+)
+@click.option(
+    "-o", "--output", default="report.html", help="Output file path."
+)
+@click.option(
+    "--open", "open_browser", is_flag=True,
+    help="Open report in browser after generating.",
+)
+@click.option(
+    "--full-attention", is_flag=True,
+    help="Include attention heatmaps for all layers.",
+)
+@click.option(
+    "--no-attention", is_flag=True,
+    help="Skip attention heatmaps entirely.",
+)
+@click.option(
+    "--upload", is_flag=True,
+    help="Upload report to CarbonFiles after generating.",
+)
+@click.option(
+    "--bucket", default=None,
+    help="Existing CarbonFiles bucket ID for upload.",
+)
+def report(
+    db, trace_id, trace_a, trace_b, output, open_browser,
+    full_attention, no_attention, upload, bucket,
+):
+    """Generate a self-contained HTML report from one or two traces."""
+    import os
+    import webbrowser
+
+    from neurotrace.report import generate_comparison_report, generate_report
+
+    # Validate options
+    if trace_id and (trace_a or trace_b):
+        raise click.UsageError(
+            "Cannot use --trace-id with --trace-a/--trace-b."
+        )
+    if not trace_id and not (trace_a and trace_b):
+        raise click.UsageError(
+            "Provide --trace-id or both --trace-a and --trace-b."
+        )
+    if (trace_a and not trace_b) or (trace_b and not trace_a):
+        raise click.UsageError(
+            "Must provide both --trace-a and --trace-b."
+        )
+
+    db_conn = TraceDB(db)
+
+    try:
+        if trace_id:
+            # Single trace report
+            resolved_id = _resolve_trace_id(db_conn, trace_id)
+            result = db_conn.read_trace(resolved_id)
+            layer_stats = db_conn.get_layer_stats(resolved_id)
+            db_conn.close()
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=err_console,
+            ) as progress:
+                task = progress.add_task(
+                    "Computing predictions...", total=None
+                )
+                layer_preds, token_tracks = _compute_layer_predictions(
+                    result
+                )
+                progress.update(task, description="Generating report...")
+
+                html = generate_report(
+                    result, layer_stats, layer_preds, token_tracks,
+                    full_attention, no_attention,
+                )
+        else:
+            # Comparison report
+            from neurotrace.analyzer import compute_diff
+
+            id_a = _resolve_trace_id(db_conn, trace_a)
+            id_b = _resolve_trace_id(db_conn, trace_b)
+            result_a = db_conn.read_trace(id_a)
+            result_b = db_conn.read_trace(id_b)
+            stats_a = db_conn.get_layer_stats(id_a)
+            stats_b = db_conn.get_layer_stats(id_b)
+            db_conn.close()
+
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=err_console,
+            ) as progress:
+                task = progress.add_task(
+                    "Computing predictions for trace A...", total=None
+                )
+                preds_a, tracks_a = _compute_layer_predictions(result_a)
+                progress.update(
+                    task,
+                    description="Computing predictions for trace B...",
+                )
+                preds_b, tracks_b = _compute_layer_predictions(result_b)
+                progress.update(task, description="Computing diff...")
+
+                diff_result = compute_diff(result_a, result_b)
+
+                # Build token lookup for diff table
+                token_lookup: dict[int, str] = {}
+                if preds_a:
+                    for lp in preds_a:
+                        for tid, s in zip(
+                            lp["top_k_ids"], lp["top_k_strings"]
+                        ):
+                            token_lookup[tid] = s
+                if preds_b:
+                    for lp in preds_b:
+                        for tid, s in zip(
+                            lp["top_k_ids"], lp["top_k_strings"]
+                        ):
+                            token_lookup[tid] = s
+                # Also add from diff metrics
+                for m in diff_result.layer_metrics:
+                    if m.trace_a_top1 not in token_lookup:
+                        token_lookup[m.trace_a_top1] = str(m.trace_a_top1)
+                    if m.trace_b_top1 not in token_lookup:
+                        token_lookup[m.trace_b_top1] = str(m.trace_b_top1)
+
+                progress.update(
+                    task, description="Generating report..."
+                )
+                html = generate_comparison_report(
+                    result_a, result_b, stats_a, stats_b,
+                    preds_a, preds_b, tracks_a, tracks_b,
+                    diff_result, token_lookup,
+                    full_attention, no_attention,
+                )
+    except ValueError as e:
+        db_conn.close()
+        raise click.ClickException(str(e))
+
+    with open(output, "w") as f:
+        f.write(html)
+
+    size_kb = os.path.getsize(output) / 1024
+    console.print(
+        f"[green]Report written to {output} ({size_kb:.0f} KB)[/green]"
+    )
+
+    if upload:
+        from neurotrace.upload import upload_report
+
+        url = upload_report(output, bucket_id=bucket)
+        console.print(f"[green]\u2713[/green] Uploaded: {url}")
+
+    if open_browser:
+        webbrowser.open(f"file://{os.path.abspath(output)}")

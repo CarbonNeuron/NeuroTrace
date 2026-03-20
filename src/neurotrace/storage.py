@@ -65,9 +65,18 @@ class TraceDB:
                 layer_stride INTEGER,
                 top_prediction VARCHAR,
                 top_prediction_prob FLOAT,
-                timestamp VARCHAR NOT NULL
+                timestamp VARCHAR NOT NULL,
+                interventions VARCHAR
             )
         """)
+        # Migration: add interventions column if missing (for pre-existing DBs)
+        try:
+            self._conn.execute(
+                "ALTER TABLE traces ADD COLUMN interventions VARCHAR"
+            )
+        except duckdb.CatalogException:
+            pass  # column already exists
+
         self._conn.execute("""
             CREATE TABLE IF NOT EXISTS layer_snapshots (
                 trace_id VARCHAR NOT NULL,
@@ -108,7 +117,9 @@ class TraceDB:
             )
         """)
 
-    def write_trace(self, result: TraceResult) -> None:
+    def write_trace(
+        self, result: TraceResult, interventions: str | None = None
+    ) -> None:
         """Write a complete trace to the database."""
         meta = result.metadata
 
@@ -123,7 +134,7 @@ class TraceDB:
 
         self._conn.execute(
             "INSERT INTO traces VALUES"
-            " (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            " (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
             [
                 meta.trace_id,
                 meta.model_name,
@@ -144,6 +155,7 @@ class TraceDB:
                 top_pred,
                 top_pred_prob,
                 meta.timestamp,
+                interventions,
             ],
         )
 
@@ -444,6 +456,16 @@ class TraceDB:
             [model_name, prompt, seed, capture_mode],
         ).fetchone()
         return row[0] if row else None
+
+    def get_interventions(self, trace_id: str) -> str | None:
+        """Get the interventions JSON for a trace, or None."""
+        row = self._conn.execute(
+            "SELECT interventions FROM traces WHERE trace_id = ?",
+            [trace_id],
+        ).fetchone()
+        if row is None:
+            return None
+        return row[0]
 
     def close(self) -> None:
         self._conn.close()

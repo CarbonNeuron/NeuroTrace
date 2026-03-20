@@ -7,8 +7,14 @@ Captures attention patterns, MLP activations, and residual streams during a forw
 ## Install
 
 ```bash
+# Development (run via uv)
 uv sync
+
+# Global PATH install (~/.local/bin/neurotrace)
+make install
 ```
+
+After `make install`, use `neurotrace` directly. For development, prefix with `uv run`.
 
 ## Quickstart
 

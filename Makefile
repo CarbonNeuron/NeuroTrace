@@ -1,4 +1,4 @@
-.PHONY: setup test test-quick lint trace-demo clean
+.PHONY: setup test test-quick lint trace-demo clean install uninstall
 
 setup:
 	uv sync --all-extras
@@ -16,6 +16,12 @@ trace-demo:
 	uv run neurotrace trace --model TinyLlama/TinyLlama-1.1B-Chat-v1.0 --prompt "The capital of France is" --db demo.db
 	uv run neurotrace list --db demo.db
 	uv run neurotrace inspect --db demo.db --trace-id latest
+
+install:
+	uv tool install --force --reinstall --from '.[upload]' neurotrace
+
+uninstall:
+	uv tool uninstall neurotrace
 
 clean:
 	find . -type d -name __pycache__ -exec rm -rf {} +

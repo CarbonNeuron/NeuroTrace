@@ -14,6 +14,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
+upload = ["carbonfiles-client>=0.5.0"]
 dev = [
     "pytest>=8.0",
     "ruff>=0.4",

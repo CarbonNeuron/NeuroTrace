@@ -23,6 +23,20 @@ def test_load_model():
 
 
 @pytest.mark.model_download
+def test_load_model_no_auth_warning(capsys):
+    """load_model should not produce HF authentication warnings."""
+    import warnings
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        load_model(TINYLLAMA)
+    auth_warnings = [
+        w for w in caught if "unauthenticated" in str(w.message).lower()
+    ]
+    assert len(auth_warnings) == 0
+
+
+@pytest.mark.model_download
 def test_auto_detect_architecture():
     model, _ = load_model(TINYLLAMA)
     arch = get_architecture(model.config.model_type)
