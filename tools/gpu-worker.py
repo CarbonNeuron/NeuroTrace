@@ -1240,6 +1240,142 @@ def _load_model(model_name: str, device: torch.device, cache_dir: str | None) ->
     )
 
 
+# ---------------------------------------------------------------------------
+# Decompose endpoint
+# ---------------------------------------------------------------------------
+
+
+class DecomposeRequest(BaseModel):
+    prompt: str
+    tokens: list[str]
+    seed: int = 42
+
+
+@app.post("/decompose")
+def decompose(req: DecomposeRequest) -> StreamingResponse:
+    """Logit Prism decomposition — exact additive logit attribution via SSE."""
+    assert _model is not None and _tokenizer is not None and _device is not None
+
+    async def _generate():
+        yield _sse_line({"type": "progress", "status": "computing"})
+
+        torch.manual_seed(req.seed)
+        input_ids = _tokenizer.encode(
+            req.prompt, return_tensors="pt"
+        ).to(_device)
+
+        # Resolve target token IDs
+        target_ids = []
+        for t in req.tokens:
+            ids = _tokenizer.encode(t, add_special_tokens=False)
+            if not ids:
+                ids = _tokenizer.encode(" " + t, add_special_tokens=False)
+            target_ids.append(ids[0] if ids else 0)
+
+        # Hook attention and MLP outputs
+        layers = _get_transformer_layers()
+        components: dict[int, dict[str, Any]] = {}
+        hooks: list[torch.utils.hooks.RemovableHandle] = []
+
+        for i, layer in enumerate(layers):
+            components[i] = {}
+
+            def _make_attn_hook(li: int):
+                def hook_fn(
+                    module: torch.nn.Module,
+                    input: Any,
+                    output: Any,
+                ) -> None:
+                    components[li]["attn"] = output[0][0, -1, :].detach()
+                return hook_fn
+
+            def _make_mlp_hook(li: int):
+                def hook_fn(
+                    module: torch.nn.Module,
+                    input: Any,
+                    output: Any,
+                ) -> None:
+                    out = (
+                        output[0, -1, :]
+                        if output.dim() == 3
+                        else output[-1, :]
+                    )
+                    components[li]["mlp"] = out.detach()
+                return hook_fn
+
+            hooks.append(
+                layer.self_attn.register_forward_hook(_make_attn_hook(i))
+            )
+            hooks.append(
+                layer.mlp.register_forward_hook(_make_mlp_hook(i))
+            )
+
+        try:
+            with torch.no_grad():
+                outputs = _model(input_ids)
+        finally:
+            for h in hooks:
+                h.remove()
+
+        # Embedding at last position
+        embed = _model.model.embed_tokens(input_ids)[0, -1, :].detach()
+
+        # Final layer norm weight
+        ln_weight = _model.model.norm.weight.detach()
+
+        # Reconstruct residual stream
+        residual = embed.clone()
+        for i in range(len(layers)):
+            residual = residual + components[i]["attn"] + components[i]["mlp"]
+
+        # RMS norm scale
+        variance = residual.pow(2).mean(-1, keepdim=False)
+        s = torch.sqrt(variance + _model.model.norm.variance_epsilon)
+
+        W_unembed = _model.lm_head.weight
+
+        decompositions: dict[str, Any] = {}
+        for token_str, token_id in zip(req.tokens, target_ids):
+            unembed_vec = W_unembed[token_id]
+            P = (unembed_vec * ln_weight) / s
+
+            embed_contrib = (P * embed).sum().item()
+            layer_contribs = []
+            total = embed_contrib
+
+            for i in range(len(layers)):
+                attn_c = (P * components[i]["attn"]).sum().item()
+                mlp_c = (P * components[i]["mlp"]).sum().item()
+                layer_contribs.append({
+                    "layer": i, "attention": attn_c, "mlp": mlp_c,
+                })
+                total += attn_c + mlp_c
+
+            actual_logit = outputs.logits[0, -1, token_id].item()
+
+            decompositions[token_str] = {
+                "token_id": token_id,
+                "final_logit": actual_logit,
+                "embedding": embed_contrib,
+                "layers": layer_contribs,
+                "reconstruction_error": abs(total - actual_logit),
+                "norm_scale": s.item(),
+            }
+
+        yield _sse_line({
+            "type": "decomposition",
+            "prompt": req.prompt,
+            "decompositions": decompositions,
+        })
+
+        await asyncio.sleep(0)
+        yield _sse_line({"type": "done"})
+
+    return StreamingResponse(
+        _generate(), media_type="text/event-stream"
+    )
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(
         description="NeuroTrace GPU inference server",

@@ -7011,3 +7011,342 @@ def _diagnose_remote(
         progress.update(task, description="Done.", completed=len(prompts))
 
     return model_name, attn_results, token_results, layers
+
+
+# ---------------------------------------------------------------------------
+# decompose command
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option("--model", default=None, help="HuggingFace model name (local mode).")
+@click.option("--db", required=True, help="Path to DuckDB database file.")
+@click.option(
+    "--dataset-builtin",
+    default=None,
+    help="Built-in dataset name (e.g. 'capitals').",
+)
+@click.option(
+    "--dataset",
+    "dataset_path",
+    default=None,
+    type=click.Path(exists=True),
+    help="Custom JSONL dataset path.",
+)
+@click.option("--prompt", default=None, help="Single prompt to decompose.")
+@click.option("--answer", default=None, help="Expected answer for --prompt.")
+@click.option(
+    "--competitors", default=None,
+    help="Comma-separated competitor tokens (auto-detected if omitted).",
+)
+@click.option(
+    "--remote", default=None, help="GPU worker URL (e.g., http://172.30.0.1:8877)."
+)
+@click.option(
+    "--device", default="cpu", help="Device: cpu, cuda, directml, auto."
+)
+@click.option("--html", "html_path", default=None, help="HTML report output path.")
+@click.option("--json", "output_json", is_flag=True, help="JSON output.")
+@click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option("--seed", default=42, type=int, help="Random seed.")
+def decompose(
+    model,
+    db,
+    dataset_builtin,
+    dataset_path,
+    prompt,
+    answer,
+    competitors,
+    remote,
+    device,
+    html_path,
+    output_json,
+    adapter,
+    seed,
+):
+    """Logit Prism decomposition — exact additive logit attribution per component."""
+    import uuid
+    from datetime import datetime, timezone
+
+    from neurotrace.decompose import (
+        DecomposeRun,
+        decompose_run_to_dict,
+        generate_decompose_html,
+        run_decompose_local,
+    )
+
+    # Validate inputs
+    has_dataset = dataset_path is not None or dataset_builtin is not None
+    has_single = prompt is not None
+    if not has_dataset and not has_single:
+        raise click.UsageError(
+            "Must provide --dataset/--dataset-builtin or --prompt/--answer."
+        )
+    if has_dataset and has_single:
+        raise click.UsageError(
+            "Cannot provide both dataset and --prompt/--answer."
+        )
+    if has_single and answer is None:
+        raise click.UsageError("--answer is required with --prompt.")
+    if remote is None and model is None:
+        raise click.UsageError("Must provide --model (local mode) or --remote.")
+
+    # Parse competitors
+    competitor_list = None
+    if competitors:
+        competitor_list = [c.strip() for c in competitors.split(",") if c.strip()]
+
+    # Build prompt list
+    if has_single:
+        prompts = [{"prompt": prompt, "answer": answer}]
+        dataset_name = "single"
+    else:
+        from neurotrace.datasets import get_builtin_dataset, load_dataset
+
+        if dataset_builtin is not None:
+            dataset = get_builtin_dataset(dataset_builtin)
+            dataset_name = dataset_builtin
+        else:
+            dataset = load_dataset(dataset_path)
+            dataset_name = dataset_path
+        prompts = [{"prompt": d["prompt"], "answer": d["answer"]} for d in dataset]
+
+    run_id = str(uuid.uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
+    all_results = []
+
+    if remote is not None:
+        all_results = _decompose_remote(
+            remote, prompts, competitor_list, seed,
+        )
+        from neurotrace.remote import RemoteWorker
+
+        worker = RemoteWorker(remote)
+        health = worker.health()
+        model_name = health["model"]
+    else:
+        from neurotrace.models import load_model
+
+        device = _resolve_device(device)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=err_console,
+        ) as progress:
+            task = progress.add_task("Loading model...", total=None)
+            model_obj, tokenizer = load_model(model, device=device)
+            model_obj = _maybe_load_adapter(model_obj, adapter)
+            model_name = model
+
+            progress.update(
+                task,
+                description=f"Decomposing {len(prompts)} prompts...",
+                total=len(prompts),
+            )
+
+            for p_idx, entry in enumerate(prompts):
+                progress.update(
+                    task,
+                    completed=p_idx,
+                    description=f"Prompt {p_idx + 1}/{len(prompts)}",
+                )
+                results = run_decompose_local(
+                    model_obj,
+                    tokenizer,
+                    entry["prompt"],
+                    entry["answer"],
+                    competitors=competitor_list,
+                    seed=seed,
+                )
+                all_results.extend(results)
+
+            progress.update(task, description="Done.", completed=len(prompts))
+
+    # Determine unique prompt count
+    unique_prompts = len({r.prompt for r in all_results}) if all_results else 0
+
+    run = DecomposeRun(
+        run_id=run_id,
+        dataset=dataset_name,
+        model_name=model_name,
+        num_prompts=unique_prompts or len(prompts),
+        results=all_results,
+        created_at=created_at,
+    )
+
+    # Save to DB
+    db_conn = TraceDB(db)
+    db_conn.write_decompose_run(
+        run_id=run_id,
+        dataset=dataset_name,
+        model_name=model_name,
+        prompt_count=run.num_prompts,
+    )
+    for r in all_results:
+        db_conn.write_decompose_result(
+            run_id=run_id,
+            prompt=r.prompt,
+            answer=r.answer,
+            competitor=r.competitor,
+            answer_logit=r.answer_logit,
+            competitor_logit=r.competitor_logit,
+            margin=r.margin,
+            embedding_margin=r.embedding_margin,
+            component_json=json.dumps(r.component_margins),
+            reconstruction_error=r.reconstruction_error,
+        )
+    db_conn.close()
+
+    run_dict = decompose_run_to_dict(run)
+
+    # HTML output
+    if html_path:
+        import os
+
+        os.makedirs(os.path.dirname(html_path) or ".", exist_ok=True)
+        html = generate_decompose_html(run)
+        with open(html_path, "w") as f:
+            f.write(html)
+        err_console.print(f"[green]Report saved to {html_path}[/green]")
+
+    # JSON output
+    if output_json:
+        click.echo(json.dumps(run_dict, indent=2))
+        return
+
+    # Console output
+    console.print(
+        f"\n[bold]Logit Prism Decomposition:[/bold] {dataset_name} "
+        f"({len(prompts)} prompts)"
+    )
+    console.print(f"Model: {model_name}\n")
+
+    for r in all_results:
+        err_str = "✓" if r.reconstruction_error < 0.01 else "⚠"
+        console.print(
+            f'[bold]"{r.prompt}"[/bold]  '
+            f"reconstruction error: {r.reconstruction_error:.4f} {err_str}"
+        )
+
+        table = Table()
+        table.add_column("Component", min_width=12)
+        table.add_column(r.answer, justify="right")
+        table.add_column(r.competitor, justify="right")
+        table.add_column("Margin", justify="right")
+
+        # Embedding
+        em = r.embedding_margin
+        em_style = "green" if em >= 0 else "red"
+        table.add_row(
+            "Embedding",
+            f"{r.answer_decomposition.embedding:+.4f}",
+            f"{r.competitor_decomposition.embedding:+.4f}",
+            f"[{em_style}]{em:+.4f}[/{em_style}]",
+        )
+
+        # Per-layer
+        for al, cl, cm in zip(
+            r.answer_decomposition.layers,
+            r.competitor_decomposition.layers,
+            r.component_margins,
+        ):
+            attn_m = cm["attn_margin"]
+            mlp_m = cm["mlp_margin"]
+            as_ = "green" if attn_m >= 0 else "red"
+            ms = "green" if mlp_m >= 0 else "red"
+            table.add_row(
+                f"L{al.layer} attn",
+                f"{al.attention:+.4f}",
+                f"{cl.attention:+.4f}",
+                f"[{as_}]{attn_m:+.4f}[/{as_}]",
+            )
+            table.add_row(
+                f"L{al.layer} mlp",
+                f"{al.mlp:+.4f}",
+                f"{cl.mlp:+.4f}",
+                f"[{ms}]{mlp_m:+.4f}[/{ms}]",
+            )
+
+        # Total
+        m_style = "green" if r.margin >= 0 else "red"
+        table.add_row(
+            "[bold]TOTAL[/bold]",
+            f"[bold]{r.answer_logit:+.4f}[/bold]",
+            f"[bold]{r.competitor_logit:+.4f}[/bold]",
+            f"[bold][{m_style}]{r.margin:+.4f}[/{m_style}][/bold]",
+        )
+
+        console.print(table)
+
+        # Top margin contributors
+        sorted_margins = sorted(
+            r.component_margins,
+            key=lambda x: x["attn_margin"] + x["mlp_margin"],
+        )
+        console.print("\n  Largest negative margin contributors:")
+        for cm in sorted_margins[:3]:
+            total_m = cm["attn_margin"] + cm["mlp_margin"]
+            if total_m < 0:
+                console.print(
+                    f"    L{cm['layer']}: {total_m:+.4f}"
+                )
+        console.print()
+
+
+def _decompose_remote(remote_url, prompts, competitor_list, seed):
+    """Run decompose via remote GPU worker."""
+    from neurotrace.decompose import run_decompose_remote
+    from neurotrace.remote import RemoteWorker
+
+    worker = RemoteWorker(remote_url)
+    health = worker.health()
+    device_name = health.get("device_name", health.get("device", "unknown"))
+
+    err_console.print(f"GPU: {device_name} via {remote_url}")
+
+    all_results = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task(
+            "Decomposing...", total=len(prompts),
+        )
+
+        for p_idx, entry in enumerate(prompts):
+            progress.update(
+                task,
+                completed=p_idx,
+                description=f"Prompt {p_idx + 1}/{len(prompts)}",
+            )
+
+            prompt_text = entry["prompt"]
+            answer_text = entry["answer"]
+
+            # Determine competitors for this prompt
+            comps = competitor_list
+            if not comps:
+                comps = ["the", "a", "is"]  # fallback
+
+            tokens = [answer_text] + comps
+
+            remote_data = {}
+            for event in worker.decompose_stream(
+                prompt_text, tokens, seed=seed,
+            ):
+                etype = event.get("type")
+                if etype == "decomposition":
+                    remote_data = event.get("decompositions", {})
+
+            for comp in comps:
+                if comp in remote_data and answer_text in remote_data:
+                    result = run_decompose_remote(
+                        remote_data, prompt_text, answer_text, comp,
+                    )
+                    all_results.append(result)
+
+        progress.update(task, description="Done.", completed=len(prompts))
+
+    return all_results

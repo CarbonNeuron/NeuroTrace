@@ -415,6 +415,34 @@ class TraceDB:
             )
         """)
 
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS decompose_runs (
+                run_id TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                dataset TEXT,
+                model_name TEXT NOT NULL,
+                prompt_count INTEGER NOT NULL
+            )
+        """)
+        self._conn.execute(
+            "CREATE SEQUENCE IF NOT EXISTS decompose_seq START 1"
+        )
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS decompose_results (
+                id INTEGER DEFAULT nextval('decompose_seq'),
+                run_id TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                competitor TEXT NOT NULL,
+                answer_logit REAL,
+                competitor_logit REAL,
+                margin REAL,
+                embedding_margin REAL,
+                component_json TEXT,
+                reconstruction_error REAL
+            )
+        """)
+
     def write_trace(
         self, result: TraceResult, interventions: str | None = None
     ) -> None:
@@ -1513,6 +1541,89 @@ class TraceDB:
             " FROM diagnosis_runs ORDER BY created_at DESC"
         ).fetchall()
         cols = ["id", "created_at", "dataset", "model_name", "prompt_count"]
+        return [dict(zip(cols, r)) for r in rows]
+
+    def write_decompose_run(
+        self,
+        run_id: str,
+        dataset: str | None,
+        model_name: str,
+        prompt_count: int,
+    ) -> None:
+        """Write a decompose run to the database."""
+        self._conn.execute(
+            "INSERT INTO decompose_runs VALUES"
+            " (?, CURRENT_TIMESTAMP, ?, ?, ?)",
+            [run_id, dataset, model_name, prompt_count],
+        )
+
+    def write_decompose_result(
+        self,
+        run_id: str,
+        prompt: str,
+        answer: str,
+        competitor: str,
+        answer_logit: float,
+        competitor_logit: float,
+        margin: float,
+        embedding_margin: float,
+        component_json: str,
+        reconstruction_error: float,
+    ) -> None:
+        """Write a single decompose result to the database."""
+        self._conn.execute(
+            "INSERT INTO decompose_results"
+            " (run_id, prompt, answer, competitor,"
+            "  answer_logit, competitor_logit, margin,"
+            "  embedding_margin, component_json,"
+            "  reconstruction_error)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                run_id, prompt, answer, competitor,
+                answer_logit, competitor_logit, margin,
+                embedding_margin, component_json,
+                reconstruction_error,
+            ],
+        )
+
+    def read_decompose_run(self, run_id: str) -> dict:
+        """Read a decompose run from the database."""
+        row = self._conn.execute(
+            "SELECT * FROM decompose_runs WHERE run_id = ?", [run_id]
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Decompose run not found: {run_id}")
+        cols = [
+            "run_id", "created_at", "dataset",
+            "model_name", "prompt_count",
+        ]
+        return dict(zip(cols, row))
+
+    def read_decompose_results(self, run_id: str) -> list[dict]:
+        """Read decompose results for a run."""
+        rows = self._conn.execute(
+            "SELECT * FROM decompose_results WHERE run_id = ?"
+            " ORDER BY id",
+            [run_id],
+        ).fetchall()
+        cols = [
+            "id", "run_id", "prompt", "answer", "competitor",
+            "answer_logit", "competitor_logit", "margin",
+            "embedding_margin", "component_json",
+            "reconstruction_error",
+        ]
+        return [dict(zip(cols, r)) for r in rows]
+
+    def list_decompose_runs(self) -> list[dict]:
+        """List all decompose runs."""
+        rows = self._conn.execute(
+            "SELECT run_id, created_at, dataset, model_name, prompt_count"
+            " FROM decompose_runs ORDER BY created_at DESC"
+        ).fetchall()
+        cols = [
+            "run_id", "created_at", "dataset",
+            "model_name", "prompt_count",
+        ]
         return [dict(zip(cols, r)) for r in rows]
 
     def close(self) -> None:

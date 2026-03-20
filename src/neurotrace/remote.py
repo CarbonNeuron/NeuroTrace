@@ -217,6 +217,31 @@ class RemoteWorker:
                 if line.startswith("data: "):
                     yield json.loads(line[6:])
 
+    def decompose_stream(
+        self,
+        prompt: str,
+        tokens: list[str],
+        seed: int = 42,
+    ) -> Generator[dict, None, None]:
+        """Stream logit decomposition results via SSE.
+
+        Yields parsed event dicts with types: progress, decomposition, done.
+        """
+        with self.client.stream(
+            "POST",
+            f"{self.base_url}/decompose",
+            json={
+                "prompt": prompt,
+                "tokens": tokens,
+                "seed": seed,
+            },
+            timeout=600.0,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line.startswith("data: "):
+                    yield json.loads(line[6:])
+
     def download_adapter(self, adapter_id: str, output_path: str) -> None:
         """Download trained adapter weights to local path."""
         import io
