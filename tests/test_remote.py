@@ -4,15 +4,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-
 # ---------------------------------------------------------------------------
 # 1. Health endpoint
 # ---------------------------------------------------------------------------
 
 def test_remote_health_parse():
     """Mock httpx.Client.get and verify RemoteWorker.health() parses the JSON."""
-    with patch("httpx.Client") as MockClient:
-        mock_client = MockClient.return_value
+    with patch("httpx.Client") as mock_cls:
+        mock_client = mock_cls.return_value
         mock_response = MagicMock()
         mock_response.json.return_value = {
             "status": "ok",
@@ -41,8 +40,8 @@ def test_remote_health_parse():
 
 def test_remote_batch_ablate_builds_request():
     """Verify the request body contains baseline + one ablation per layer."""
-    with patch("httpx.Client") as MockClient:
-        mock_client = MockClient.return_value
+    with patch("httpx.Client") as mock_cls:
+        mock_client = mock_cls.return_value
 
         # Set up a streaming context manager that yields no lines
         mock_response = MagicMock()
@@ -55,7 +54,9 @@ def test_remote_batch_ablate_builds_request():
 
         worker = RemoteWorker("http://localhost:8877")
         num_layers = 3
-        list(worker.batch_ablate_stream("The capital of France is", num_layers=num_layers))
+        list(worker.batch_ablate_stream(
+            "The capital of France is", num_layers=num_layers,
+        ))
 
         mock_client.stream.assert_called_once()
         call_args = mock_client.stream.call_args
@@ -79,16 +80,21 @@ def test_remote_batch_ablate_builds_request():
 
 def test_remote_batch_ablate_parses_sse_stream():
     """Mock streaming response with SSE lines and verify parsed events."""
-    with patch("httpx.Client") as MockClient:
-        mock_client = MockClient.return_value
+    with patch("httpx.Client") as mock_cls:
+        mock_client = mock_cls.return_value
 
         mock_response = MagicMock()
         mock_response.__enter__ = MagicMock(return_value=mock_response)
         mock_response.__exit__ = MagicMock(return_value=False)
         mock_response.iter_lines.return_value = [
-            'data: {"type":"progress","index":0,"total":2,"description":"baseline"}',
-            'data: {"type":"result","index":0,"zero_mlp_layers":[],"final_token":"Paris","final_prob":0.51}',
-            'data: {"type":"result","index":1,"zero_mlp_layers":[0],"final_token":"London","final_prob":0.30}',
+            'data: {"type":"progress","index":0,'
+            '"total":2,"description":"baseline"}',
+            'data: {"type":"result","index":0,'
+            '"zero_mlp_layers":[],'
+            '"final_token":"Paris","final_prob":0.51}',
+            'data: {"type":"result","index":1,'
+            '"zero_mlp_layers":[0],'
+            '"final_token":"London","final_prob":0.30}',
             'data: {"type":"done","total_results":2}',
         ]
         mock_client.stream.return_value = mock_response
@@ -116,8 +122,8 @@ def test_remote_batch_ablate_parses_sse_stream():
 
 def test_remote_finetune_parses_sse_stream():
     """Mock finetune SSE stream and verify parsed events."""
-    with patch("httpx.Client") as MockClient:
-        mock_client = MockClient.return_value
+    with patch("httpx.Client") as mock_cls:
+        mock_client = mock_cls.return_value
 
         mock_response = MagicMock()
         mock_response.__enter__ = MagicMock(return_value=mock_response)
@@ -161,10 +167,10 @@ def test_remote_finetune_parses_sse_stream():
 
 def test_remote_connection_error():
     """Verify httpx.ConnectError propagates from RemoteWorker.health()."""
-    with patch("httpx.Client") as MockClient:
+    with patch("httpx.Client") as mock_cls:
         import httpx
 
-        mock_client = MockClient.return_value
+        mock_client = mock_cls.return_value
         mock_client.get.side_effect = httpx.ConnectError("Connection refused")
 
         from neurotrace.remote import RemoteWorker

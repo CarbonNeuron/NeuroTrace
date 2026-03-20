@@ -8,17 +8,15 @@ import pytest
 
 from neurotrace.heatmap import (
     HeatmapCell,
-    HeatmapLayerSummary,
     HeatmapResult,
+    _compute_flip_direction,
     build_layer_summaries,
     check_correct,
     generate_heatmap_html,
     heatmap_result_from_dict,
     heatmap_result_to_dict,
-    _compute_flip_direction,
 )
 from neurotrace.storage import TraceDB
-
 
 # ---------------------------------------------------------------------------
 # Helper
@@ -52,7 +50,11 @@ def _make_cell(
 def _make_result(cells=None, num_prompts=2, num_layers=3):
     """Build a small HeatmapResult for testing."""
     if cells is None:
-        cells = [_make_cell(p, l) for p in range(num_prompts) for l in range(num_layers)]
+        cells = [
+            _make_cell(p, li)
+            for p in range(num_prompts)
+            for li in range(num_layers)
+        ]
     summaries = build_layer_summaries(cells, num_layers, num_prompts)
     return HeatmapResult(
         run_id="test-run-001",
@@ -137,7 +139,10 @@ class TestComputeFlipDirection:
 
 class TestHeatmapCellCreation:
     def test_all_fields(self):
-        cell = _make_cell(0, 5, flip_direction="broke", baseline_correct=True, ablated_correct=False)
+        cell = _make_cell(
+            0, 5, flip_direction="broke",
+            baseline_correct=True, ablated_correct=False,
+        )
         assert cell.prompt_index == 0
         assert cell.prompt == "prompt 0"
         assert cell.expected_answer == "Paris"
@@ -157,12 +162,24 @@ class TestBuildLayerSummaries:
     def test_counts_and_impact(self):
         cells = [
             # prompt 0
-            _make_cell(0, 0, flip_direction="fixed", baseline_correct=False, ablated_correct=True),
-            _make_cell(0, 1, flip_direction="broke", baseline_correct=True, ablated_correct=False),
+            _make_cell(
+                0, 0, flip_direction="fixed",
+                baseline_correct=False, ablated_correct=True,
+            ),
+            _make_cell(
+                0, 1, flip_direction="broke",
+                baseline_correct=True, ablated_correct=False,
+            ),
             _make_cell(0, 2, flip_direction="none"),
             # prompt 1
-            _make_cell(1, 0, flip_direction="fixed", baseline_correct=False, ablated_correct=True),
-            _make_cell(1, 1, flip_direction="changed", baseline_correct=False, ablated_correct=False),
+            _make_cell(
+                1, 0, flip_direction="fixed",
+                baseline_correct=False, ablated_correct=True,
+            ),
+            _make_cell(
+                1, 1, flip_direction="changed",
+                baseline_correct=False, ablated_correct=False,
+            ),
             _make_cell(1, 2, flip_direction="none"),
         ]
         summaries = build_layer_summaries(cells, num_layers=3, num_prompts=2)
@@ -201,9 +218,18 @@ class TestHeatmapImpactScore:
     def test_impact_formula(self):
         """impact_score = (fixes - breaks) / total"""
         cells = [
-            _make_cell(0, 0, flip_direction="fixed", baseline_correct=False, ablated_correct=True),
-            _make_cell(1, 0, flip_direction="broke", baseline_correct=True, ablated_correct=False),
-            _make_cell(2, 0, flip_direction="broke", baseline_correct=True, ablated_correct=False),
+            _make_cell(
+                0, 0, flip_direction="fixed",
+                baseline_correct=False, ablated_correct=True,
+            ),
+            _make_cell(
+                1, 0, flip_direction="broke",
+                baseline_correct=True, ablated_correct=False,
+            ),
+            _make_cell(
+                2, 0, flip_direction="broke",
+                baseline_correct=True, ablated_correct=False,
+            ),
             _make_cell(3, 0, flip_direction="none"),
         ]
         summaries = build_layer_summaries(cells, num_layers=1, num_prompts=4)
@@ -231,7 +257,9 @@ class TestHeatmapJsonRoundtrip:
             assert orig_cell.prompt_index == rest_cell.prompt_index
             assert orig_cell.layer == rest_cell.layer
             assert orig_cell.flip_direction == rest_cell.flip_direction
-            assert orig_cell.delta_correct_prob == pytest.approx(rest_cell.delta_correct_prob)
+            assert orig_cell.delta_correct_prob == pytest.approx(
+                rest_cell.delta_correct_prob,
+            )
 
         for orig_s, rest_s in zip(original.layer_summaries, restored.layer_summaries):
             assert orig_s.layer == rest_s.layer
@@ -263,7 +291,9 @@ class TestHeatmapDbRoundtrip:
 
             result = _make_result()
             cells_json = json.dumps(heatmap_result_to_dict(result)["cells"])
-            summaries_json = json.dumps(heatmap_result_to_dict(result)["layer_summaries"])
+            summaries_json = json.dumps(
+                heatmap_result_to_dict(result)["layer_summaries"],
+            )
 
             db.write_heatmap_run(
                 run_id=result.run_id,

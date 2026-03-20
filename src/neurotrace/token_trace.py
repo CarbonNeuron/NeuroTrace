@@ -8,7 +8,6 @@ from typing import Any
 
 import numpy as np
 
-
 # ---------------------------------------------------------------------------
 # Data structures
 # ---------------------------------------------------------------------------
@@ -681,7 +680,7 @@ def generate_token_trace_html_single(
     if has_competitor:
         competitor_heatmap = (
             "<h2>Competitor Projection</h2>"
-            f'<div class="chart-container">'
+            '<div class="chart-container">'
             + _render_heatmap_svg(
                 result.entries, tokens, layers,
                 value_key="competitor_projection",

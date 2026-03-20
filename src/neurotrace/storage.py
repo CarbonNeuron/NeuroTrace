@@ -907,7 +907,9 @@ class TraceDB:
             ],
         )
 
-    def save_circuit(self, circuit_id: str, result, probe_id: str | None = None) -> None:
+    def save_circuit(
+        self, circuit_id: str, result, probe_id: str | None = None,
+    ) -> None:
         """Save a circuit analysis result to the database."""
         import json
 

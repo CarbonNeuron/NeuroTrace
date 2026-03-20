@@ -3397,10 +3397,22 @@ def probe(
     "--probe-dir", required=True,
     help="Path to probe output directory (contains mean_direction.npy).",
 )
-@click.option("--layer", default=None, type=int, help="MLP layer to decompose (default: auto from probe metadata).")
-@click.option("--top-k", default=30, type=int, help="Number of top tokens to show.")
-@click.option("--reverse-tokens", default=None, help="Comma-separated tokens to trace backwards through MLP.")
-@click.option("--compare-prompt", multiple=True, help="Compare MLP behavior on a specific prompt vs the direction.")
+@click.option(
+    "--layer", default=None, type=int,
+    help="MLP layer to decompose (default: auto from probe).",
+)
+@click.option(
+    "--top-k", default=30, type=int,
+    help="Number of top tokens to show.",
+)
+@click.option(
+    "--reverse-tokens", default=None,
+    help="Comma-separated tokens to trace backwards.",
+)
+@click.option(
+    "--compare-prompt", multiple=True,
+    help="Compare MLP behavior on a prompt vs direction.",
+)
 @click.option("--seed", default=42, type=int, help="Random seed.")
 @click.option("--output", default=None, help="Output directory.")
 @click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
@@ -3618,7 +3630,10 @@ def circuit(
             console.print(f"  Top MLP-boosted: {real_top}")
 
         for pw in rc.pairwise:
-            console.print(f"\n[bold]Diff:[/bold] \"{pw.prompt_a}\" vs \"{pw.prompt_b}\"")
+            console.print(
+                f'\n[bold]Diff:[/bold] "{pw.prompt_a}"'
+                f' vs "{pw.prompt_b}"'
+            )
             console.print(
                 f"  Cosine sim: {pw.cosine_similarity:.4f} | "
                 f"Norm ratio: {pw.norm_ratio:.4f}"
@@ -3803,7 +3818,7 @@ def heatmap(
     adapter,
     seed,
 ):
-    """Generate MLP ablation heatmap: zero each MLP layer, measure prediction changes."""
+    """Generate MLP ablation heatmap: zero each layer, measure changes."""
     import uuid
     from datetime import datetime, timezone
 
