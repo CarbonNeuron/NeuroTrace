@@ -82,6 +82,26 @@ class RemoteWorker:
                 if line.startswith("data: "):
                     yield json.loads(line[6:])
 
+    def forward_states_stream(
+        self, prompts: list[str], seed: int = 42
+    ) -> Generator[dict, None, None]:
+        """Stream forward-pass hidden states via SSE.
+
+        Yields parsed event dicts with types: progress, states, done.
+        The 'states' event contains base64-encoded float32 data for
+        all layers' last-token hidden states: shape [num_layers, hidden_dim].
+        """
+        with self.client.stream(
+            "POST",
+            f"{self.base_url}/forward-states",
+            json={"prompts": prompts, "seed": seed},
+            timeout=600.0,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line.startswith("data: "):
+                    yield json.loads(line[6:])
+
     def finetune_stream(self, config: dict) -> Generator[dict, None, None]:
         """Stream finetune progress via SSE. Yields parsed event dicts."""
         with self.client.stream(

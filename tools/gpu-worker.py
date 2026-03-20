@@ -259,6 +259,11 @@ class ExtractActivationsRequest(BaseModel):
     seed: int = 42
 
 
+class ForwardStatesRequest(BaseModel):
+    prompts: list[str]
+    seed: int = 42
+
+
 class DatasetEntry(BaseModel):
     prompt: str
     answer: str
@@ -459,6 +464,81 @@ def batch_ablate(req: BatchAblateRequest) -> StreamingResponse:
         yield _sse_line({"type": "done", "total_results": total})
 
     return StreamingResponse(_generate(), media_type="text/event-stream")
+
+
+@app.post("/forward-states")
+def forward_states(req: ForwardStatesRequest) -> StreamingResponse:
+    """Return all layers' last-token hidden states for each prompt via SSE."""
+    assert _model is not None and _tokenizer is not None and _device is not None
+
+    import base64
+
+    import numpy as np
+
+    async def _generate():
+        layers = _get_transformer_layers()
+        total = len(req.prompts)
+
+        for idx, prompt in enumerate(req.prompts):
+            yield _sse_line({
+                "type": "progress",
+                "current": idx + 1,
+                "total": total,
+            })
+
+            torch.manual_seed(req.seed)
+            inputs = _tokenizer(prompt, return_tensors="pt").to(_device)
+
+            captured: dict[int, torch.Tensor] = {}
+            hooks: list[torch.utils.hooks.RemovableHandle] = []
+
+            for layer_idx in range(len(layers)):
+                def _make_hook(li: int):
+                    def hook_fn(
+                        module: torch.nn.Module,
+                        input: Any,
+                        output: Any,
+                    ) -> None:
+                        out = output[0] if isinstance(output, tuple) else output
+                        captured[li] = out[:, -1, :].detach().cpu().float()
+                    return hook_fn
+
+                h = layers[layer_idx].register_forward_hook(
+                    _make_hook(layer_idx)
+                )
+                hooks.append(h)
+
+            try:
+                with torch.no_grad():
+                    _model(**inputs)
+            finally:
+                for h in hooks:
+                    h.remove()
+
+            # Stack all layers: [num_layers, hidden_dim]
+            layer_states = []
+            for li in range(len(layers)):
+                if li in captured:
+                    layer_states.append(captured[li][0].numpy())
+
+            stacked = np.stack(layer_states).astype(np.float32)
+            encoded = base64.b64encode(stacked.tobytes()).decode("ascii")
+
+            yield _sse_line({
+                "type": "states",
+                "prompt_idx": idx,
+                "shape": list(stacked.shape),
+                "dtype": "float32",
+                "hidden_states": encoded,
+            })
+
+            await asyncio.sleep(0)
+
+        yield _sse_line({"type": "done", "total": total})
+
+    return StreamingResponse(
+        _generate(), media_type="text/event-stream"
+    )
 
 
 @app.post("/extract-activations")

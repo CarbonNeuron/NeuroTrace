@@ -4365,3 +4365,338 @@ def _probe_universal_remote(
             rows.append(arr)
 
     return np.stack(rows)
+
+
+@cli.command()
+@click.option("--model", default=None, help="HuggingFace model name (local mode).")
+@click.option("--db", required=True, help="Path to DuckDB database file.")
+@click.option(
+    "--dataset-builtin",
+    default=None,
+    help="Built-in dataset name (e.g. 'capitals').",
+)
+@click.option(
+    "--dataset",
+    "dataset_path",
+    default=None,
+    type=click.Path(exists=True),
+    help="Custom JSONL dataset path.",
+)
+@click.option("--prompt", default=None, help="Single prompt to analyze.")
+@click.option("--answer", default=None, help="Expected answer for --prompt.")
+@click.option(
+    "--remote", default=None, help="GPU worker URL (e.g., http://172.30.0.1:8877)."
+)
+@click.option(
+    "--device", default="cpu", help="Device: cpu, cuda, directml, auto."
+)
+@click.option(
+    "--threshold", default=0.7, type=float,
+    help="Recovery ratio threshold for vulnerability (default: 0.7).",
+)
+@click.option("--html", "html_path", default=None, help="HTML report output path.")
+@click.option("--json", "output_json", is_flag=True, help="JSON output.")
+@click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option("--seed", default=42, type=int, help="Random seed.")
+def commitment(
+    model,
+    db,
+    dataset_builtin,
+    dataset_path,
+    prompt,
+    answer,
+    remote,
+    device,
+    threshold,
+    html_path,
+    output_json,
+    adapter,
+    seed,
+):
+    """Measure how strongly the model commits to the correct answer at each layer."""
+    import uuid
+    from datetime import datetime, timezone
+
+    from neurotrace.commitment import (
+        CommitmentRun,
+        commitment_run_to_dict,
+        generate_commitment_html,
+        validate_against_heatmap,
+    )
+
+    # Validate inputs
+    has_dataset = dataset_path is not None or dataset_builtin is not None
+    has_single = prompt is not None
+    if not has_dataset and not has_single:
+        raise click.UsageError(
+            "Must provide --dataset/--dataset-builtin or --prompt/--answer."
+        )
+    if has_dataset and has_single:
+        raise click.UsageError(
+            "Cannot provide both dataset and --prompt/--answer."
+        )
+    if has_single and answer is None:
+        raise click.UsageError("--answer is required with --prompt.")
+    if remote is None and model is None:
+        raise click.UsageError("Must provide --model (local mode) or --remote.")
+
+    # Build prompt list
+    if has_single:
+        prompts = [{"prompt": prompt, "answer": answer}]
+        dataset_name = "single"
+    else:
+        from neurotrace.datasets import get_builtin_dataset, load_dataset
+
+        if dataset_builtin is not None:
+            dataset = get_builtin_dataset(dataset_builtin)
+            dataset_name = dataset_builtin
+        else:
+            dataset = load_dataset(dataset_path)
+            dataset_name = dataset_path
+        prompts = [{"prompt": d["prompt"], "answer": d["answer"]} for d in dataset]
+
+    run_id = str(uuid.uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    if remote is not None:
+        results = _commitment_remote(
+            remote, prompts, seed, threshold, model,
+        )
+        from neurotrace.remote import RemoteWorker
+
+        worker = RemoteWorker(remote)
+        health = worker.health()
+        model_name = health["model"]
+        num_layers = health["num_layers"]
+    else:
+        from neurotrace.commitment import run_commitment_local
+        from neurotrace.models import get_architecture, load_model
+
+        device = _resolve_device(device)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=err_console,
+        ) as progress:
+            task = progress.add_task("Loading model...", total=None)
+            model_obj, tokenizer = load_model(model, device=device)
+            model_obj = _maybe_load_adapter(model_obj, adapter)
+            arch = get_architecture(model_obj.config.model_type)
+            num_layers = len(arch.get_layers(model_obj))
+            model_name = model
+
+            progress.update(
+                task,
+                description=(
+                    f"Commitment scan: {len(prompts)} prompts x {num_layers} layers"
+                ),
+                total=len(prompts),
+            )
+
+            def progress_cb(prompt_idx, n_prompts):
+                progress.update(
+                    task,
+                    completed=prompt_idx,
+                    description=(
+                        f"Prompt {prompt_idx + 1}/{n_prompts}"
+                    ),
+                )
+
+            results = run_commitment_local(
+                model_obj,
+                tokenizer,
+                arch,
+                prompts,
+                seed=seed,
+                threshold=threshold,
+                progress_callback=progress_cb,
+            )
+            progress.update(task, description="Done.", completed=len(prompts))
+
+    # Build run object
+    run = CommitmentRun(
+        run_id=run_id,
+        dataset_name=dataset_name,
+        model_name=model_name,
+        num_layers=num_layers,
+        num_prompts=len(prompts),
+        threshold=threshold,
+        results=results,
+        created_at=created_at,
+    )
+
+    # Cross-validate against heatmap if available
+    db_conn = TraceDB(db)
+    try:
+        heatmap_runs = db_conn.get_all_heatmap_runs()
+        matching = [
+            r for r in heatmap_runs
+            if r["dataset_name"] == dataset_name
+        ]
+        if matching:
+            run.validation = validate_against_heatmap(
+                results, matching[0]["cells"]
+            )
+    except Exception:
+        pass  # No heatmap data, skip validation
+
+    # Save to DB
+    run_dict = commitment_run_to_dict(run)
+    db_conn.write_commitment_run(
+        run_id=run_id,
+        dataset_name=dataset_name,
+        model_name=model_name,
+        n_prompts=len(prompts),
+        n_vulnerable=run_dict["n_vulnerable"],
+        n_robust=run_dict["n_robust"],
+        threshold=threshold,
+        avg_commitment_score=run_dict["avg_commitment_score"],
+    )
+    for r in results:
+        db_conn.write_commitment_result(
+            run_id=run_id,
+            prompt=r.prompt,
+            answer=r.answer,
+            peak_prob=r.peak_prob,
+            peak_layer=r.peak_layer,
+            final_prob=r.final_prob,
+            recovery_ratio=r.recovery_ratio,
+            vulnerable=r.vulnerable,
+            trajectory=json.dumps(r.trajectory),
+        )
+    db_conn.close()
+
+    # HTML output
+    if html_path:
+        import os
+
+        os.makedirs(os.path.dirname(html_path) or ".", exist_ok=True)
+        html = generate_commitment_html(run)
+        with open(html_path, "w") as f:
+            f.write(html)
+        console.print(f"[green]Report saved to {html_path}[/green]")
+
+    # JSON output
+    if output_json:
+        click.echo(json.dumps(run_dict, indent=2))
+        return
+
+    # Terminal output
+    n_vulnerable = run_dict["n_vulnerable"]
+    n_robust = run_dict["n_robust"]
+    console.print(
+        f"\n[bold]Commitment Analysis:[/bold] {dataset_name} "
+        f"({len(prompts)} prompts)"
+    )
+    console.print(
+        f"Model: {model_name} | Threshold: {threshold}"
+    )
+    console.print(
+        f"[green]{n_robust} robust[/green] | "
+        f"[red]{n_vulnerable} vulnerable[/red] | "
+        f"Avg commitment: {run_dict['avg_commitment_score']:.3f}\n"
+    )
+
+    table = Table()
+    table.add_column("Prompt", max_width=50)
+    table.add_column("Answer")
+    table.add_column("Peak", justify="right")
+    table.add_column("PkLyr", justify="right")
+    table.add_column("Final", justify="right")
+    table.add_column("Recovery", justify="right")
+    table.add_column("Status")
+
+    for r in results:
+        style = "red" if r.vulnerable else "green"
+        status = "VULN" if r.vulnerable else "OK"
+        table.add_row(
+            r.prompt[:50],
+            r.answer,
+            f"{r.peak_prob:.3f}",
+            str(r.peak_layer),
+            f"{r.final_prob:.3f}",
+            f"{r.recovery_ratio:.3f}",
+            status,
+            style=style,
+        )
+    console.print(table)
+
+    if run.validation:
+        v = run.validation
+        console.print(
+            f"\n[bold]Heatmap Validation:[/bold] "
+            f"TP={v['tp']} FP={v['fp']} FN={v['fn']} TN={v['tn']} "
+            f"Accuracy={v['accuracy']:.1%}"
+        )
+        if v.get("auc_roc") is not None:
+            console.print(f"AUC-ROC: {v['auc_roc']:.4f}")
+
+
+def _commitment_remote(remote_url, prompts, seed, threshold, model_name_hint):
+    """Run commitment analysis via remote GPU worker."""
+    import base64
+
+    import numpy as np
+
+    from neurotrace.commitment import run_commitment_remote
+    from neurotrace.models import get_lm_head_and_norm, load_model
+    from neurotrace.remote import RemoteWorker
+
+    worker = RemoteWorker(remote_url)
+    health = worker.health()
+    device_name = health.get("device_name", health.get("device", "unknown"))
+    model_name = health["model"]
+
+    err_console.print(f"GPU: {device_name} via {remote_url}")
+
+    # Fetch hidden states from remote
+    prompt_texts = [p["prompt"] for p in prompts]
+    hidden_states_list = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task(
+            "Fetching hidden states...", total=len(prompts),
+        )
+
+        for event in worker.forward_states_stream(prompt_texts, seed=seed):
+            etype = event.get("type")
+            if etype == "progress":
+                progress.update(
+                    task,
+                    completed=event.get("current", 0),
+                    description=(
+                        f"Fetching states {event.get('current', 0)}"
+                        f"/{event.get('total', len(prompts))}..."
+                    ),
+                )
+            elif etype == "states":
+                raw = base64.b64decode(event["hidden_states"])
+                shape = event["shape"]
+                arr = np.frombuffer(raw, dtype=np.float32).copy().reshape(shape)
+                hidden_states_list.append(arr)
+
+        progress.update(task, description="Loading lm_head locally...")
+
+        # Load just model for lm_head + norm (from HF cache)
+        model_obj, tokenizer = load_model(model_name, device="cpu")
+        lm_head, final_ln = get_lm_head_and_norm(model_obj)
+
+        progress.update(task, description="Computing commitment scores...")
+
+        lm_head_weight = lm_head.weight.data
+
+        results = run_commitment_remote(
+            hidden_states_list,
+            lm_head_weight,
+            final_ln,
+            tokenizer,
+            prompts,
+            threshold=threshold,
+        )
+        progress.update(task, description="Done.")
+
+    return results

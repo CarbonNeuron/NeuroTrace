@@ -217,6 +217,37 @@ class TraceDB:
         """)
 
         self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS commitment_runs (
+                run_id TEXT PRIMARY KEY,
+                dataset_name TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                n_prompts INTEGER NOT NULL,
+                n_vulnerable INTEGER NOT NULL,
+                n_robust INTEGER NOT NULL,
+                threshold REAL NOT NULL,
+                avg_commitment_score REAL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        self._conn.execute(
+            "CREATE SEQUENCE IF NOT EXISTS commitment_seq START 1"
+        )
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS commitment_results (
+                id INTEGER DEFAULT nextval('commitment_seq'),
+                run_id TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                peak_prob REAL,
+                peak_layer INTEGER,
+                final_prob REAL,
+                recovery_ratio REAL,
+                vulnerable BOOLEAN,
+                trajectory JSON
+            )
+        """)
+
+        self._conn.execute("""
             CREATE TABLE IF NOT EXISTS universal_probes (
                 id TEXT PRIMARY KEY,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -900,6 +931,107 @@ class TraceDB:
                 output_path,
             ],
         )
+
+    def write_commitment_run(
+        self,
+        run_id: str,
+        dataset_name: str,
+        model_name: str,
+        n_prompts: int,
+        n_vulnerable: int,
+        n_robust: int,
+        threshold: float,
+        avg_commitment_score: float,
+    ) -> None:
+        """Write a commitment run to the database."""
+        self._conn.execute(
+            "INSERT INTO commitment_runs VALUES"
+            " (?, ?, ?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP)",
+            [
+                run_id,
+                dataset_name,
+                model_name,
+                n_prompts,
+                n_vulnerable,
+                n_robust,
+                threshold,
+                avg_commitment_score,
+            ],
+        )
+
+    def write_commitment_result(
+        self,
+        run_id: str,
+        prompt: str,
+        answer: str,
+        peak_prob: float,
+        peak_layer: int,
+        final_prob: float,
+        recovery_ratio: float,
+        vulnerable: bool,
+        trajectory: str,
+    ) -> None:
+        """Write a single commitment result to the database."""
+        self._conn.execute(
+            "INSERT INTO commitment_results"
+            " (run_id, prompt, answer, peak_prob, peak_layer,"
+            "  final_prob, recovery_ratio, vulnerable, trajectory)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                run_id,
+                prompt,
+                answer,
+                peak_prob,
+                peak_layer,
+                final_prob,
+                recovery_ratio,
+                vulnerable,
+                trajectory,
+            ],
+        )
+
+    def read_commitment_run(self, run_id: str) -> dict:
+        """Read a commitment run from the database."""
+        row = self._conn.execute(
+            "SELECT * FROM commitment_runs WHERE run_id = ?", [run_id]
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Commitment run not found: {run_id}")
+        cols = [
+            "run_id", "dataset_name", "model_name",
+            "n_prompts", "n_vulnerable", "n_robust",
+            "threshold", "avg_commitment_score", "created_at",
+        ]
+        return dict(zip(cols, row))
+
+    def read_commitment_results(self, run_id: str) -> list[dict]:
+        """Read commitment results for a run."""
+        rows = self._conn.execute(
+            "SELECT * FROM commitment_results WHERE run_id = ?"
+            " ORDER BY id",
+            [run_id],
+        ).fetchall()
+        cols = [
+            "id", "run_id", "prompt", "answer",
+            "peak_prob", "peak_layer", "final_prob",
+            "recovery_ratio", "vulnerable", "trajectory",
+        ]
+        return [dict(zip(cols, r)) for r in rows]
+
+    def list_commitment_runs(self) -> list[dict]:
+        """List all commitment runs."""
+        rows = self._conn.execute(
+            "SELECT run_id, dataset_name, model_name,"
+            " n_prompts, n_vulnerable, n_robust,"
+            " threshold, avg_commitment_score, created_at"
+            " FROM commitment_runs ORDER BY created_at DESC"
+        ).fetchall()
+        cols = [
+            "run_id", "dataset_name", "model_name",
+            "n_prompts", "n_vulnerable", "n_robust",
+            "threshold", "avg_commitment_score", "created_at",
+        ]
+        return [dict(zip(cols, r)) for r in rows]
 
     def close(self) -> None:
         self._conn.close()
