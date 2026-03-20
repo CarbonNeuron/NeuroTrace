@@ -270,6 +270,13 @@ class ForwardMlpDeltasRequest(BaseModel):
     seed: int = 42
 
 
+class AttributeGradientsRequest(BaseModel):
+    prompts: list[str]
+    layer: int
+    target_token_ids: list[int]
+    seed: int = 42
+
+
 class DatasetEntry(BaseModel):
     prompt: str
     answer: str
@@ -700,6 +707,115 @@ def forward_mlp_deltas(req: ForwardMlpDeltasRequest) -> StreamingResponse:
     return StreamingResponse(
         _generate(), media_type="text/event-stream"
     )
+
+
+@app.post("/attribute-gradients")
+def attribute_gradients(req: AttributeGradientsRequest) -> StreamingResponse:
+    """Compute gradient-based token attribution for MLP delta projections."""
+    assert _model is not None and _tokenizer is not None and _device is not None
+
+    async def _generate():
+        model_layers = _get_transformer_layers()
+        total = len(req.prompts)
+
+        if req.layer >= len(model_layers):
+            n = len(model_layers)
+            yield _sse_line({
+                "type": "error",
+                "message": (
+                    f"Layer {req.layer} out of range"
+                    f" (model has {n} layers)"
+                ),
+            })
+            return
+
+        for idx, prompt in enumerate(req.prompts):
+            yield _sse_line({
+                "type": "progress",
+                "current": idx + 1,
+                "total": total,
+            })
+
+            if idx < len(req.target_token_ids):
+                target_token_id = req.target_token_ids[idx]
+            else:
+                target_token_id = req.target_token_ids[0]
+
+            torch.manual_seed(req.seed)
+            inputs = _tokenizer(prompt, return_tensors="pt").to(_device)
+
+            # Get embeddings with grad tracking
+            embeddings = _model.model.embed_tokens(inputs.input_ids)
+            embeddings = embeddings.detach().requires_grad_(True)
+
+            # Hook target layer's MLP
+            mlp_delta: dict[str, torch.Tensor] = {}
+
+            def hook_fn(module, inp, out):
+                inp_t = inp[0] if isinstance(inp, tuple) else inp
+                out_t = out if not isinstance(out, tuple) else out[0]
+                mlp_delta["input"] = inp_t
+                mlp_delta["output"] = out_t
+
+            handle = model_layers[req.layer].mlp.register_forward_hook(hook_fn)
+
+            try:
+                _model.model(
+                    inputs_embeds=embeddings,
+                    attention_mask=inputs.attention_mask,
+                )
+            finally:
+                handle.remove()
+
+            # Compute MLP delta at last token position
+            delta = mlp_delta["output"][:, -1, :] - mlp_delta["input"][:, -1, :]
+
+            # Get target direction from lm_head
+            target_dir = _model.lm_head.weight[target_token_id].detach().float()
+            target_dir = target_dir / target_dir.norm()
+
+            # Scalar projection
+            projection = (delta.float() * target_dir).sum()
+
+            # Backprop to embeddings
+            projection.backward()
+
+            # Attribution = gradient magnitude at each position
+            grads = embeddings.grad[0]  # [seq_len, hidden_dim]
+            grad_magnitudes = grads.norm(dim=-1).detach().cpu().numpy()  # [seq_len]
+
+            # Decode tokens
+            token_ids = inputs.input_ids[0].tolist()
+            tokens = [_tokenizer.decode([tid]) for tid in token_ids]
+            target_token = _tokenizer.decode([target_token_id])
+
+            # Normalize
+            total_mag = float(grad_magnitudes.sum())
+            if total_mag > 1e-10:
+                normalized = (grad_magnitudes / total_mag).tolist()
+            else:
+                n = len(grad_magnitudes)
+                normalized = [1.0 / n] * n if n > 0 else []
+
+            yield _sse_line({
+                "type": "attribution",
+                "prompt_idx": idx,
+                "prompt": prompt,
+                "layer": req.layer,
+                "target_token": target_token,
+                "target_token_id": target_token_id,
+                "token_attributions": [
+                    {"position": i, "token": t, "attribution": round(a, 6)}
+                    for i, (t, a) in enumerate(zip(tokens, normalized))
+                ],
+                "method": "gradient",
+            })
+
+            await asyncio.sleep(0)
+
+        yield _sse_line({"type": "done", "total": total})
+
+    return StreamingResponse(_generate(), media_type="text/event-stream")
 
 
 @app.post("/finetune")

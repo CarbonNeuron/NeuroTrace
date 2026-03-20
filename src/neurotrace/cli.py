@@ -5102,3 +5102,481 @@ def _contrast_remote(
         progress.update(task, description="Done.")
 
     return cells, domain_deltas
+
+
+@cli.command()
+@click.option("--model", default=None, help="HuggingFace model name (local mode).")
+@click.option("--db", required=True, help="Path to DuckDB database file.")
+@click.option("--prompt", "prompt_text", default=None, help="Single prompt to analyze.")
+@click.option(
+    "--dataset-builtin", default=None,
+    help="Built-in dataset name (e.g. 'capitals').",
+)
+@click.option(
+    "--dataset", "dataset_path", default=None,
+    help="Custom JSONL dataset path.",
+)
+@click.option("--layer", required=True, type=int, help="Layer index to analyze.")
+@click.option(
+    "--target", required=True,
+    help="Target: 'answer', 'competitor', 'both', or a literal token.",
+)
+@click.option(
+    "--method", default="gradient", type=click.Choice(["gradient", "ablation"]),
+    help="Attribution method.",
+)
+@click.option(
+    "--remote", default=None,
+    help="GPU worker URL (e.g., http://172.30.0.1:8877).",
+)
+@click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
+@click.option("--html", "html_path", default=None, help="HTML report output path.")
+@click.option("--json", "output_json", is_flag=True, help="JSON output.")
+@click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option("--seed", default=42, type=int, help="Random seed.")
+def attribute(
+    model,
+    db,
+    prompt_text,
+    dataset_builtin,
+    dataset_path,
+    layer,
+    target,
+    method,
+    remote,
+    device,
+    html_path,
+    output_json,
+    adapter,
+    seed,
+):
+    """Compute which input tokens most influence MLP behavior at a layer."""
+    import uuid
+    from datetime import datetime, timezone
+
+    from neurotrace.attribute import (
+        AttributionRun,
+        aggregate_attributions,
+        attribution_run_to_dict,
+        generate_attribution_html,
+    )
+
+    if remote is None and model is None:
+        raise click.UsageError("Must provide --model (local mode) or --remote.")
+
+    if prompt_text is None and dataset_builtin is None and dataset_path is None:
+        raise click.UsageError(
+            "Must provide --prompt, --dataset-builtin, or --dataset."
+        )
+
+    # Build prompt list
+    prompts: list[dict] = []
+    dataset_name = None
+
+    if prompt_text is not None:
+        prompts = [{"prompt": prompt_text, "answer": ""}]
+    elif dataset_builtin is not None:
+        from neurotrace.datasets import get_builtin_dataset
+
+        prompts = get_builtin_dataset(dataset_builtin)
+        dataset_name = dataset_builtin
+    elif dataset_path is not None:
+        from neurotrace.datasets import load_dataset
+
+        prompts = load_dataset(dataset_path)
+        dataset_name = dataset_path
+
+    # Load commitment data for competitor/answer token resolution
+    db_conn = TraceDB(db)
+    commitment_data: dict[str, dict] = {}
+    try:
+        for run_info in db_conn.list_commitment_runs():
+            results = db_conn.read_commitment_results(run_info["run_id"])
+            for r in results:
+                commitment_data[r["prompt"]] = {
+                    "competitor_token": r["competitor_token"] or "",
+                    "answer": r["answer"],
+                }
+    except Exception:
+        pass
+
+    run_id = str(uuid.uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    # Determine target directions to run
+    target_directions = []
+    if target == "both":
+        target_directions = ["answer", "competitor"]
+    else:
+        target_directions = [target]
+
+    all_results = []
+
+    for target_dir in target_directions:
+        if remote is not None:
+            dir_results = _attribute_remote(
+                remote, prompts, layer, target_dir, method,
+                commitment_data, seed, model,
+            )
+            from neurotrace.remote import RemoteWorker
+
+            worker = RemoteWorker(remote)
+            health = worker.health()
+            model_name = health["model"]
+        else:
+            from neurotrace.attribute import (
+                run_attribution_ablation_local,
+                run_attribution_gradient_local,
+            )
+            from neurotrace.models import get_architecture, load_model
+
+            device = _resolve_device(device)
+            with Progress(
+                SpinnerColumn(),
+                TextColumn("[progress.description]{task.description}"),
+                console=err_console,
+            ) as progress:
+                task = progress.add_task("Loading model...", total=None)
+                model_obj, tokenizer = load_model(model, device=device)
+                model_obj = _maybe_load_adapter(model_obj, adapter)
+                arch = get_architecture(model_obj.config.model_type)
+                model_name = model
+
+                progress.update(
+                    task,
+                    description=f"Attribution: {len(prompts)} prompts @ L{layer}",
+                    total=len(prompts),
+                )
+
+                dir_results = []
+                for i, entry in enumerate(prompts):
+                    progress.update(
+                        task, completed=i,
+                        description=f"Processing {i + 1}/{len(prompts)}...",
+                    )
+
+                    p = entry["prompt"]
+                    answer = entry.get("answer", "")
+
+                    # Resolve target token
+                    target_token, target_token_id = _resolve_target_token(
+                        tokenizer, p, answer, target_dir, commitment_data,
+                    )
+                    if target_token_id is None:
+                        continue
+
+                    if method == "gradient":
+                        result = run_attribution_gradient_local(
+                            model_obj, tokenizer, arch,
+                            p, layer, target_token_id, target_token,
+                            seed=seed,
+                        )
+                    else:
+                        result = run_attribution_ablation_local(
+                            model_obj, tokenizer, arch,
+                            p, layer, target_token_id, target_token,
+                            seed=seed,
+                        )
+                    dir_results.append(result)
+
+                progress.update(task, description="Done.", completed=len(prompts))
+
+        all_results.extend(dir_results)
+
+    # Build run
+    run = AttributionRun(
+        run_id=run_id,
+        layer=layer,
+        target_direction=target,
+        method=method,
+        model_name=model_name,
+        dataset=dataset_name,
+        results=all_results,
+        created_at=created_at,
+    )
+
+    # Save to DB
+    db_conn.write_attribution_run(
+        run_id=run_id,
+        layer=layer,
+        target_direction=target,
+        method=method,
+        model_name=model_name,
+        dataset=dataset_name,
+    )
+    for r in all_results:
+        for ta in r.token_attributions:
+            db_conn.write_attribution_result(
+                run_id=run_id,
+                prompt=r.prompt,
+                token_position=ta.position,
+                token_text=ta.token,
+                attribution_score=ta.attribution,
+                target_token=r.target_token,
+                target_token_id=r.target_token_id,
+            )
+    db_conn.close()
+
+    # HTML output
+    if html_path:
+        import os
+
+        os.makedirs(os.path.dirname(html_path) or ".", exist_ok=True)
+        html = generate_attribution_html(run)
+        with open(html_path, "w") as f:
+            f.write(html)
+        console.print(f"[green]Report saved to {html_path}[/green]")
+
+    # JSON output
+    result_dict = attribution_run_to_dict(run)
+    if output_json:
+        click.echo(json.dumps(result_dict, indent=2))
+        return
+
+    # Terminal output
+    if len(all_results) == 1:
+        r = all_results[0]
+        console.print(
+            f'\n[bold]Attribution:[/bold] "{r.prompt}" → L{r.layer} MLP '
+            f'→ "{r.target_token}"'
+        )
+        console.print(f"Method: {r.method}\n")
+
+        max_attr = max(ta.attribution for ta in r.token_attributions)
+        for ta in r.token_attributions:
+            bar_len = int(10 * ta.attribution / max_attr) if max_attr > 0 else 0
+            bar = "█" * bar_len + "░" * (10 - bar_len)
+            marker = " ← strongest driver" if ta.attribution == max_attr else ""
+            style = "bold" if ta.attribution == max_attr else ""
+            console.print(
+                f"  {ta.token:<12} {bar}  {ta.attribution:.3f}{marker}",
+                style=style,
+            )
+    elif len(all_results) > 1:
+        console.print(
+            f"\n[bold]Token Attribution Summary:[/bold] "
+            f"{dataset_name or 'custom'} @ L{layer} → {target}"
+        )
+        console.print(f"Method: {method} | {len(all_results)} prompts\n")
+
+        agg = aggregate_attributions(all_results)
+        sorted_tokens = sorted(
+            agg.items(), key=lambda x: x[1]["avg_attribution"], reverse=True,
+        )
+
+        table = Table()
+        table.add_column("Token")
+        table.add_column("Avg Attribution", justify="right")
+        table.add_column("Count", justify="right")
+        table.add_column("Max", justify="right")
+
+        for token, stats in sorted_tokens[:15]:
+            table.add_row(
+                token.strip() or "▁",
+                f"{stats['avg_attribution']:.3f}",
+                f"{int(stats['count'])}",
+                f"{stats['max_attribution']:.3f}",
+            )
+        console.print(table)
+    else:
+        console.print("[yellow]No attribution results computed.[/yellow]")
+
+
+def _resolve_target_token(
+    tokenizer, prompt, answer, target_dir, commitment_data,
+):
+    """Resolve target direction to (token_text, token_id) pair."""
+    if target_dir == "answer":
+        if not answer:
+            answer = commitment_data.get(prompt, {}).get("answer", "")
+        if not answer:
+            return None, None
+        ids = tokenizer.encode(" " + answer, add_special_tokens=False)
+        if not ids:
+            ids = tokenizer.encode(answer, add_special_tokens=False)
+        if ids:
+            return answer, ids[0]
+        return None, None
+    elif target_dir == "competitor":
+        comp = commitment_data.get(prompt, {}).get("competitor_token", "")
+        if not comp:
+            return None, None
+        ids = tokenizer.encode(" " + comp, add_special_tokens=False)
+        if not ids:
+            ids = tokenizer.encode(comp, add_special_tokens=False)
+        if ids:
+            return comp, ids[0]
+        return None, None
+    else:
+        # Literal token text
+        ids = tokenizer.encode(" " + target_dir, add_special_tokens=False)
+        if not ids:
+            ids = tokenizer.encode(target_dir, add_special_tokens=False)
+        if ids:
+            return target_dir, ids[0]
+        return None, None
+
+
+def _attribute_remote(
+    remote_url, prompts, layer, target_dir, method,
+    commitment_data, seed, model_name_hint,
+):
+    """Run attribution analysis via remote GPU worker."""
+    import base64
+
+    import numpy as np
+
+    from neurotrace.attribute import (
+        build_attribution_result,
+        run_attribution_ablation_remote,
+    )
+    from neurotrace.models import get_lm_head_and_norm, load_model
+    from neurotrace.remote import RemoteWorker
+
+    worker = RemoteWorker(remote_url)
+    health = worker.health()
+    device_name = health.get("device_name", health.get("device", "unknown"))
+    model_name = health["model"]
+
+    err_console.print(f"GPU: {device_name} via {remote_url}")
+
+    # Load model locally for tokenizer and lm_head
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task("Loading tokenizer & lm_head...", total=None)
+        model_obj, tokenizer = load_model(model_name, device="cpu")
+        lm_head, _ = get_lm_head_and_norm(model_obj)
+        lm_head_weight = lm_head.weight.data.cpu().float().numpy()
+
+        # Resolve target tokens for each prompt
+        prompt_texts = []
+        target_token_ids = []
+        target_tokens = []
+        valid_entries = []
+
+        for entry in prompts:
+            p = entry["prompt"]
+            answer = entry.get("answer", "")
+            tok_text, tok_id = _resolve_target_token(
+                tokenizer, p, answer, target_dir, commitment_data,
+            )
+            if tok_id is not None:
+                prompt_texts.append(p)
+                target_token_ids.append(tok_id)
+                target_tokens.append(tok_text)
+                valid_entries.append(entry)
+
+        if not prompt_texts:
+            progress.update(task, description="No valid prompts.")
+            return []
+
+        results = []
+
+        if method == "gradient":
+            progress.update(
+                task,
+                description=(
+                    f"Gradient attribution"
+                    f" ({len(prompt_texts)} prompts)..."
+                ),
+                total=len(prompt_texts),
+            )
+
+            for event in worker.attribute_gradients_stream(
+                prompt_texts, layer, target_token_ids, seed=seed,
+            ):
+                etype = event.get("type")
+                if etype == "progress":
+                    progress.update(
+                        task, completed=event.get("current", 0),
+                        description=(
+                            f"Gradient attribution "
+                            f"{event.get('current', 0)}"
+                            f"/{event.get('total', len(prompt_texts))}..."
+                        ),
+                    )
+                elif etype == "attribution":
+                    tokens = [ta["token"] for ta in event["token_attributions"]]
+                    attrs = [ta["attribution"] for ta in event["token_attributions"]]
+                    results.append(build_attribution_result(
+                        prompt=event["prompt"],
+                        tokens=tokens,
+                        attributions=attrs,
+                        layer=layer,
+                        target_token=event["target_token"],
+                        target_token_id=event["target_token_id"],
+                        method="gradient",
+                    ))
+
+        else:
+            # Ablation method: use forward_mlp_deltas_stream
+            # Generate N+1 prompts per original (baseline + one per token)
+            progress.update(
+                task,
+                description="Preparing ablation prompts...",
+            )
+
+            pad_token_id = tokenizer.pad_token_id
+            if pad_token_id is None:
+                pad_token_id = tokenizer.eos_token_id or 0
+
+            for pi, p in enumerate(prompt_texts):
+                progress.update(
+                    task,
+                    description=f"Ablation {pi + 1}/{len(prompt_texts)}...",
+                    total=len(prompt_texts),
+                    completed=pi,
+                )
+
+                token_ids = tokenizer.encode(p)
+                tokens = [tokenizer.decode([tid]) for tid in token_ids]
+
+                # Build ablated prompts
+                all_ablation_prompts = [p]  # baseline first
+                for i in range(len(token_ids)):
+                    ablated = token_ids.copy()
+                    ablated[i] = pad_token_id
+                    all_ablation_prompts.append(tokenizer.decode(ablated))
+
+                # Fetch MLP deltas for all variants
+                mlp_data = [{} for _ in all_ablation_prompts]
+                for event in worker.forward_mlp_deltas_stream(
+                    all_ablation_prompts, layers=[layer], seed=seed,
+                ):
+                    etype = event.get("type")
+                    if etype == "deltas":
+                        pidx_inner = event["prompt_idx"]
+                        dtype = (
+                            np.float16
+                            if event.get("dtype") == "float16"
+                            else np.float32
+                        )
+                        mlp_in = np.frombuffer(
+                            base64.b64decode(event["mlp_input"]),
+                            dtype=dtype,
+                        ).astype(np.float32).copy()
+                        mlp_out = np.frombuffer(
+                            base64.b64decode(event["mlp_output"]),
+                            dtype=dtype,
+                        ).astype(np.float32).copy()
+                        mlp_data[pidx_inner] = {
+                            "mlp_input": mlp_in, "mlp_output": mlp_out,
+                        }
+
+                baseline = mlp_data[0]
+                ablated = mlp_data[1:]
+
+                if baseline and all(d for d in ablated):
+                    result = run_attribution_ablation_remote(
+                        baseline, ablated, lm_head_weight,
+                        tokens, p, layer,
+                        target_token_ids[pi], target_tokens[pi],
+                    )
+                    results.append(result)
+
+        progress.update(task, description="Done.")
+
+    return results

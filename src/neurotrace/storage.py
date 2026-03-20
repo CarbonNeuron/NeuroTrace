@@ -305,6 +305,33 @@ class TraceDB:
             )
         """)
 
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS attribution_runs (
+                run_id TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                layer INTEGER NOT NULL,
+                target_direction TEXT NOT NULL,
+                method TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                dataset TEXT
+            )
+        """)
+        self._conn.execute(
+            "CREATE SEQUENCE IF NOT EXISTS attribution_seq START 1"
+        )
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS attribution_results (
+                id INTEGER DEFAULT nextval('attribution_seq'),
+                run_id TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                token_position INTEGER NOT NULL,
+                token_text TEXT NOT NULL,
+                attribution_score REAL NOT NULL,
+                target_token TEXT NOT NULL,
+                target_token_id INTEGER NOT NULL
+            )
+        """)
+
     def write_trace(
         self, result: TraceResult, interventions: str | None = None
     ) -> None:
@@ -1171,6 +1198,84 @@ class TraceDB:
             " FROM contrast_runs ORDER BY created_at DESC"
         ).fetchall()
         cols = ["run_id", "created_at", "domains", "layers", "model_name"]
+        return [dict(zip(cols, r)) for r in rows]
+
+    def write_attribution_run(
+        self,
+        run_id: str,
+        layer: int,
+        target_direction: str,
+        method: str,
+        model_name: str,
+        dataset: str | None = None,
+    ) -> None:
+        """Write an attribution run to the database."""
+        self._conn.execute(
+            "INSERT INTO attribution_runs VALUES"
+            " (?, CURRENT_TIMESTAMP, ?, ?, ?, ?, ?)",
+            [run_id, layer, target_direction, method, model_name, dataset],
+        )
+
+    def write_attribution_result(
+        self,
+        run_id: str,
+        prompt: str,
+        token_position: int,
+        token_text: str,
+        attribution_score: float,
+        target_token: str,
+        target_token_id: int,
+    ) -> None:
+        """Write a single attribution result to the database."""
+        self._conn.execute(
+            "INSERT INTO attribution_results"
+            " (run_id, prompt, token_position, token_text,"
+            "  attribution_score, target_token, target_token_id)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?)",
+            [
+                run_id, prompt, token_position, token_text,
+                attribution_score, target_token, target_token_id,
+            ],
+        )
+
+    def read_attribution_run(self, run_id: str) -> dict:
+        """Read an attribution run from the database."""
+        row = self._conn.execute(
+            "SELECT * FROM attribution_runs WHERE run_id = ?", [run_id]
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Attribution run not found: {run_id}")
+        cols = [
+            "run_id", "created_at", "layer", "target_direction",
+            "method", "model_name", "dataset",
+        ]
+        return dict(zip(cols, row))
+
+    def read_attribution_results(self, run_id: str) -> list[dict]:
+        """Read attribution results for a run."""
+        rows = self._conn.execute(
+            "SELECT * FROM attribution_results WHERE run_id = ?"
+            " ORDER BY id",
+            [run_id],
+        ).fetchall()
+        cols = [
+            "id", "run_id", "prompt", "token_position",
+            "token_text", "attribution_score",
+            "target_token", "target_token_id",
+        ]
+        return [dict(zip(cols, r)) for r in rows]
+
+    def list_attribution_runs(self) -> list[dict]:
+        """List all attribution runs."""
+        rows = self._conn.execute(
+            "SELECT run_id, created_at, layer, target_direction,"
+            " method, model_name, dataset"
+            " FROM attribution_runs ORDER BY created_at DESC"
+        ).fetchall()
+        cols = [
+            "run_id", "created_at", "layer", "target_direction",
+            "method", "model_name", "dataset",
+        ]
         return [dict(zip(cols, r)) for r in rows]
 
     def close(self) -> None:

@@ -127,6 +127,33 @@ class RemoteWorker:
                 if line.startswith("data: "):
                     yield json.loads(line[6:])
 
+    def attribute_gradients_stream(
+        self,
+        prompts: list[str],
+        layer: int,
+        target_token_ids: list[int],
+        seed: int = 42,
+    ) -> Generator[dict, None, None]:
+        """Stream gradient attribution results via SSE.
+
+        Yields parsed event dicts with types: progress, attribution, done.
+        """
+        with self.client.stream(
+            "POST",
+            f"{self.base_url}/attribute-gradients",
+            json={
+                "prompts": prompts,
+                "layer": layer,
+                "target_token_ids": target_token_ids,
+                "seed": seed,
+            },
+            timeout=600.0,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line.startswith("data: "):
+                    yield json.loads(line[6:])
+
     def finetune_stream(self, config: dict) -> Generator[dict, None, None]:
         """Stream finetune progress via SSE. Yields parsed event dicts."""
         with self.client.stream(
