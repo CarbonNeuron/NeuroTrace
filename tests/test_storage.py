@@ -166,3 +166,33 @@ def test_light_mode_null_blobs(tmp_path):
         # Stats should still be present
         assert snap.mlp_activation_mag is not None
     db.close()
+
+
+def test_resolve_trace_id_by_label(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    db = TraceDB(db_path)
+    db.write_trace(_make_sample_trace())
+
+    resolved = db.resolve_trace_id("test-label")
+    assert resolved == "test-uuid-1234"
+    db.close()
+
+
+def test_resolve_trace_id_by_prefix(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    db = TraceDB(db_path)
+    db.write_trace(_make_sample_trace())
+
+    resolved = db.resolve_trace_id("test-uuid")
+    assert resolved == "test-uuid-1234"
+    db.close()
+
+
+def test_resolve_trace_id_latest(tmp_path):
+    db_path = str(tmp_path / "test.db")
+    db = TraceDB(db_path)
+    db.write_trace(_make_sample_trace())
+
+    resolved = db.resolve_trace_id("latest")
+    assert resolved == "test-uuid-1234"
+    db.close()

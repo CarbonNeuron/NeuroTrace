@@ -212,8 +212,51 @@ class TraceDB:
                 ],
             )
 
+    def resolve_trace_id(self, identifier: str) -> str:
+        """Resolve a label, prefix, or full trace_id to a full trace_id."""
+        if identifier == "latest":
+            return self.get_latest_trace_id()
+
+        # Try exact trace_id match
+        row = self._conn.execute(
+            "SELECT trace_id FROM traces WHERE trace_id = ?",
+            [identifier],
+        ).fetchone()
+        if row:
+            return row[0]
+
+        # Try label match
+        rows = self._conn.execute(
+            "SELECT trace_id FROM traces WHERE label = ?",
+            [identifier],
+        ).fetchall()
+        if len(rows) == 1:
+            return rows[0][0]
+        if len(rows) > 1:
+            raise ValueError(
+                f"Ambiguous label {identifier!r}: matches "
+                f"{len(rows)} traces"
+            )
+
+        # Try prefix match on trace_id
+        rows = self._conn.execute(
+            "SELECT trace_id FROM traces"
+            " WHERE trace_id LIKE ? || '%'",
+            [identifier],
+        ).fetchall()
+        if len(rows) == 1:
+            return rows[0][0]
+        if len(rows) > 1:
+            raise ValueError(
+                f"Ambiguous prefix {identifier!r}: matches "
+                f"{len(rows)} traces"
+            )
+
+        raise ValueError(f"Trace not found: {identifier}")
+
     def read_trace(self, trace_id: str) -> TraceResult:
         """Read a complete trace from the database."""
+        trace_id = self.resolve_trace_id(trace_id)
         row = self._conn.execute(
             "SELECT * FROM traces WHERE trace_id = ?", [trace_id]
         ).fetchone()

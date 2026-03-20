@@ -14,10 +14,8 @@ err_console = Console(stderr=True)
 
 
 def _resolve_trace_id(db: TraceDB, trace_id: str) -> str:
-    """Resolve 'latest' alias to actual trace_id."""
-    if trace_id == "latest":
-        return db.get_latest_trace_id()
-    return trace_id
+    """Resolve label, prefix, 'latest', or full trace_id."""
+    return db.resolve_trace_id(trace_id)
 
 
 @click.group()
