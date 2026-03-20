@@ -264,6 +264,12 @@ class ForwardStatesRequest(BaseModel):
     seed: int = 42
 
 
+class ForwardMlpDeltasRequest(BaseModel):
+    prompts: list[str]
+    layers: list[int] | None = None
+    seed: int = 42
+
+
 class DatasetEntry(BaseModel):
     prompt: str
     answer: str
@@ -608,6 +614,84 @@ def extract_activations(req: ExtractActivationsRequest) -> StreamingResponse:
                 "dtype": "float32",
                 "data": encoded,
             })
+
+            await asyncio.sleep(0)
+
+        yield _sse_line({"type": "done", "total": total})
+
+    return StreamingResponse(
+        _generate(), media_type="text/event-stream"
+    )
+
+
+@app.post("/forward-mlp-deltas")
+def forward_mlp_deltas(req: ForwardMlpDeltasRequest) -> StreamingResponse:
+    """Return MLP input/output at specified layers for each prompt via SSE."""
+    assert _model is not None and _tokenizer is not None and _device is not None
+
+    import base64
+
+    import numpy as np
+
+    async def _generate():
+        model_layers = _get_transformer_layers()
+        total = len(req.prompts)
+        target_layers = req.layers if req.layers is not None else list(range(len(model_layers)))
+
+        for idx, prompt in enumerate(req.prompts):
+            yield _sse_line({
+                "type": "progress",
+                "current": idx + 1,
+                "total": total,
+            })
+
+            torch.manual_seed(req.seed)
+            inputs = _tokenizer(prompt, return_tensors="pt").to(_device)
+
+            captured_in: dict[int, torch.Tensor] = {}
+            captured_out: dict[int, torch.Tensor] = {}
+            hooks: list[torch.utils.hooks.RemovableHandle] = []
+
+            for layer_idx in target_layers:
+                def _make_hook(li: int):
+                    def hook_fn(
+                        module: torch.nn.Module,
+                        input: Any,
+                        output: Any,
+                    ) -> None:
+                        inp = input[0] if isinstance(input, tuple) else input
+                        captured_in[li] = inp[:, -1, :].detach().cpu().float()
+                        out = output if not isinstance(output, tuple) else output[0]
+                        captured_out[li] = out[:, -1, :].detach().cpu().float()
+                    return hook_fn
+
+                if layer_idx < len(model_layers):
+                    mlp = model_layers[layer_idx].mlp
+                    h = mlp.register_forward_hook(_make_hook(layer_idx))
+                    hooks.append(h)
+
+            try:
+                with torch.no_grad():
+                    _model(**inputs)
+            finally:
+                for h in hooks:
+                    h.remove()
+
+            for li in target_layers:
+                if li not in captured_in:
+                    continue
+                mlp_in = captured_in[li][0].numpy().astype(np.float16)
+                mlp_out = captured_out[li][0].numpy().astype(np.float16)
+
+                yield _sse_line({
+                    "type": "deltas",
+                    "prompt_idx": idx,
+                    "layer": li,
+                    "mlp_input": base64.b64encode(mlp_in.tobytes()).decode("ascii"),
+                    "mlp_output": base64.b64encode(mlp_out.tobytes()).decode("ascii"),
+                    "shape": list(mlp_in.shape),
+                    "dtype": "float16",
+                })
 
             await asyncio.sleep(0)
 

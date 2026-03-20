@@ -102,6 +102,31 @@ class RemoteWorker:
                 if line.startswith("data: "):
                     yield json.loads(line[6:])
 
+    def forward_mlp_deltas_stream(
+        self,
+        prompts: list[str],
+        layers: list[int] | None = None,
+        seed: int = 42,
+    ) -> Generator[dict, None, None]:
+        """Stream MLP input/output activations via SSE.
+
+        Yields parsed event dicts with types: progress, deltas, done.
+        """
+        payload: dict = {"prompts": prompts, "seed": seed}
+        if layers is not None:
+            payload["layers"] = layers
+
+        with self.client.stream(
+            "POST",
+            f"{self.base_url}/forward-mlp-deltas",
+            json=payload,
+            timeout=600.0,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line.startswith("data: "):
+                    yield json.loads(line[6:])
+
     def finetune_stream(self, config: dict) -> Generator[dict, None, None]:
         """Stream finetune progress via SSE. Yields parsed event dicts."""
         with self.client.stream(

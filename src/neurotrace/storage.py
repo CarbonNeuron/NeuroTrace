@@ -270,6 +270,41 @@ class TraceDB:
             )
         """)
 
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS contrast_runs (
+                run_id TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                domains JSON NOT NULL,
+                layers JSON NOT NULL,
+                model_name TEXT NOT NULL
+            )
+        """)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS contrast_results (
+                run_id TEXT NOT NULL,
+                domain TEXT NOT NULL,
+                layer INTEGER NOT NULL,
+                prompt TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                mlp_delta_norm REAL,
+                answer_projection REAL,
+                competitor_projection REAL,
+                competitor_token TEXT
+            )
+        """)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS contrast_summaries (
+                run_id TEXT NOT NULL,
+                domain TEXT NOT NULL,
+                layer INTEGER NOT NULL,
+                mean_delta_norm REAL,
+                std_delta_norm REAL,
+                mean_answer_proj REAL,
+                mean_competitor_proj REAL,
+                cosine_similarities JSON
+            )
+        """)
+
     def write_trace(
         self, result: TraceResult, interventions: str | None = None
     ) -> None:
@@ -1057,6 +1092,85 @@ class TraceDB:
             "n_prompts", "n_vulnerable", "n_robust",
             "threshold", "avg_commitment_score", "created_at",
         ]
+        return [dict(zip(cols, r)) for r in rows]
+
+    def write_contrast_run(
+        self,
+        run_id: str,
+        domains: str,
+        layers: str,
+        model_name: str,
+    ) -> None:
+        """Write a contrast run to the database."""
+        self._conn.execute(
+            "INSERT INTO contrast_runs VALUES"
+            " (?, CURRENT_TIMESTAMP, ?, ?, ?)",
+            [run_id, domains, layers, model_name],
+        )
+
+    def write_contrast_result(
+        self,
+        run_id: str,
+        domain: str,
+        layer: int,
+        prompt: str,
+        answer: str,
+        mlp_delta_norm: float,
+        answer_projection: float,
+        competitor_projection: float,
+        competitor_token: str,
+    ) -> None:
+        """Write a single contrast result to the database."""
+        self._conn.execute(
+            "INSERT INTO contrast_results VALUES"
+            " (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                run_id, domain, layer, prompt, answer,
+                mlp_delta_norm, answer_projection,
+                competitor_projection, competitor_token,
+            ],
+        )
+
+    def write_contrast_summary(
+        self,
+        run_id: str,
+        domain: str,
+        layer: int,
+        mean_delta_norm: float,
+        std_delta_norm: float,
+        mean_answer_proj: float,
+        mean_competitor_proj: float,
+        cosine_similarities: str,
+    ) -> None:
+        """Write a contrast domain summary to the database."""
+        self._conn.execute(
+            "INSERT INTO contrast_summaries VALUES"
+            " (?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                run_id, domain, layer,
+                mean_delta_norm, std_delta_norm,
+                mean_answer_proj, mean_competitor_proj,
+                cosine_similarities,
+            ],
+        )
+
+    def read_contrast_run(self, run_id: str) -> dict:
+        """Read a contrast run from the database."""
+        row = self._conn.execute(
+            "SELECT * FROM contrast_runs WHERE run_id = ?", [run_id]
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Contrast run not found: {run_id}")
+        cols = ["run_id", "created_at", "domains", "layers", "model_name"]
+        return dict(zip(cols, row))
+
+    def list_contrast_runs(self) -> list[dict]:
+        """List all contrast runs."""
+        rows = self._conn.execute(
+            "SELECT run_id, created_at, domains, layers, model_name"
+            " FROM contrast_runs ORDER BY created_at DESC"
+        ).fetchall()
+        cols = ["run_id", "created_at", "domains", "layers", "model_name"]
         return [dict(zip(cols, r)) for r in rows]
 
     def close(self) -> None:

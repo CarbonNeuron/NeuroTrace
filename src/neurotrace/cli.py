@@ -4715,3 +4715,390 @@ def _commitment_remote(remote_url, prompts, seed, threshold, model_name_hint):
         progress.update(task, description="Done.")
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# contrast command
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option("--model", default=None, help="HuggingFace model name (local mode).")
+@click.option("--db", required=True, help="Path to DuckDB database file.")
+@click.option(
+    "--domains", required=True,
+    help="Comma-separated built-in dataset names (e.g. 'capitals,math_simple').",
+)
+@click.option(
+    "--layers", "layer_spec", required=True,
+    help="Comma-separated layer indices (e.g. '0,2,10,20').",
+)
+@click.option(
+    "--remote", default=None,
+    help="GPU worker URL (e.g., http://172.30.0.1:8877).",
+)
+@click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
+@click.option("--html", "html_path", default=None, help="HTML report output path.")
+@click.option("--json", "output_json", is_flag=True, help="JSON output.")
+@click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option("--seed", default=42, type=int, help="Random seed.")
+def contrast(
+    model,
+    db,
+    domains,
+    layer_spec,
+    remote,
+    device,
+    html_path,
+    output_json,
+    adapter,
+    seed,
+):
+    """Compare MLP activation geometry across domains at specific layers."""
+    import uuid
+    from datetime import datetime, timezone
+
+    from neurotrace.contrast import (
+        ContrastResult,
+        analyze_vulnerable_vs_robust,
+        build_domain_summaries,
+        compute_domain_centroid,
+        contrast_result_to_dict,
+        generate_contrast_html,
+    )
+
+    if remote is None and model is None:
+        raise click.UsageError("Must provide --model (local mode) or --remote.")
+
+    # Parse domains and layers
+    domain_names = [d.strip() for d in domains.split(",")]
+    layers = [int(x.strip()) for x in layer_spec.split(",")]
+
+    # Load datasets for each domain
+    from neurotrace.datasets import get_builtin_dataset
+
+    domain_prompts: dict[str, list[dict]] = {}
+    for name in domain_names:
+        dataset = get_builtin_dataset(name)
+        domain_prompts[name] = [
+            {"prompt": d["prompt"], "answer": d["answer"]}
+            for d in dataset
+        ]
+
+    # Load commitment data if available (for competitor projections)
+    db_conn = TraceDB(db)
+    commitment_data: dict[str, dict] = {}
+    try:
+        for run_info in db_conn.list_commitment_runs():
+            results = db_conn.read_commitment_results(run_info["run_id"])
+            for r in results:
+                commitment_data[r["prompt"]] = {
+                    "competitor_token": r["competitor_token"] or "",
+                }
+    except Exception:
+        pass
+
+    run_id = str(uuid.uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    if remote is not None:
+        cells, domain_deltas = _contrast_remote(
+            remote, domain_prompts, layers, commitment_data, seed, model,
+        )
+        from neurotrace.remote import RemoteWorker
+
+        worker = RemoteWorker(remote)
+        health = worker.health()
+        model_name = health["model"]
+    else:
+        from neurotrace.contrast import run_contrast_local
+        from neurotrace.models import get_architecture, load_model
+
+        device = _resolve_device(device)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=err_console,
+        ) as progress:
+            task = progress.add_task("Loading model...", total=None)
+            model_obj, tokenizer = load_model(model, device=device)
+            model_obj = _maybe_load_adapter(model_obj, adapter)
+            arch = get_architecture(model_obj.config.model_type)
+            model_name = model
+
+            total_prompts = sum(len(ps) for ps in domain_prompts.values())
+            progress.update(
+                task,
+                description=(
+                    f"Contrast scan: {total_prompts} prompts x "
+                    f"{len(layers)} layers"
+                ),
+                total=total_prompts,
+            )
+
+            def progress_cb(current, total):
+                progress.update(
+                    task, completed=current,
+                    description=f"Processing {current + 1}/{total}...",
+                )
+
+            cells, domain_deltas = run_contrast_local(
+                model_obj, tokenizer, arch,
+                domain_prompts, layers,
+                commitment_data=commitment_data,
+                seed=seed,
+                progress_callback=progress_cb,
+            )
+            progress.update(task, description="Done.", completed=total_prompts)
+
+    # Build domain centroids for cosine similarity
+    centroids: dict[tuple[str, int], any] = {}
+    for domain_name in domain_names:
+        for layer in layers:
+            deltas = [
+                domain_deltas[k]
+                for k in domain_deltas
+                if k[0] == domain_name and k[1] == layer
+            ]
+            if deltas:
+                centroids[(domain_name, layer)] = compute_domain_centroid(deltas)
+
+    summaries = build_domain_summaries(cells, domain_names, layers, centroids)
+
+    # Analysis 5: vulnerable vs robust within first domain (with heatmap data)
+    vuln_robust = None
+    try:
+        heatmap_runs = db_conn.get_all_heatmap_runs()
+        for domain_name in domain_names:
+            matching = [
+                r for r in heatmap_runs
+                if r["dataset_name"] == domain_name
+            ]
+            if matching:
+                vuln_robust = analyze_vulnerable_vs_robust(
+                    cells, matching[0]["cells"],
+                    domain_name, layers, domain_deltas,
+                )
+                break
+    except Exception:
+        pass
+
+    result = ContrastResult(
+        run_id=run_id,
+        domains=domain_names,
+        layers=layers,
+        model_name=model_name,
+        cells=cells,
+        summaries=summaries,
+        vulnerable_vs_robust=vuln_robust,
+        created_at=created_at,
+    )
+
+    # Save to DB
+    db_conn.write_contrast_run(
+        run_id=run_id,
+        domains=json.dumps(domain_names),
+        layers=json.dumps(layers),
+        model_name=model_name,
+    )
+    for c in cells:
+        db_conn.write_contrast_result(
+            run_id=run_id,
+            domain=c.domain,
+            layer=c.layer,
+            prompt=c.prompt,
+            answer=c.answer,
+            mlp_delta_norm=c.mlp_delta_norm,
+            answer_projection=c.answer_projection,
+            competitor_projection=c.competitor_projection,
+            competitor_token=c.competitor_token,
+        )
+    for s in summaries:
+        db_conn.write_contrast_summary(
+            run_id=run_id,
+            domain=s.domain,
+            layer=s.layer,
+            mean_delta_norm=s.mean_delta_norm,
+            std_delta_norm=s.std_delta_norm,
+            mean_answer_proj=s.mean_answer_proj,
+            mean_competitor_proj=s.mean_competitor_proj,
+            cosine_similarities=json.dumps(s.cosine_similarities),
+        )
+    db_conn.close()
+
+    # HTML output
+    if html_path:
+        import os
+
+        os.makedirs(os.path.dirname(html_path) or ".", exist_ok=True)
+        html = generate_contrast_html(result)
+        with open(html_path, "w") as f:
+            f.write(html)
+        console.print(f"[green]Report saved to {html_path}[/green]")
+
+    # JSON output
+    result_dict = contrast_result_to_dict(result)
+    if output_json:
+        click.echo(json.dumps(result_dict, indent=2))
+        return
+
+    # Terminal output
+    console.print(
+        f"\n[bold]Domain Geometry Contrast:[/bold] "
+        f"{', '.join(domain_names)} | Layers {layers}"
+    )
+    console.print(f"Model: {model_name}\n")
+
+    for layer in layers:
+        layer_sums = [s for s in summaries if s.layer == layer]
+        if not layer_sums:
+            continue
+
+        console.print(f"[bold]Layer {layer} MLP Delta Analysis:[/bold]")
+        table = Table()
+        table.add_column("Domain")
+        table.add_column("Mean|D|", justify="right")
+        table.add_column("Std|D|", justify="right")
+        table.add_column("->Answer", justify="right")
+        table.add_column("->Competitor", justify="right")
+        for d in domain_names:
+            table.add_column(f"cos({d[:6]})", justify="right")
+
+        for s in layer_sums:
+            cos_vals = [
+                f"{s.cosine_similarities.get(d, 0.0):.3f}"
+                for d in domain_names
+            ]
+            style = ""
+            if s.mean_answer_proj < -0.1:
+                style = "red"
+            elif s.mean_answer_proj > 0.1:
+                style = "green"
+
+            table.add_row(
+                s.domain,
+                f"{s.mean_delta_norm:.2f}",
+                f"{s.std_delta_norm:.2f}",
+                f"{s.mean_answer_proj:+.3f}",
+                f"{s.mean_competitor_proj:+.3f}",
+                *cos_vals,
+                style=style,
+            )
+        console.print(table)
+        console.print()
+
+    # Print natural language summary for first two domains at first layer
+    if len(summaries) >= 2:
+        s0 = summaries[0]
+        s1 = summaries[1]
+        if s0.mean_delta_norm > 0 and s1.mean_delta_norm > 0:
+            ratio = s0.mean_delta_norm / s1.mean_delta_norm
+            console.print(
+                f"[dim]Layer {s0.layer}: MLP pushes "
+                f"{ratio:.1f}x harder on {s0.domain} "
+                f"(|D|={s0.mean_delta_norm:.2f}) than "
+                f"{s1.domain} (|D|={s1.mean_delta_norm:.2f}).[/dim]"
+            )
+
+    if vuln_robust and vuln_robust.get("status") == "ok":
+        for layer_str, info in vuln_robust.get("layers", {}).items():
+            cos_sim = info["cosine_similarity"]
+            interp = (
+                "confirming weak immunity hypothesis"
+                if cos_sim > 0.8
+                else "suggesting targeted interference"
+            )
+            console.print(
+                f"[dim]L{layer_str} within-domain: vulnerable and robust "
+                f"receive similar MLP push (cos={cos_sim:.2f}), "
+                f"{interp}.[/dim]"
+            )
+
+
+def _contrast_remote(
+    remote_url, domain_prompts, layers, commitment_data, seed, model_name_hint,
+):
+    """Run contrast analysis via remote GPU worker."""
+    import base64
+
+    import numpy as np
+
+    from neurotrace.contrast import run_contrast_remote
+    from neurotrace.models import get_lm_head_and_norm, load_model
+    from neurotrace.remote import RemoteWorker
+
+    worker = RemoteWorker(remote_url)
+    health = worker.health()
+    device_name = health.get("device_name", health.get("device", "unknown"))
+    model_name = health["model"]
+
+    err_console.print(f"GPU: {device_name} via {remote_url}")
+
+    # Flatten all prompts in domain order
+    all_prompts = []
+    for domain, prompts in domain_prompts.items():
+        for p in prompts:
+            all_prompts.append(p["prompt"])
+
+    mlp_data_by_prompt: list[dict] = [{} for _ in all_prompts]
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task(
+            "Fetching MLP deltas...", total=len(all_prompts),
+        )
+
+        for event in worker.forward_mlp_deltas_stream(
+            all_prompts, layers=layers, seed=seed,
+        ):
+            etype = event.get("type")
+            if etype == "progress":
+                progress.update(
+                    task,
+                    completed=event.get("current", 0),
+                    description=(
+                        f"Fetching MLP deltas "
+                        f"{event.get('current', 0)}"
+                        f"/{event.get('total', len(all_prompts))}..."
+                    ),
+                )
+            elif etype == "deltas":
+                pidx = event["prompt_idx"]
+                layer = event["layer"]
+                dtype = np.float16 if event.get("dtype") == "float16" else np.float32
+                mlp_in = np.frombuffer(
+                    base64.b64decode(event["mlp_input"]),
+                    dtype=dtype,
+                ).astype(np.float32).copy()
+                mlp_out = np.frombuffer(
+                    base64.b64decode(event["mlp_output"]),
+                    dtype=dtype,
+                ).astype(np.float32).copy()
+
+                mlp_data_by_prompt[pidx][str(layer)] = {
+                    "mlp_input": mlp_in,
+                    "mlp_output": mlp_out,
+                }
+
+        progress.update(task, description="Loading lm_head locally...")
+
+        model_obj, tokenizer = load_model(model_name, device="cpu")
+        lm_head, final_ln = get_lm_head_and_norm(model_obj)
+        lm_head_weight = lm_head.weight.data.cpu().float().numpy()
+
+        progress.update(task, description="Computing contrast metrics...")
+
+        cells, domain_deltas = run_contrast_remote(
+            mlp_data_by_prompt,
+            lm_head_weight,
+            tokenizer,
+            domain_prompts,
+            layers,
+            commitment_data=commitment_data,
+        )
+        progress.update(task, description="Done.")
+
+    return cells, domain_deltas
