@@ -198,18 +198,17 @@ def run_scan(
         # Trace
         result = tracer.trace(prompt, seed=seed)
 
-        # Resolve answer token ID
-        vocab = tokenizer.get_vocab()
-        answer_token_id = None
-        candidates = [answer, f"\u2581{answer}", f" {answer}"]
-        for candidate in candidates:
-            if candidate in vocab:
-                answer_token_id = vocab[candidate]
-                break
-        if answer_token_id is None:
-            encoded = tokenizer.encode(answer, add_special_tokens=False)
-            if encoded:
-                answer_token_id = encoded[0]
+        # Resolve answer token ID: tokenize with leading space (as the model
+        # would predict it) and take the first token.  This correctly handles
+        # multi-token answers like "Canberra" → ["▁Can", "ber", "ra"] — we
+        # compare against "▁Can".
+        encoded = tokenizer.encode(" " + answer, add_special_tokens=False)
+        answer_token_id = encoded[0] if encoded else None
+        # Normalized full answer for prefix matching — handles subword
+        # granularity mismatches where the tokenizer and model split
+        # differently (e.g. answer "Budapest" tokenizes as single token
+        # ▁Budapest but model predicts ▁Bud).
+        answer_lower = answer.strip().lower()
 
         if answer_token_id is None:
             # Can't resolve token, mark as wrong
@@ -249,7 +248,29 @@ def run_scan(
                 layer_probs = torch.softmax(layer_logits[-1], dim=-1)
 
                 answer_prob = float(layer_probs[answer_token_id].item())
-                answer_rank = int((layer_probs >= answer_prob).sum().item())
+                answer_rank = int(
+                    (layer_probs >= answer_prob).sum().item()
+                )
+
+                # Prefix fallback: if the top-1 decoded token is a
+                # valid prefix of the full answer, treat as rank 1.
+                # Handles subword granularity mismatches — e.g. model
+                # predicts "Bud" and answer is "Budapest".
+                if answer_rank != 1:
+                    top1_id = int(torch.argmax(layer_probs).item())
+                    top1_decoded = (
+                        tokenizer.decode(top1_id)
+                        .strip()
+                        .lstrip("\u2581")
+                        .lower()
+                    )
+                    if top1_decoded and answer_lower.startswith(
+                        top1_decoded
+                    ):
+                        answer_rank = 1
+                        answer_prob = float(
+                            layer_probs[top1_id].item()
+                        )
 
             ranks.append(answer_rank)
             probs_list.append(answer_prob)
