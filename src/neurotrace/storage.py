@@ -448,6 +448,41 @@ class TraceDB:
         """)
 
         self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS fingerprint_runs (
+                id TEXT PRIMARY KEY,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                dataset TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                prompt_count INTEGER NOT NULL
+            )
+        """)
+        self._conn.execute(
+            "CREATE SEQUENCE IF NOT EXISTS fingerprint_seq START 1"
+        )
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS fingerprints (
+                id INTEGER DEFAULT nextval('fingerprint_seq'),
+                run_id TEXT NOT NULL,
+                prompt TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                competitor TEXT NOT NULL,
+                answer_logit REAL,
+                competitor_logit REAL,
+                margin REAL,
+                key_vectors BLOB NOT NULL,
+                p_answer BLOB NOT NULL,
+                p_competitor BLOB NOT NULL
+            )
+        """)
+        try:
+            self._conn.execute(
+                "CREATE INDEX IF NOT EXISTS idx_fp_run_prompt"
+                " ON fingerprints (run_id, prompt)"
+            )
+        except duckdb.CatalogException:
+            pass
+
+        self._conn.execute("""
             CREATE TABLE IF NOT EXISTS decompose_runs (
                 run_id TEXT PRIMARY KEY,
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -1657,6 +1692,95 @@ class TraceDB:
             "model_name", "prompt_count",
         ]
         return [dict(zip(cols, r)) for r in rows]
+
+    def write_fingerprint_run(
+        self,
+        run_id: str,
+        dataset: str,
+        model_name: str,
+        prompt_count: int,
+    ) -> None:
+        """Write a fingerprint run to the database."""
+        self._conn.execute(
+            "INSERT INTO fingerprint_runs VALUES"
+            " (?, CURRENT_TIMESTAMP, ?, ?, ?)",
+            [run_id, dataset, model_name, prompt_count],
+        )
+
+    def write_fingerprint(
+        self,
+        run_id: str,
+        prompt: str,
+        answer: str,
+        competitor: str,
+        answer_logit: float,
+        competitor_logit: float,
+        margin: float,
+        key_vectors_blob: bytes,
+        p_answer_blob: bytes,
+        p_competitor_blob: bytes,
+    ) -> None:
+        """Write a single fingerprint to the database."""
+        self._conn.execute(
+            "INSERT INTO fingerprints"
+            " (run_id, prompt, answer, competitor,"
+            "  answer_logit, competitor_logit, margin,"
+            "  key_vectors, p_answer, p_competitor)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            [
+                run_id, prompt, answer, competitor,
+                answer_logit, competitor_logit, margin,
+                key_vectors_blob, p_answer_blob, p_competitor_blob,
+            ],
+        )
+
+    def list_fingerprint_runs(self) -> list[dict]:
+        """List all fingerprint runs."""
+        rows = self._conn.execute(
+            "SELECT id, created_at, dataset, model_name, prompt_count"
+            " FROM fingerprint_runs ORDER BY created_at DESC"
+        ).fetchall()
+        cols = ["id", "created_at", "dataset", "model_name", "prompt_count"]
+        return [dict(zip(cols, r)) for r in rows]
+
+    def load_fingerprints(self, run_id: str) -> list:
+        """Load fingerprints for a run. Returns list of Fingerprint objects."""
+        from neurotrace.fingerprint import (
+            Fingerprint,
+            deserialize_f16_tensor,
+        )
+
+        rows = self._conn.execute(
+            "SELECT prompt, answer, competitor,"
+            " answer_logit, competitor_logit, margin,"
+            " key_vectors, p_answer, p_competitor"
+            " FROM fingerprints WHERE run_id = ?"
+            " ORDER BY id",
+            [run_id],
+        ).fetchall()
+        results = []
+        for r in rows:
+            results.append(Fingerprint(
+                prompt=r[0],
+                answer=r[1],
+                competitor=r[2],
+                answer_logit=r[3],
+                competitor_logit=r[4],
+                margin=r[5],
+                key_vectors=deserialize_f16_tensor(r[6]),
+                p_answer=deserialize_f16_tensor(r[7]),
+                p_competitor=deserialize_f16_tensor(r[8]),
+            ))
+        return results
+
+    def get_latest_fingerprint_run_id(self) -> str:
+        """Return the run_id of the most recent fingerprint run."""
+        row = self._conn.execute(
+            "SELECT id FROM fingerprint_runs ORDER BY created_at DESC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            raise ValueError("No fingerprint runs in database")
+        return row[0]
 
     def write_repair_run(
         self,

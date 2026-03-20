@@ -7353,6 +7353,315 @@ def _decompose_remote(remote_url, prompts, competitor_list, seed):
 
 
 # ---------------------------------------------------------------------------
+# fingerprint command
+# ---------------------------------------------------------------------------
+
+
+@cli.command()
+@click.option("--db", required=True, help="Path to DuckDB database file.")
+@click.option("--model", default=None, help="HuggingFace model name (local mode).")
+@click.option(
+    "--dataset-builtin", default=None,
+    help="Built-in dataset name for fingerprinting.",
+)
+@click.option(
+    "--dataset", "dataset_path", default=None,
+    type=click.Path(exists=True),
+    help="Custom JSONL dataset path.",
+)
+@click.option("--list", "list_runs", is_flag=True, help="Show fingerprint stats.")
+@click.option(
+    "--remote", default=None,
+    help="GPU worker URL (e.g., http://172.30.0.1:8877).",
+)
+@click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
+@click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option("--seed", default=42, type=int, help="Random seed.")
+@click.option("--json", "output_json", is_flag=True, help="JSON output.")
+def fingerprint(
+    db,
+    model,
+    dataset_builtin,
+    dataset_path,
+    list_runs,
+    remote,
+    device,
+    adapter,
+    seed,
+    output_json,
+):
+    """Build MLP key vector fingerprints for analytical regression checking."""
+    import uuid
+
+    from neurotrace.fingerprint import (
+        FingerprintRun,
+        compute_alignment_stats,
+        compute_fingerprint_local,
+        serialize_f16_tensor,
+    )
+
+    db_conn = TraceDB(db)
+
+    # Handle --list
+    if list_runs:
+        runs = db_conn.list_fingerprint_runs()
+        if not runs:
+            console.print("[dim]No fingerprint runs found.[/dim]")
+            db_conn.close()
+            return
+
+        if output_json:
+            click.echo(json.dumps(runs, indent=2, default=str))
+            db_conn.close()
+            return
+
+        table = Table()
+        table.add_column("Run ID", max_width=12)
+        table.add_column("Dataset")
+        table.add_column("Model", max_width=30)
+        table.add_column("Prompts", justify="right")
+        table.add_column("Created")
+        for run in runs:
+            table.add_row(
+                str(run["id"])[:12],
+                run["dataset"],
+                str(run["model_name"])[:30],
+                str(run["prompt_count"]),
+                str(run["created_at"]),
+            )
+        console.print(table)
+        db_conn.close()
+        return
+
+    # Validate inputs
+    if dataset_builtin is None and dataset_path is None:
+        raise click.UsageError(
+            "Must provide --dataset-builtin or --dataset."
+        )
+    if dataset_builtin is not None and dataset_path is not None:
+        raise click.UsageError(
+            "Cannot provide both --dataset-builtin and --dataset."
+        )
+    if remote is None and model is None:
+        raise click.UsageError(
+            "Must provide --model (local mode) or --remote."
+        )
+
+    # Load dataset
+    from neurotrace.datasets import get_builtin_dataset, load_dataset
+
+    if dataset_builtin is not None:
+        dataset = get_builtin_dataset(dataset_builtin)
+        dataset_name = dataset_builtin
+    else:
+        dataset = load_dataset(dataset_path)
+        dataset_name = dataset_path
+
+    prompts = [{"prompt": d["prompt"], "answer": d["answer"]} for d in dataset]
+    run_id = str(uuid.uuid4())
+    all_fingerprints = []
+
+    if remote is not None:
+        all_fingerprints = _fingerprint_remote(
+            remote, prompts, seed, dataset_name,
+        )
+        from neurotrace.remote import RemoteWorker
+
+        worker = RemoteWorker(remote)
+        health = worker.health()
+        model_name = health["model"]
+    else:
+        from neurotrace.models import load_model
+
+        device = _resolve_device(device)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=err_console,
+        ) as progress:
+            task = progress.add_task("Loading model...", total=None)
+            model_obj, tokenizer = load_model(model, device=device)
+            model_obj = _maybe_load_adapter(model_obj, adapter)
+            model_name = model
+
+            progress.update(
+                task,
+                description=f"Fingerprinting {len(prompts)} prompts...",
+                total=len(prompts),
+            )
+
+            for p_idx, entry in enumerate(prompts):
+                progress.update(
+                    task,
+                    completed=p_idx,
+                    description=(
+                        f"Fingerprint {p_idx + 1}/{len(prompts)}"
+                    ),
+                )
+                fp = compute_fingerprint_local(
+                    model_obj, tokenizer,
+                    entry["prompt"], entry["answer"],
+                    seed=seed,
+                )
+                all_fingerprints.append(fp)
+
+            progress.update(
+                task, description="Done.", completed=len(prompts),
+            )
+
+    # Save to DB
+    db_conn.write_fingerprint_run(
+        run_id=run_id,
+        dataset=dataset_name,
+        model_name=model_name,
+        prompt_count=len(all_fingerprints),
+    )
+    for fp in all_fingerprints:
+        db_conn.write_fingerprint(
+            run_id=run_id,
+            prompt=fp.prompt,
+            answer=fp.answer,
+            competitor=fp.competitor,
+            answer_logit=fp.answer_logit,
+            competitor_logit=fp.competitor_logit,
+            margin=fp.margin,
+            key_vectors_blob=serialize_f16_tensor(fp.key_vectors),
+            p_answer_blob=serialize_f16_tensor(fp.p_answer),
+            p_competitor_blob=serialize_f16_tensor(fp.p_competitor),
+        )
+    db_conn.close()
+
+    # Build run object for output
+    run = FingerprintRun(
+        run_id=run_id,
+        dataset=dataset_name,
+        model_name=model_name,
+        prompt_count=len(all_fingerprints),
+        fingerprints=all_fingerprints,
+    )
+
+    if output_json:
+        out = {
+            "run_id": run.run_id,
+            "dataset": run.dataset,
+            "model_name": run.model_name,
+            "prompt_count": run.prompt_count,
+            "fingerprints": [
+                {
+                    "prompt": fp.prompt,
+                    "answer": fp.answer,
+                    "competitor": fp.competitor,
+                    "answer_logit": fp.answer_logit,
+                    "competitor_logit": fp.competitor_logit,
+                    "margin": fp.margin,
+                }
+                for fp in all_fingerprints
+            ],
+        }
+        click.echo(json.dumps(out, indent=2))
+        return
+
+    # Compute alignment stats
+    stats = compute_alignment_stats(all_fingerprints)
+
+    # Compute total storage size
+    total_bytes = 0
+    for fp in all_fingerprints:
+        total_bytes += fp.key_vectors.nbytes
+        total_bytes += fp.p_answer.nbytes
+        total_bytes += fp.p_competitor.nbytes
+
+    if total_bytes >= 1024 * 1024:
+        size_str = f"{total_bytes / (1024 * 1024):.1f} MB"
+    else:
+        size_str = f"{total_bytes / 1024:.1f} KB"
+
+    kv_shape = all_fingerprints[0].key_vectors.shape if all_fingerprints else (0, 0)
+    p_shape = all_fingerprints[0].p_answer.shape if all_fingerprints else (0,)
+
+    console.print(
+        f"\n[bold]Fingerprint:[/bold] {dataset_name}"
+        f" ({len(all_fingerprints)} prompts)"
+    )
+    if remote:
+        console.print(f"GPU: via {remote}")
+    console.print(f"\nStored {len(all_fingerprints)} fingerprints ({size_str})")
+    console.print(
+        f"  Key vectors: {kv_shape[0]} layers"
+        f" x {kv_shape[1] if len(kv_shape) > 1 else '?'} dims x float16"
+    )
+    console.print(
+        f"  Projection vectors: {p_shape[0]} dims x float16"
+    )
+
+    if stats.get("max_pair"):
+        console.print("\nAlignment analysis:")
+        console.print(
+            f"  Avg cross-prompt alignment:"
+            f" {stats['avg_alignment']:.2f}"
+        )
+        max_p = stats["max_pair"]
+        min_p = stats["min_pair"]
+        console.print(
+            f"  Max alignment pair:"
+            f" {max_p[0]}↔{max_p[1]}"
+            f" ({stats['max_alignment']:.2f})"
+        )
+        console.print(
+            f"  Min alignment pair:"
+            f" {min_p[0]}↔{min_p[1]}"
+            f" ({stats['min_alignment']:.2f})"
+        )
+    console.print()
+
+
+def _fingerprint_remote(remote_url, prompts, seed, dataset_name):
+    """Run fingerprinting via remote GPU worker."""
+    from neurotrace.fingerprint import build_fingerprint_from_remote
+    from neurotrace.remote import RemoteWorker
+
+    worker = RemoteWorker(remote_url)
+    health = worker.health()
+    device_name = health.get("device_name", health.get("device", "unknown"))
+    err_console.print(f"GPU: {device_name} via {remote_url}")
+
+    all_fingerprints = []
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task(
+            "Fingerprinting...", total=len(prompts),
+        )
+
+        for event in worker.fingerprint_stream(prompts, seed):
+            etype = event.get("type")
+            if etype == "progress":
+                current = event.get("current", 0)
+                total = event.get("total", len(prompts))
+                progress.update(
+                    task,
+                    completed=current,
+                    total=total,
+                    description=(
+                        f"Fingerprint {current}/{total}"
+                    ),
+                )
+            elif etype == "result":
+                for fp_data in event.get("fingerprints", []):
+                    fp = build_fingerprint_from_remote(fp_data)
+                    all_fingerprints.append(fp)
+
+        progress.update(
+            task, description="Done.", completed=len(prompts),
+        )
+
+    return all_fingerprints
+
+
+# ---------------------------------------------------------------------------
 # repair command
 # ---------------------------------------------------------------------------
 
@@ -7403,6 +7712,10 @@ def _decompose_remote(remote_url, prompts, competitor_list, seed):
 @click.option("--json", "output_json", is_flag=True, help="JSON output.")
 @click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
 @click.option("--seed", default=42, type=int, help="Random seed.")
+@click.option(
+    "--fast-regression", is_flag=True,
+    help="Use fingerprints for analytical regression checking (no forward passes).",
+)
 def repair(
     model,
     db,
@@ -7423,6 +7736,7 @@ def repair(
     output_json,
     adapter,
     seed,
+    fast_regression,
 ):
     """ROME rank-one weight repair using Logit Prism decomposition."""
     import uuid
@@ -7553,6 +7867,75 @@ def repair(
                 all_results.append(result)
 
             progress.update(task, description="Done.", completed=len(prompts))
+
+    # Fast regression checking via fingerprints
+    if fast_regression and all_results:
+        from neurotrace.fingerprint import (
+            check_regressions_fast,
+        )
+        from neurotrace.repair import RegressionResult
+
+        db_conn_fp = TraceDB(db)
+        try:
+            latest_fp_run = db_conn_fp.get_latest_fingerprint_run_id()
+            fps = db_conn_fp.load_fingerprints(latest_fp_run)
+        except ValueError:
+            fps = []
+            err_console.print(
+                "[yellow]No fingerprints found — run"
+                " 'neurotrace fingerprint' first.[/yellow]"
+            )
+        db_conn_fp.close()
+
+        if fps:
+            err_console.print(
+                f"[dim]Analytical regression check:"
+                f" {len(fps)} fingerprints[/dim]"
+            )
+            for r in all_results:
+                if r.status == "skipped":
+                    continue
+                # We need k_star and delta — extract from repair.py
+                # For local mode, re-compute them
+                if remote is None:
+                    from neurotrace.repair import (
+                        compute_correction_delta,
+                        compute_key_vector,
+                    )
+
+                    k_star = compute_key_vector(
+                        model_obj, tokenizer, r.prompt,
+                        r.target_layer, seed,
+                    )
+                    delta = compute_correction_delta(
+                        model_obj, tokenizer, r.answer,
+                        r.competitor,
+                        target_margin - r.before.component_margin,
+                    )
+                    k_np = k_star.detach().cpu().numpy()
+                    d_np = delta.detach().cpu().numpy()
+
+                    affected = check_regressions_fast(
+                        d_np, k_np, r.target_layer, fps,
+                    )
+
+                    for ar in affected:
+                        status = "regression" if ar.regression else "ok"
+                        r.regressions.append(RegressionResult(
+                            prompt=ar.prompt,
+                            answer=ar.answer,
+                            before_prob=ar.current_margin,
+                            after_prob=ar.new_margin,
+                            status=status,
+                        ))
+
+                    if any(ar.regression for ar in affected):
+                        r.status = "regression"
+
+            err_console.print(
+                "[dim]  (analytical, fingerprint-based,"
+                " no forward pass)[/dim]"
+            )
 
     run = RepairRun(
         run_id=run_id,

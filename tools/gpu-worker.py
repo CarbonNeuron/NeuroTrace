@@ -1263,6 +1263,160 @@ def _load_model(model_name: str, device: torch.device, cache_dir: str | None) ->
 
 
 # ---------------------------------------------------------------------------
+# Fingerprint endpoint
+# ---------------------------------------------------------------------------
+
+
+class FingerprintPrompt(BaseModel):
+    prompt: str
+    answer: str
+
+
+class FingerprintRequest(BaseModel):
+    prompts: list[FingerprintPrompt]
+    seed: int = 42
+
+
+@app.post("/fingerprint")
+def fingerprint(req: FingerprintRequest) -> StreamingResponse:
+    """Compute MLP key vector fingerprints for analytical regression checking."""
+    assert _model is not None and _tokenizer is not None and _device is not None
+
+    import base64
+
+    import numpy as np
+
+    async def _generate():
+        layers = _get_transformer_layers()
+        total = len(req.prompts)
+
+        fingerprints = []
+
+        for idx, item in enumerate(req.prompts):
+            yield _sse_line({
+                "type": "progress",
+                "current": idx + 1,
+                "total": total,
+                "status": "fingerprinting",
+            })
+
+            torch.manual_seed(req.seed)
+            input_ids = _tokenizer.encode(
+                item.prompt, return_tensors="pt",
+            ).to(_device)
+
+            # Resolve answer token ID
+            answer_ids = _tokenizer.encode(
+                " " + item.answer, add_special_tokens=False,
+            )
+            if not answer_ids:
+                answer_ids = _tokenizer.encode(
+                    item.answer, add_special_tokens=False,
+                )
+            answer_id = answer_ids[0] if answer_ids else 0
+
+            # Capture MLP key vectors (input to down_proj) at every layer
+            key_vectors: dict[int, torch.Tensor] = {}
+
+            def make_hook(layer_idx):
+                def hook_fn(module, args):
+                    inp = args[0] if isinstance(args, tuple) else args
+                    if inp.dim() == 3:
+                        key_vectors[layer_idx] = (
+                            inp[0, -1, :].detach().cpu().half()
+                        )
+                    elif inp.dim() == 2:
+                        key_vectors[layer_idx] = (
+                            inp[-1, :].detach().cpu().half()
+                        )
+                    else:
+                        key_vectors[layer_idx] = inp.detach().cpu().half()
+                return hook_fn
+
+            hooks: list[torch.utils.hooks.RemovableHandle] = []
+            for i, layer in enumerate(layers):
+                hooks.append(
+                    layer.mlp.down_proj.register_forward_pre_hook(
+                        make_hook(i),
+                    )
+                )
+
+            try:
+                with torch.no_grad():
+                    outputs = _model(
+                        input_ids, output_hidden_states=True,
+                    )
+            finally:
+                for h in hooks:
+                    h.remove()
+
+            # Get logits and find competitor
+            logits = outputs.logits[0, -1, :]
+            answer_logit = logits[answer_id].item()
+
+            logits_masked = logits.clone()
+            logits_masked[answer_id] = float("-inf")
+            competitor_id = logits_masked.argmax().item()
+            competitor_logit = logits[competitor_id].item()
+            competitor = _tokenizer.decode([competitor_id]).strip()
+            if not competitor:
+                competitor = _tokenizer.decode([competitor_id])
+
+            # Compute Logit Prism projection vectors
+            last_hidden = outputs.hidden_states[-1][0, -1, :]
+            ln_weight = _model.model.norm.weight.detach()
+            variance = last_hidden.pow(2).mean(-1, keepdim=False)
+            s = torch.sqrt(variance + _model.model.norm.variance_epsilon)
+
+            w_unembed = _model.lm_head.weight
+            p_answer = (
+                (w_unembed[answer_id] * ln_weight / s)
+                .detach().cpu().half().numpy()
+            )
+            p_competitor = (
+                (w_unembed[competitor_id] * ln_weight / s)
+                .detach().cpu().half().numpy()
+            )
+
+            # Stack key vectors
+            kv_tensor = torch.stack([
+                key_vectors[i] for i in range(len(layers))
+            ]).numpy()
+
+            fingerprints.append({
+                "prompt": item.prompt,
+                "answer": item.answer,
+                "competitor": competitor,
+                "answer_logit": round(answer_logit, 4),
+                "competitor_logit": round(competitor_logit, 4),
+                "margin": round(answer_logit - competitor_logit, 4),
+                "key_vectors_b64": base64.b64encode(
+                    kv_tensor.tobytes(),
+                ).decode("ascii"),
+                "key_vectors_shape": list(kv_tensor.shape),
+                "p_answer_b64": base64.b64encode(
+                    p_answer.tobytes(),
+                ).decode("ascii"),
+                "p_competitor_b64": base64.b64encode(
+                    p_competitor.tobytes(),
+                ).decode("ascii"),
+                "p_shape": list(p_answer.shape),
+            })
+
+            await asyncio.sleep(0)
+
+        yield _sse_line({
+            "type": "result",
+            "fingerprints": fingerprints,
+        })
+        yield _sse_line({"type": "done", "total": total})
+
+    return StreamingResponse(
+        _generate(), media_type="text/event-stream",
+    )
+
+
+# ---------------------------------------------------------------------------
 # Decompose endpoint
 # ---------------------------------------------------------------------------
 

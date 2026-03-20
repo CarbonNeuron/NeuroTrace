@@ -242,6 +242,27 @@ class RemoteWorker:
                 if line.startswith("data: "):
                     yield json.loads(line[6:])
 
+    def fingerprint_stream(
+        self,
+        prompts: list[dict],
+        seed: int = 42,
+    ) -> Generator[dict, None, None]:
+        """Stream fingerprint results via SSE.
+
+        prompts: list of {"prompt": str, "answer": str}
+        Yields parsed event dicts with types: progress, result, done.
+        """
+        with self.client.stream(
+            "POST",
+            f"{self.base_url}/fingerprint",
+            json={"prompts": prompts, "seed": seed},
+            timeout=600.0,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line.startswith("data: "):
+                    yield json.loads(line[6:])
+
     def repair_stream(
         self,
         prompt: str,
