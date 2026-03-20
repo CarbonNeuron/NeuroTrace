@@ -13,6 +13,23 @@ console = Console()
 err_console = Console(stderr=True)
 
 
+def _resolve_device(device: str) -> str:
+    """Resolve 'auto' device to best available, pass others through."""
+    if device != "auto":
+        return device
+    try:
+        import torch_directml  # noqa: F401
+
+        return "privateuseone:0"
+    except ImportError:
+        pass
+    import torch
+
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
 def _resolve_trace_id(db: TraceDB, trace_id: str) -> str:
     """Resolve label, prefix, 'latest', or full trace_id."""
     return db.resolve_trace_id(trace_id)
@@ -52,6 +69,7 @@ def cli() -> None:
 )
 @click.option("--layer-stride", default=1, type=int, help="Layer stride for capture.")
 @click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
 def trace(
     model,
     prompt,
@@ -62,6 +80,7 @@ def trace(
     capture_mode,
     layer_stride,
     adapter,
+    device,
 ):
     """Run a forward-pass trace and store results."""
     if prompt is None and prompts_file is None:
@@ -85,7 +104,8 @@ def trace(
         from neurotrace.models import load_model
         from neurotrace.tracer import Tracer
 
-        model_obj, tokenizer = load_model(model)
+        device = _resolve_device(device)
+        model_obj, tokenizer = load_model(model, device=device)
         model_obj = _maybe_load_adapter(model_obj, adapter)
         progress.update(task, description="Model loaded.")
 
@@ -411,7 +431,10 @@ def diff(
 @click.option("--track", default=None, help="Token string to track across all layers.")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
 @click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
-def predict(db, trace_id, top_k, changes_only, layers, track, output_json, adapter):
+@click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
+def predict(
+    db, trace_id, top_k, changes_only, layers, track, output_json, adapter, device
+):
     """Show top-K token predictions at every layer from a stored trace."""
     import torch
 
@@ -450,7 +473,8 @@ def predict(db, trace_id, top_k, changes_only, layers, track, output_json, adapt
         task = progress.add_task("Loading model...", total=None)
         from neurotrace.models import load_model
 
-        model_obj, tokenizer = load_model(model_name)
+        device = _resolve_device(device)
+        model_obj, tokenizer = load_model(model_name, device=device)
         model_obj = _maybe_load_adapter(model_obj, adapter)
         progress.update(task, description="Projecting layers...")
 
@@ -687,6 +711,7 @@ def decode(model, tokens, from_trace, db):
 @click.option("--flagged-only", is_flag=True, help="Show only flagged layers.")
 @click.option("--head-detail", is_flag=True, help="Show critical head details.")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
+@click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
 def compare(
     model,
     prompt_a,
@@ -697,6 +722,7 @@ def compare(
     flagged_only,
     head_detail,
     output_json,
+    device,
 ):
     """Trace two prompts, diff them, and show decoded results."""
     from neurotrace.analyzer import compute_diff
@@ -735,7 +761,8 @@ def compare(
         console=err_console,
     ) as progress:
         task = progress.add_task("Loading model...", total=None)
-        model_obj, tokenizer = load_model(model)
+        device = _resolve_device(device)
+        model_obj, tokenizer = load_model(model, device=device)
         progress.update(task, description="Model loaded.")
 
         tracer = Tracer(
@@ -899,6 +926,7 @@ def compare(
 @click.option("--label", default=None, help="Label for the ablated trace.")
 @click.option("--seed", default=42, type=int, help="Random seed.")
 @click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
 def ablate(
     db,
     model,
@@ -912,6 +940,7 @@ def ablate(
     label,
     seed,
     adapter,
+    device,
 ):
     """Run inference with targeted components disabled and compare to baseline."""
     from neurotrace.ablate import (
@@ -961,7 +990,8 @@ def ablate(
         task = progress.add_task("Loading model...", total=None)
         from neurotrace.models import load_model
 
-        model_obj, tokenizer = load_model(model)
+        device = _resolve_device(device)
+        model_obj, tokenizer = load_model(model, device=device)
         model_obj = _maybe_load_adapter(model_obj, adapter)
         progress.update(task, description="Model loaded.")
 
@@ -1422,6 +1452,7 @@ def _parse_sweep_zero_heads(value: str) -> tuple[int, list[int]]:
 )
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
 @click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
 def sweep(
     db,
     model,
@@ -1440,6 +1471,7 @@ def sweep(
     scale_mlp,
     output_json,
     adapter,
+    device,
 ):
     """Run multiple ablations in a single model load, sweeping a parameter range."""
     from neurotrace.ablate import (
@@ -1555,7 +1587,8 @@ def sweep(
         task = progress.add_task("Loading model...", total=None)
         from neurotrace.models import load_model
 
-        model_obj, tokenizer = load_model(model)
+        device = _resolve_device(device)
+        model_obj, tokenizer = load_model(model, device=device)
         model_obj = _maybe_load_adapter(model_obj, adapter)
         progress.update(task, description="Model loaded.")
 
@@ -1741,6 +1774,7 @@ def sweep(
 @click.option("--details", is_flag=True, help="Show layer details for flagged prompts.")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
 @click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
 def scan(
     db,
     model,
@@ -1754,6 +1788,7 @@ def scan(
     details,
     output_json,
     adapter,
+    device,
 ):
     """Scan a dataset for sabotaged predictions."""
     from neurotrace.datasets import get_builtin_dataset, load_dataset
@@ -1780,7 +1815,8 @@ def scan(
         task = progress.add_task("Loading model...", total=None)
         from neurotrace.models import load_model
 
-        model_obj, tokenizer = load_model(model)
+        device = _resolve_device(device)
+        model_obj, tokenizer = load_model(model, device=device)
         model_obj = _maybe_load_adapter(model_obj, adapter)
         progress.update(task, description="Model loaded.")
 
@@ -1975,6 +2011,8 @@ def scan(
 @click.option("--eval-after", is_flag=True, help="Run scan after training.")
 @click.option("--seed", default=42, type=int, help="Random seed.")
 @click.option("--json", "output_json", is_flag=True, help="JSON output.")
+@click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
+@click.option("--remote", default=None, help="GPU worker URL (e.g., http://172.30.0.1:8877).")
 def finetune(
     db,
     model,
@@ -1991,6 +2029,8 @@ def finetune(
     eval_after,
     seed,
     output_json,
+    device,
+    remote,
 ):
     """Train a LoRA adapter on specified MLP layers to fix sabotaged predictions."""
     from neurotrace.finetune import (
@@ -2000,6 +2040,24 @@ def finetune(
         generate_training_data_from_scan,
         run_finetune,
     )
+
+    # Remote GPU finetune
+    if remote is not None:
+        _finetune_remote(
+            remote=remote,
+            dataset_builtin=dataset_builtin,
+            dataset_path=dataset_path,
+            target_layers=target_layers,
+            rank=rank,
+            alpha=alpha,
+            epochs=epochs,
+            lr=lr,
+            output_dir=output_dir,
+            seed=seed,
+            output_json=output_json,
+            db=db,
+        )
+        return
 
     # Validate data source
     sources = [dataset_builtin, dataset_path, from_scan]
@@ -2051,6 +2109,7 @@ def finetune(
                     seed,
                     progress,
                     task,
+                    device=device,
                 )
 
             examples = generate_training_data_from_builtin(
@@ -2073,7 +2132,8 @@ def finetune(
             from neurotrace.models import load_model
             from neurotrace.scan import run_scan
 
-            model_obj, tokenizer = load_model(model)
+            device = _resolve_device(device)
+            model_obj, tokenizer = load_model(model, device=device)
             dataset = get_builtin_dataset("capitals")
             scan_result = run_scan(model_obj, tokenizer, dataset, "capitals", seed=seed)
             examples = generate_training_data_from_scan(scan_result)
@@ -2126,6 +2186,7 @@ def finetune(
                 progress,
                 task,
                 adapter_path=output_dir,
+                device=device,
             )
             result.scan_after = scan_after.get("summary") if scan_after else None
 
@@ -2189,6 +2250,7 @@ def _run_eval_scan(
     progress,
     task,
     adapter_path=None,
+    device="cpu",
 ):
     """Run a scan for evaluation, returning summary dict."""
     from neurotrace.datasets import get_builtin_dataset
@@ -2197,7 +2259,8 @@ def _run_eval_scan(
 
     dataset = get_builtin_dataset(dataset_builtin)
 
-    model_obj, tokenizer = load_model(model_name)
+    device = _resolve_device(device)
+    model_obj, tokenizer = load_model(model_name, device=device)
     model_obj = _maybe_load_adapter(model_obj, adapter_path)
 
     def progress_cb(i, total, _prompt):
@@ -2250,6 +2313,7 @@ def _run_eval_scan(
 @click.option("--skip-finetune", is_flag=True, help="Skip the finetune step.")
 @click.option("--seed", default=42, type=int, help="Random seed.")
 @click.option("--json", "output_json", is_flag=True, help="JSON output.")
+@click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
 def experiment(
     db,
     model,
@@ -2260,6 +2324,7 @@ def experiment(
     skip_finetune,
     seed,
     output_json,
+    device,
 ):
     """Run a full diagnostic pipeline: scan, ablate, finetune, verify."""
     import os
@@ -2290,7 +2355,8 @@ def experiment(
         from neurotrace.models import load_model
         from neurotrace.scan import run_scan
 
-        model_obj, tokenizer = load_model(model)
+        device = _resolve_device(device)
+        model_obj, tokenizer = load_model(model, device=device)
         progress.update(task, description="Model loaded.")
 
         # --- Step 1: Baseline scan ---
@@ -2489,7 +2555,8 @@ def experiment(
         if not skip_finetune:
             progress.update(task, description="Step 4/4: Verifying with adapter...")
 
-            model_obj, tokenizer = load_model(model)
+            device = _resolve_device(device)
+            model_obj, tokenizer = load_model(model, device=device)
             model_obj = _maybe_load_adapter(model_obj, adapter_path)
 
             def verify_progress(i, total, prompt):
@@ -2747,6 +2814,7 @@ def experiment(
 @click.option("--seed", default=42, type=int, help="Random seed.")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
 @click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
 def neurons(
     db,
     model,
@@ -2764,6 +2832,7 @@ def neurons(
     seed,
     output_json,
     adapter,
+    device,
 ):
     """Neuron-level MLP attribution: profile or ablate individual neurons."""
     if ablate_mode:
@@ -2781,6 +2850,7 @@ def neurons(
             seed,
             output_json,
             adapter,
+            device=device,
         )
     else:
         _neurons_profile(
@@ -2794,6 +2864,7 @@ def neurons(
             seed,
             output_json,
             adapter,
+            device=device,
         )
 
 
@@ -2808,6 +2879,7 @@ def _neurons_profile(
     seed,
     output_json,
     adapter=None,
+    device="cpu",
 ):
     """Profile mode: capture and rank MLP intermediate neuron activations."""
     from neurotrace.neurons import profile_neurons
@@ -2820,7 +2892,8 @@ def _neurons_profile(
         task = progress.add_task("Loading model...", total=None)
         from neurotrace.models import load_model
 
-        model_obj, tokenizer = load_model(model)
+        device = _resolve_device(device)
+        model_obj, tokenizer = load_model(model, device=device)
         model_obj = _maybe_load_adapter(model_obj, adapter)
         progress.update(task, description="Profiling neurons...")
 
@@ -2919,6 +2992,7 @@ def _neurons_ablate(
     seed,
     output_json,
     adapter=None,
+    device="cpu",
 ):
     """Ablate mode: zero specific neurons and measure prediction impact."""
     from neurotrace.neurons import ablate_neurons, parse_neurons
@@ -2935,7 +3009,8 @@ def _neurons_ablate(
         task = progress.add_task("Loading model...", total=None)
         from neurotrace.models import load_model
 
-        model_obj, tokenizer = load_model(model)
+        device = _resolve_device(device)
+        model_obj, tokenizer = load_model(model, device=device)
         model_obj = _maybe_load_adapter(model_obj, adapter)
         progress.update(task, description="Model loaded.")
 
@@ -3087,6 +3162,7 @@ def _neurons_ablate(
 )
 @click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
+@click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
 def probe(
     db,
     model,
@@ -3099,6 +3175,7 @@ def probe(
     cross_dataset,
     adapter,
     output_json,
+    device,
 ):
     """Find the sabotage direction in activation space via linear probing."""
     from neurotrace.datasets import get_builtin_dataset, load_dataset
@@ -3130,7 +3207,8 @@ def probe(
         task = progress.add_task("Loading model...", total=None)
         from neurotrace.models import load_model
 
-        model_obj, tokenizer = load_model(model)
+        device = _resolve_device(device)
+        model_obj, tokenizer = load_model(model, device=device)
         model_obj = _maybe_load_adapter(model_obj, adapter)
         progress.update(task, description="Model loaded.")
 
@@ -3325,6 +3403,7 @@ def probe(
 @click.option("--output", default=None, help="Output directory.")
 @click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
+@click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
 def circuit(
     db,
     model,
@@ -3337,6 +3416,7 @@ def circuit(
     output,
     adapter,
     output_json,
+    device,
 ):
     """Trace computational circuit from probe direction through MLP to token outputs."""
     from neurotrace.circuit import (
@@ -3370,7 +3450,8 @@ def circuit(
         task = progress.add_task("Loading model...", total=None)
         from neurotrace.models import load_model
 
-        model_obj, tokenizer = load_model(model)
+        device = _resolve_device(device)
+        model_obj, tokenizer = load_model(model, device=device)
         model_obj = _maybe_load_adapter(model_obj, adapter)
         progress.update(task, description="Model loaded.")
 
@@ -3545,3 +3626,436 @@ def circuit(
             console.print(f"  More boosted for first: {diff_tokens}")
 
     console.print(f"\n[green]Results saved to {output}/[/green]")
+
+
+def _finetune_remote(
+    remote,
+    dataset_builtin,
+    dataset_path,
+    target_layers,
+    rank,
+    alpha,
+    epochs,
+    lr,
+    output_dir,
+    seed,
+    output_json,
+    db,
+):
+    """Run LoRA fine-tuning on a remote GPU worker."""
+    from neurotrace.remote import RemoteWorker
+
+    worker = RemoteWorker(remote, timeout=600.0)
+    health = worker.health()
+    device_name = health.get("device_name", health.get("device", "unknown"))
+
+    # Parse target layers
+    layers = [int(x.strip()) for x in target_layers.split(",") if x.strip()]
+
+    # Load dataset
+    dataset_items = []
+    if dataset_builtin is not None:
+        from neurotrace.datasets import get_builtin_dataset
+
+        raw = get_builtin_dataset(dataset_builtin)
+        dataset_items = [{"prompt": d["prompt"], "answer": d["answer"]} for d in raw]
+    elif dataset_path is not None:
+        from neurotrace.datasets import load_dataset
+
+        raw = load_dataset(dataset_path)
+        dataset_items = [{"prompt": d["prompt"], "answer": d["answer"]} for d in raw]
+
+    # Determine output directory
+    if output_dir is None:
+        import re
+        from datetime import datetime
+
+        model_name = health.get("model", "unknown")
+        model_slug = re.sub(r"[^a-zA-Z0-9]", "-", model_name).strip("-")
+        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        output_dir = f"adapters/{model_slug}-{timestamp}"
+
+    config = {
+        "dataset": dataset_items,
+        "target_layers": layers,
+        "target_modules": ["gate_proj", "up_proj", "down_proj"],
+        "epochs": epochs,
+        "lr": lr,
+        "rank": rank,
+        "batch_size": 4,
+    }
+
+    total_time = 0
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task(
+            f"Training LoRA on {device_name}...", total=None
+        )
+
+        adapter_id = None
+        final_loss = None
+        for event in worker.finetune_stream(config):
+            etype = event.get("type")
+            if etype == "config":
+                total_steps = event.get("total_steps", 0)
+                progress.update(task, total=total_steps)
+            elif etype == "progress":
+                step = event.get("step", 0)
+                loss = event.get("loss", 0)
+                epoch = event.get("epoch", 0)
+                progress.update(
+                    task,
+                    completed=step,
+                    description=(
+                        f"Epoch {epoch} step {step} loss: {loss:.4f}"
+                    ),
+                )
+            elif etype == "epoch_end":
+                avg_loss = event.get("avg_loss", 0)
+                epoch = event.get("epoch", 0)
+                err_console.print(
+                    f"  Epoch {epoch} avg loss: {avg_loss:.4f}"
+                )
+            elif etype == "complete":
+                adapter_id = event.get("adapter_id")
+                final_loss = event.get("final_loss")
+                total_time = event.get("total_time_seconds", 0)
+                progress.update(
+                    task,
+                    description=f"Training complete! loss={final_loss:.4f}",
+                )
+
+        if adapter_id:
+            progress.update(
+                task, description=f"Downloading adapter {adapter_id}..."
+            )
+            import os
+
+            os.makedirs(output_dir, exist_ok=True)
+            worker.download_adapter(adapter_id, output_dir)
+            progress.update(task, description="Done.")
+
+    console.print("\n[bold]Remote LoRA Training Complete[/bold]")
+    console.print(f"Device: {device_name}")
+    if final_loss is not None:
+        console.print(f"Final loss: {final_loss:.4f}")
+    if total_time:
+        console.print(f"Training time: {total_time:.1f}s")
+    console.print(f"Adapter saved to: {output_dir}")
+
+    if output_json:
+        click.echo(
+            json.dumps(
+                {
+                    "adapter_id": adapter_id,
+                    "output_dir": output_dir,
+                    "final_loss": final_loss,
+                    "total_time_seconds": total_time,
+                    "device": device_name,
+                },
+                indent=2,
+            )
+        )
+
+
+@cli.command()
+@click.option("--model", default=None, help="HuggingFace model name (local mode).")
+@click.option("--db", required=True, help="Path to DuckDB database file.")
+@click.option(
+    "--dataset-builtin",
+    default=None,
+    help="Built-in dataset name (e.g. 'capitals').",
+)
+@click.option(
+    "--dataset",
+    "dataset_path",
+    default=None,
+    type=click.Path(exists=True),
+    help="Custom JSONL dataset path.",
+)
+@click.option(
+    "--remote", default=None, help="GPU worker URL (e.g., http://172.30.0.1:8877)."
+)
+@click.option(
+    "--device", default="cpu", help="Device: cpu, cuda, directml, auto."
+)
+@click.option("--layers", default=None, help="Layer range (default: all).")
+@click.option("--html", "html_path", default=None, help="HTML heatmap output path.")
+@click.option("--json", "output_json", is_flag=True, help="JSON output.")
+@click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
+@click.option("--seed", default=42, type=int, help="Random seed.")
+def heatmap(
+    model,
+    db,
+    dataset_builtin,
+    dataset_path,
+    remote,
+    device,
+    layers,
+    html_path,
+    output_json,
+    adapter,
+    seed,
+):
+    """Generate MLP ablation heatmap: zero each MLP layer, measure prediction changes."""
+    import uuid
+    from datetime import datetime, timezone
+
+    from neurotrace.datasets import get_builtin_dataset, load_dataset
+    from neurotrace.heatmap import (
+        HeatmapResult,
+        build_layer_summaries,
+        generate_heatmap_html,
+        heatmap_result_to_dict,
+    )
+
+    # Validate inputs
+    if dataset_path is None and dataset_builtin is None:
+        raise click.UsageError("Must provide either --dataset or --dataset-builtin.")
+    if dataset_path is not None and dataset_builtin is not None:
+        raise click.UsageError("Cannot provide both --dataset and --dataset-builtin.")
+    if remote is None and model is None:
+        raise click.UsageError("Must provide --model (local mode) or --remote.")
+
+    # Load dataset
+    if dataset_builtin is not None:
+        dataset = get_builtin_dataset(dataset_builtin)
+        dataset_name = dataset_builtin
+    else:
+        dataset = load_dataset(dataset_path)
+        dataset_name = dataset_path
+
+    prompts = [{"prompt": d["prompt"], "answer": d["answer"]} for d in dataset]
+
+    run_id = str(uuid.uuid4())
+    created_at = datetime.now(timezone.utc).isoformat()
+
+    if remote is not None:
+        cells = _heatmap_remote(remote, prompts, seed)
+        # Get model name and num_layers from worker
+        from neurotrace.remote import RemoteWorker
+
+        worker = RemoteWorker(remote)
+        health = worker.health()
+        model_name = health["model"]
+        num_layers = health["num_layers"]
+    else:
+        from neurotrace.heatmap import run_heatmap_local
+        from neurotrace.models import get_architecture, load_model
+
+        device = _resolve_device(device)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("[progress.description]{task.description}"),
+            console=err_console,
+        ) as progress:
+            task = progress.add_task("Loading model...", total=None)
+            model_obj, tokenizer = load_model(model, device=device)
+            model_obj = _maybe_load_adapter(model_obj, adapter)
+            arch = get_architecture(model_obj.config.model_type)
+            num_layers = len(arch.get_layers(model_obj))
+            model_name = model
+
+            progress.update(
+                task,
+                description=(
+                    f"Running heatmap: {len(prompts)} prompts x {num_layers} layers"
+                ),
+                total=len(prompts) * num_layers,
+            )
+
+            def progress_cb(prompt_idx, layer_idx, n_prompts, n_layers):
+                completed = prompt_idx * n_layers + layer_idx + 1
+                progress.update(
+                    task,
+                    completed=completed,
+                    description=(
+                        f"Prompt {prompt_idx + 1}/{n_prompts} "
+                        f"Layer {layer_idx}/{n_layers}"
+                    ),
+                )
+
+            cells = run_heatmap_local(
+                model_obj,
+                tokenizer,
+                arch,
+                prompts,
+                seed=seed,
+                progress_callback=progress_cb,
+            )
+            progress.update(task, description="Done.")
+
+    # Build summaries
+    layer_summaries = build_layer_summaries(cells, num_layers, len(prompts))
+
+    result = HeatmapResult(
+        run_id=run_id,
+        dataset_name=dataset_name,
+        model_name=model_name,
+        num_layers=num_layers,
+        num_prompts=len(prompts),
+        cells=cells,
+        layer_summaries=layer_summaries,
+        created_at=created_at,
+    )
+
+    # Save to DB
+    result_dict = heatmap_result_to_dict(result)
+    db_conn = TraceDB(db)
+    db_conn.write_heatmap_run(
+        run_id=run_id,
+        dataset_name=dataset_name,
+        model_name=model_name,
+        num_layers=num_layers,
+        num_prompts=len(prompts),
+        cells_json=json.dumps(result_dict["cells"]),
+        summaries_json=json.dumps(result_dict["layer_summaries"]),
+        adapter_path=adapter,
+    )
+    db_conn.close()
+
+    # HTML output
+    if html_path:
+        import os
+
+        os.makedirs(os.path.dirname(html_path) or ".", exist_ok=True)
+        html = generate_heatmap_html(result)
+        with open(html_path, "w") as f:
+            f.write(html)
+        console.print(f"[green]Heatmap saved to {html_path}[/green]")
+
+    # JSON output
+    if output_json:
+        click.echo(json.dumps(result_dict, indent=2))
+        return
+
+    # Terminal table
+    console.print(
+        f"\n[bold]Heatmap:[/bold] {dataset_name} "
+        f"({len(prompts)} prompts x {num_layers} layers)"
+    )
+    console.print(f"Model: {model_name}\n")
+
+    table = Table()
+    table.add_column("Layer", justify="right")
+    table.add_column("Fixes", justify="right")
+    table.add_column("Breaks", justify="right")
+    table.add_column("Changes", justify="right")
+    table.add_column("Avg DProb", justify="right")
+    table.add_column("Impact", justify="right")
+
+    for s in layer_summaries:
+        style = None
+        if s.impact_score > 0.05:
+            style = "green"
+        elif s.impact_score < -0.05:
+            style = "red"
+        table.add_row(
+            str(s.layer),
+            str(s.fixes),
+            str(s.breaks),
+            str(s.changes),
+            f"{s.avg_delta_correct_prob:+.3f}",
+            f"{s.impact_score:+.3f}",
+            style=style,
+        )
+
+    console.print(table)
+
+
+def _heatmap_remote(remote_url, prompts, seed):
+    """Run heatmap via remote GPU worker with SSE streaming."""
+    from neurotrace.heatmap import HeatmapCell, check_correct
+    from neurotrace.remote import RemoteWorker
+
+    worker = RemoteWorker(remote_url)
+    health = worker.health()
+    num_layers = health["num_layers"]
+    device_name = health.get("device_name", health.get("device", "unknown"))
+
+    err_console.print(
+        f"GPU: {device_name} via {remote_url}"
+    )
+
+    cells = []
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        outer_task = progress.add_task(
+            "Heatmap", total=len(prompts)
+        )
+        inner_task = progress.add_task(
+            "Layer", total=num_layers + 1
+        )
+
+        for prompt_idx, item in enumerate(prompts):
+            prompt = item["prompt"]
+            answer = item["answer"]
+            progress.update(
+                outer_task,
+                description=f"Prompt {prompt_idx + 1}/{len(prompts)}",
+            )
+            progress.update(inner_task, completed=0)
+
+            baseline_token = None
+            baseline_prob = 0.0
+            baseline_correct = False
+
+            for event in worker.batch_ablate_stream(
+                prompt, num_layers, seed=seed
+            ):
+                etype = event.get("type")
+                if etype == "progress":
+                    idx = event.get("index", 0)
+                    progress.update(inner_task, completed=idx)
+                elif etype == "result":
+                    idx = event.get("index", 0)
+                    token = event.get("final_token", "")
+                    prob = event.get("final_prob", 0.0)
+                    zero_layers = event.get("zero_mlp_layers", [])
+
+                    if idx == 0:
+                        # Baseline
+                        baseline_token = token
+                        baseline_prob = prob
+                        baseline_correct = check_correct(token, answer)
+                    else:
+                        # Ablated — zero_layers has one element
+                        layer = zero_layers[0] if zero_layers else idx - 1
+                        ablated_correct = check_correct(token, answer)
+
+                        if not baseline_correct and ablated_correct:
+                            flip_dir = "fixed"
+                        elif baseline_correct and not ablated_correct:
+                            flip_dir = "broke"
+                        elif token != baseline_token:
+                            flip_dir = "changed"
+                        else:
+                            flip_dir = "none"
+
+                        cells.append(
+                            HeatmapCell(
+                                prompt_index=prompt_idx,
+                                prompt=prompt,
+                                expected_answer=answer,
+                                layer=layer,
+                                baseline_token=baseline_token,
+                                baseline_prob=baseline_prob,
+                                baseline_correct=baseline_correct,
+                                ablated_token=token,
+                                ablated_prob=prob,
+                                ablated_correct=ablated_correct,
+                                delta_correct_prob=prob - baseline_prob,
+                                flipped=token != baseline_token,
+                                flip_direction=flip_dir,
+                            )
+                        )
+
+            progress.update(outer_task, advance=1)
+
+    return cells

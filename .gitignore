@@ -8,3 +8,8 @@ report.html
 dist/
 build/
 .venv/
+adapters/
+experiments/
+probes/
+circuits/
+heatmaps/

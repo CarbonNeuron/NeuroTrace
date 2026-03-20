@@ -202,6 +202,19 @@ class TraceDB:
                 created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
             )
         """)
+        self._conn.execute("""
+            CREATE TABLE IF NOT EXISTS heatmap_runs (
+                run_id TEXT PRIMARY KEY,
+                dataset_name TEXT NOT NULL,
+                model_name TEXT NOT NULL,
+                adapter_path TEXT,
+                num_layers INTEGER NOT NULL,
+                num_prompts INTEGER NOT NULL,
+                created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                cells JSON NOT NULL,
+                summaries JSON NOT NULL
+            )
+        """)
 
     def write_trace(
         self, result: TraceResult, interventions: str | None = None
@@ -773,6 +786,46 @@ class TraceDB:
                 reverse_tokens,
             ],
         )
+
+    def write_heatmap_run(
+        self,
+        run_id: str,
+        dataset_name: str,
+        model_name: str,
+        num_layers: int,
+        num_prompts: int,
+        cells_json: str,
+        summaries_json: str,
+        adapter_path: str | None = None,
+    ) -> None:
+        """Write a heatmap run to the database."""
+        self._conn.execute(
+            "INSERT INTO heatmap_runs VALUES"
+            " (?, ?, ?, ?, ?, ?, CURRENT_TIMESTAMP, ?, ?)",
+            [
+                run_id,
+                dataset_name,
+                model_name,
+                adapter_path,
+                num_layers,
+                num_prompts,
+                cells_json,
+                summaries_json,
+            ],
+        )
+
+    def read_heatmap_run(self, run_id: str) -> dict:
+        """Read a heatmap run from the database."""
+        row = self._conn.execute(
+            "SELECT * FROM heatmap_runs WHERE run_id = ?", [run_id]
+        ).fetchone()
+        if row is None:
+            raise ValueError(f"Heatmap run not found: {run_id}")
+        cols = [
+            "run_id", "dataset_name", "model_name", "adapter_path",
+            "num_layers", "num_prompts", "created_at", "cells", "summaries",
+        ]
+        return dict(zip(cols, row))
 
     def close(self) -> None:
         self._conn.close()

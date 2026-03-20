@@ -863,6 +863,9 @@ finetune = [
 probe = [
     { name = "scikit-learn" },
 ]
+remote = [
+    { name = "httpx" },
+]
 upload = [
     { name = "carbonfiles-client" },
 ]
@@ -874,6 +877,7 @@ requires-dist = [
     { name = "click", specifier = ">=8.0" },
     { name = "datasets", marker = "extra == 'finetune'", specifier = ">=3.0.0" },
     { name = "duckdb", specifier = ">=1.0" },
+    { name = "httpx", marker = "extra == 'remote'", specifier = ">=0.27.0" },
     { name = "huggingface-hub", specifier = ">=0.20" },
     { name = "numpy", specifier = ">=1.24" },
     { name = "peft", marker = "extra == 'finetune'", specifier = ">=0.14.0" },
@@ -885,7 +889,7 @@ requires-dist = [
     { name = "torch", specifier = ">=2.0" },
     { name = "transformers", specifier = ">=4.30" },
 ]
-provides-extras = ["upload", "finetune", "probe", "dev"]
+provides-extras = ["upload", "finetune", "probe", "remote", "dev"]
 
 [[package]]
 name = "nodeenv"
