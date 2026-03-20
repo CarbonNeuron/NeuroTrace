@@ -416,3 +416,300 @@ def predict(model, prompt, top_k):
             bar_len = int(prob * 40)
             bar = "#" * bar_len
             console.print(f"  {prob:6.3f} [green]{bar}[/green] {repr(s)} (id={tok})")
+
+
+def _slugify(text: str, max_len: int = 30) -> str:
+    """Slugify text for use as a trace label."""
+    import re
+
+    slug = text.lower().strip()
+    slug = re.sub(r"[^a-z0-9]+", "-", slug)
+    slug = slug.strip("-")[:max_len].rstrip("-")
+    return slug
+
+
+def _decode_tokens(tokenizer, token_ids: list[int]) -> list[dict]:
+    """Decode token IDs to strings, hex bytes, and special flag."""
+    results = []
+    special_ids = set(tokenizer.all_special_ids)
+    for tid in sorted(token_ids):
+        decoded = tokenizer.decode(tid)
+        raw_token = tokenizer.convert_ids_to_tokens(tid)
+        token_bytes = decoded.encode("utf-8")
+        hex_bytes = " ".join(f"{b:02x}" for b in token_bytes)
+        results.append({
+            "token_id": tid,
+            "string": decoded,
+            "raw_token": raw_token,
+            "hex_bytes": hex_bytes,
+            "is_special": tid in special_ids,
+        })
+    return results
+
+
+@cli.command()
+@click.option(
+    "--model", required=True, help="HuggingFace model name or path."
+)
+@click.option(
+    "--tokens",
+    default=None,
+    multiple=True,
+    type=int,
+    help="Token IDs to decode.",
+)
+@click.option(
+    "--from-trace",
+    default=None,
+    help="Trace ID — decode all unique top-1 tokens.",
+)
+@click.option("--db", default=None, help="Path to DuckDB database file.")
+def decode(model, tokens, from_trace, db):
+    """Decode token IDs to human-readable strings."""
+    if not tokens and from_trace is None:
+        raise click.UsageError(
+            "Must provide --tokens or --from-trace."
+        )
+    if from_trace is not None and db is None:
+        raise click.UsageError("--from-trace requires --db.")
+
+    token_ids = list(tokens)
+
+    if from_trace is not None:
+        db_conn = TraceDB(db)
+        try:
+            trace_id = _resolve_trace_id(db_conn, from_trace)
+            stats = db_conn.get_layer_stats(trace_id)
+        finally:
+            db_conn.close()
+        unique_ids = {s["top1_token"] for s in stats}
+        token_ids = sorted(unique_ids)
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task("Loading tokenizer...", total=None)
+        from transformers import AutoTokenizer
+
+        tokenizer = AutoTokenizer.from_pretrained(model)
+        progress.update(task, description="Done.")
+
+    decoded = _decode_tokens(tokenizer, token_ids)
+
+    table = Table(title="Token Decode")
+    table.add_column("Token ID", justify="right", style="cyan")
+    table.add_column("String")
+    table.add_column("Raw Token")
+    table.add_column("Bytes")
+    table.add_column("Special")
+
+    for d in decoded:
+        table.add_row(
+            str(d["token_id"]),
+            repr(d["string"]),
+            str(d["raw_token"]),
+            d["hex_bytes"],
+            "YES" if d["is_special"] else "",
+        )
+
+    console.print(table)
+
+
+@cli.command()
+@click.option(
+    "--model", required=True, help="HuggingFace model name or path."
+)
+@click.option("--prompt-a", required=True, help="First prompt.")
+@click.option("--prompt-b", required=True, help="Second prompt.")
+@click.option("--db", required=True, help="Path to DuckDB database file.")
+@click.option("--seed", default=42, type=int, help="Random seed.")
+@click.option("--light", is_flag=True, help="Use light capture mode.")
+@click.option(
+    "--flagged-only", is_flag=True, help="Show only flagged layers."
+)
+@click.option(
+    "--head-detail", is_flag=True, help="Show critical head details."
+)
+@click.option(
+    "--json", "output_json", is_flag=True, help="Output as JSON."
+)
+def compare(
+    model, prompt_a, prompt_b, db, seed, light, flagged_only,
+    head_detail, output_json,
+):
+    """Trace two prompts, diff them, and show decoded results."""
+    from neurotrace.analyzer import compute_diff
+    from neurotrace.models import load_model
+    from neurotrace.tracer import Tracer
+
+    capture_mode = "light" if light else "full"
+    db_conn = TraceDB(db)
+
+    status_console = err_console if output_json else console
+
+    def find_or_trace(prompt, tracer_obj, tokenizer_obj):
+        """Return trace_id, reusing existing trace if possible."""
+        existing = db_conn.find_existing_trace(
+            model, prompt, seed, capture_mode,
+        )
+        if existing is not None:
+            status_console.print(
+                f"[dim]Reusing existing trace {existing[:8]}[/dim]"
+            )
+            return existing
+
+        label = _slugify(prompt)
+        result = tracer_obj.trace(prompt, label=label, seed=seed)
+        db_conn.write_trace(result)
+        status_console.print(
+            f"[green]Traced: {result.metadata.trace_id[:8]}[/green]"
+            f" ({repr(prompt[:40])})"
+        )
+        return result.metadata.trace_id
+
+    with Progress(
+        SpinnerColumn(),
+        TextColumn("[progress.description]{task.description}"),
+        console=err_console,
+    ) as progress:
+        task = progress.add_task("Loading model...", total=None)
+        model_obj, tokenizer = load_model(model)
+        progress.update(task, description="Model loaded.")
+
+        tracer = Tracer(
+            model_obj, tokenizer, capture_mode=capture_mode,
+        )
+
+        progress.update(task, description="Tracing prompt A...")
+        trace_a_id = find_or_trace(prompt_a, tracer, tokenizer)
+
+        progress.update(task, description="Tracing prompt B...")
+        trace_b_id = find_or_trace(prompt_b, tracer, tokenizer)
+
+        progress.update(task, description="Done.")
+
+    # Load traces and diff
+    result_a = db_conn.read_trace(trace_a_id)
+    result_b = db_conn.read_trace(trace_b_id)
+    db_conn.close()
+
+    diff_result = compute_diff(result_a, result_b)
+
+    # Build token decode lookup from both traces
+    all_top1_ids = set()
+    for m in diff_result.layer_metrics:
+        all_top1_ids.add(m.trace_a_top1)
+        all_top1_ids.add(m.trace_b_top1)
+    token_lookup = {}
+    for tid in all_top1_ids:
+        token_lookup[tid] = tokenizer.decode(tid)
+
+    if output_json:
+        output = {
+            "trace_a_id": diff_result.trace_a_id,
+            "trace_b_id": diff_result.trace_b_id,
+            "prompt_a": prompt_a,
+            "prompt_b": prompt_b,
+            "first_divergence_layer": diff_result.first_divergence_layer,
+            "token_legend": {
+                str(k): v for k, v in token_lookup.items()
+            },
+            "layer_metrics": [
+                {
+                    "layer_index": m.layer_index,
+                    "cosine_similarity": m.cosine_similarity,
+                    "top1_changed": m.top1_changed,
+                    "kl_divergence": m.kl_divergence,
+                    "flagged": m.flagged,
+                    "trace_a_top1": m.trace_a_top1,
+                    "trace_a_top1_str": token_lookup.get(
+                        m.trace_a_top1, "?"
+                    ),
+                    "trace_a_top1_prob": m.trace_a_top1_prob,
+                    "trace_b_top1": m.trace_b_top1,
+                    "trace_b_top1_str": token_lookup.get(
+                        m.trace_b_top1, "?"
+                    ),
+                    "trace_b_top1_prob": m.trace_b_top1_prob,
+                }
+                for m in diff_result.layer_metrics
+            ],
+            "critical_heads": [
+                {"layer": h[0], "head": h[1], "js_divergence": h[2]}
+                for h in diff_result.critical_heads
+            ],
+        }
+        click.echo(json.dumps(output, indent=2, default=str))
+        return
+
+    # Rich table output
+    metrics = list(diff_result.layer_metrics)
+    if flagged_only:
+        metrics = [m for m in metrics if m.flagged]
+
+    table = Table(
+        title=f"Compare: {trace_a_id[:8]} vs {trace_b_id[:8]}"
+    )
+    table.add_column("Layer", justify="right")
+    table.add_column("Cos Sim", justify="right")
+    table.add_column("Top-1 Changed")
+    table.add_column("KL Div", justify="right")
+    table.add_column("Flagged")
+    table.add_column("Trace A Top-1")
+    table.add_column("Trace B Top-1")
+
+    for m in metrics:
+        style = "red" if m.flagged else None
+        a_str = token_lookup.get(m.trace_a_top1, "?")
+        b_str = token_lookup.get(m.trace_b_top1, "?")
+        table.add_row(
+            str(m.layer_index),
+            f"{m.cosine_similarity:.4f}",
+            "YES" if m.top1_changed else "no",
+            f"{m.kl_divergence:.4f}",
+            "FLAGGED" if m.flagged else "",
+            f"{repr(a_str)} ({m.trace_a_top1_prob:.2f})",
+            f"{repr(b_str)} ({m.trace_b_top1_prob:.2f})",
+            style=style,
+        )
+
+    console.print(table)
+
+    # Summary
+    flagged_count = sum(
+        1 for m in diff_result.layer_metrics if m.flagged
+    )
+    console.print(
+        f"\n[bold]Flagged layers:[/bold] "
+        f"{flagged_count}/{len(diff_result.layer_metrics)}"
+    )
+    if diff_result.first_divergence_layer is not None:
+        console.print(
+            f"[bold]First divergence:[/bold]"
+            f" layer {diff_result.first_divergence_layer}"
+        )
+
+    if head_detail and diff_result.critical_heads:
+        console.print(
+            "\n[bold]Critical Heads (top JS divergence):[/bold]"
+        )
+        head_table = Table()
+        head_table.add_column("Layer", justify="right")
+        head_table.add_column("Head", justify="right")
+        head_table.add_column("JS Divergence", justify="right")
+        for layer_idx, head_idx, js_div in diff_result.critical_heads:
+            head_table.add_row(
+                str(layer_idx), str(head_idx), f"{js_div:.6f}"
+            )
+        console.print(head_table)
+
+    # Token legend
+    console.print("\n[bold]Token Legend:[/bold]")
+    legend_table = Table()
+    legend_table.add_column("ID", justify="right", style="cyan")
+    legend_table.add_column("String")
+    for tid in sorted(token_lookup.keys()):
+        legend_table.add_row(str(tid), repr(token_lookup[tid]))
+    console.print(legend_table)

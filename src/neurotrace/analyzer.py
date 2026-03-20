@@ -34,8 +34,14 @@ class DiffResult:
 
 
 def _cosine_sim(a: np.ndarray, b: np.ndarray) -> float:
+    # When shapes differ (different seq_len), compare last position only
+    if a.shape != b.shape and a.ndim >= 2 and b.ndim >= 2:
+        a = a[-1:]
+        b = b[-1:]
     a_flat = a.flatten()
     b_flat = b.flatten()
+    if a_flat.shape != b_flat.shape:
+        return 0.0
     denom = np.linalg.norm(a_flat) * np.linalg.norm(b_flat)
     if denom < 1e-10:
         return 1.0
@@ -86,7 +92,8 @@ def compute_diff(
         ):
             a_avg = snap_a.attention_weights.mean(axis=0).flatten()
             b_avg = snap_b.attention_weights.mean(axis=0).flatten()
-            kl_div = _kl_divergence(a_avg, b_avg)
+            if a_avg.shape == b_avg.shape:
+                kl_div = _kl_divergence(a_avg, b_avg)
 
         # (D) Combined flagging
         flagged = cos_sim < cosine_threshold or top1_changed or kl_div > kl_threshold
@@ -114,11 +121,20 @@ def compute_diff(
             and snap_b.attention_weights is not None
         ):
             num_heads = snap_a.attention_weights.shape[0]
+            same_shape = (
+                snap_a.attention_weights.shape
+                == snap_b.attention_weights.shape
+            )
             for h in range(num_heads):
-                a_head = snap_a.attention_weights[h].flatten()
-                b_head = snap_b.attention_weights[h].flatten()
-                js = _js_divergence(a_head, b_head)
-                all_head_divergences.append((snap_a.layer_index, h, js))
+                if same_shape:
+                    a_head = snap_a.attention_weights[h].flatten()
+                    b_head = snap_b.attention_weights[h].flatten()
+                    js = _js_divergence(a_head, b_head)
+                else:
+                    js = 0.0
+                all_head_divergences.append(
+                    (snap_a.layer_index, h, js)
+                )
 
     # Top critical heads by JS divergence
     all_head_divergences.sort(key=lambda x: x[2], reverse=True)

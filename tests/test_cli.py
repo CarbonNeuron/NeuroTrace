@@ -3,6 +3,7 @@
 import json
 
 import numpy as np
+import pytest
 from click.testing import CliRunner
 
 from neurotrace.cli import cli
@@ -13,6 +14,8 @@ from neurotrace.types import (
     TraceMetadata,
     TraceResult,
 )
+
+TINYLLAMA = "TinyLlama/TinyLlama-1.1B-Chat-v1.0"
 
 
 def _write_sample_trace(
@@ -154,3 +157,114 @@ def test_prompts_file(tmp_path):
     )
     # Should fail at model loading, not at argument parsing
     assert "nonexistent" in result.output or result.exit_code != 0
+
+
+@pytest.mark.model_download
+def test_decode_specific_tokens(tinyllama_model):
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        ["decode", "--model", TINYLLAMA, "--tokens", "3681", "--tokens", "593"],
+    )
+    assert result.exit_code == 0
+    assert "3681" in result.output
+    assert "593" in result.output
+
+
+@pytest.mark.model_download
+def test_decode_from_trace(tinyllama_model, tmp_path):
+    db_path = str(tmp_path / "test.db")
+    runner = CliRunner()
+    # First create a trace
+    runner.invoke(
+        cli,
+        [
+            "trace", "--model", TINYLLAMA,
+            "--prompt", "Hello", "--db", db_path,
+        ],
+    )
+    # Now decode from it
+    result = runner.invoke(
+        cli,
+        [
+            "decode", "--model", TINYLLAMA,
+            "--from-trace", "latest", "--db", db_path,
+        ],
+    )
+    assert result.exit_code == 0
+    assert "Token Decode" in result.output
+
+
+@pytest.mark.model_download
+def test_compare_end_to_end(tinyllama_model, tmp_path):
+    db_path = str(tmp_path / "test.db")
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "compare", "--model", TINYLLAMA,
+            "--prompt-a", "The capital of France is",
+            "--prompt-b", "The capital of Germany is",
+            "--db", db_path,
+        ],
+    )
+    assert result.exit_code == 0
+    assert "Compare:" in result.output
+    assert "Token Legend" in result.output
+    assert "Flagged layers:" in result.output
+
+
+@pytest.mark.model_download
+def test_compare_reuses_existing_traces(tinyllama_model, tmp_path):
+    db_path = str(tmp_path / "test.db")
+    runner = CliRunner()
+    # Run compare once
+    runner.invoke(
+        cli,
+        [
+            "compare", "--model", TINYLLAMA,
+            "--prompt-a", "Hello world",
+            "--prompt-b", "Goodbye world",
+            "--db", db_path,
+        ],
+    )
+    # Run same compare again — should reuse
+    result = runner.invoke(
+        cli,
+        [
+            "compare", "--model", TINYLLAMA,
+            "--prompt-a", "Hello world",
+            "--prompt-b", "Goodbye world",
+            "--db", db_path,
+        ],
+    )
+    assert result.exit_code == 0
+    assert "Reusing existing trace" in result.output
+
+    # Verify only 2 traces in DB (not 4)
+    db_conn = TraceDB(db_path)
+    traces = db_conn.list_traces()
+    db_conn.close()
+    assert len(traces) == 2
+
+
+@pytest.mark.model_download
+def test_compare_json_output(tinyllama_model, tmp_path):
+    db_path = str(tmp_path / "test.db")
+    runner = CliRunner()
+    result = runner.invoke(
+        cli,
+        [
+            "compare", "--model", TINYLLAMA,
+            "--prompt-a", "Hello",
+            "--prompt-b", "Goodbye",
+            "--db", db_path, "--json",
+        ],
+    )
+    assert result.exit_code == 0
+    # Extract JSON from output (tqdm progress bars may precede it)
+    output = result.output[result.output.index("{"):]
+    data = json.loads(output)
+    assert "token_legend" in data
+    assert "layer_metrics" in data
+    assert "trace_a_top1_str" in data["layer_metrics"][0]

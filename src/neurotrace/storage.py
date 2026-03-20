@@ -429,5 +429,21 @@ class TraceDB:
             for r in rows
         ]
 
+    def find_existing_trace(
+        self,
+        model_name: str,
+        prompt: str,
+        seed: int,
+        capture_mode: str,
+    ) -> str | None:
+        """Find an existing trace matching these parameters."""
+        row = self._conn.execute(
+            "SELECT trace_id FROM traces"
+            " WHERE model_name = ? AND prompt = ?"
+            " AND random_seed = ? AND capture_mode = ?",
+            [model_name, prompt, seed, capture_mode],
+        ).fetchone()
+        return row[0] if row else None
+
     def close(self) -> None:
         self._conn.close()
