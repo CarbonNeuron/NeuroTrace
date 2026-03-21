@@ -20,12 +20,14 @@ class PromptHealResult:
     answer: str
     baseline_prob: float
     baseline_status: str  # "correct" | "wrong" | "sabotaged" | "weak"
-    action: str  # "healed" | "rolled_back" | "skipped" | "already_correct" | "wrong"
+    action: str  # "healed" | "lobotomized" | "rolled_back" | "skipped" | "already_correct" | "wrong"
     result_prob: float
     final_status: str  # "correct" | "wrong" | "sabotaged" | "weak"
     target_layer: int | None = None
     edit_norm: float | None = None
     rollback_reason: str | None = None
+    before_token: str | None = None
+    after_token: str | None = None
 
 
 @dataclass
@@ -46,6 +48,7 @@ class HealResult:
     healed_weak: int
     edits_attempted: int
     edits_applied: int
+    edits_lobotomized: int
     edits_rolled_back: int
     edits_skipped: int
     regressions_checked: int
@@ -143,6 +146,7 @@ def run_heal_local(
             healed_weak=baseline_weak,
             edits_attempted=0,
             edits_applied=0,
+            edits_lobotomized=0,
             edits_rolled_back=0,
             edits_skipped=0,
             regressions_checked=0,
@@ -465,6 +469,7 @@ def run_heal_local(
         ),
         edits_attempted=edits_attempted,
         edits_applied=edits_applied,
+        edits_lobotomized=0,
         edits_rolled_back=edits_rolled_back,
         edits_skipped=edits_skipped,
         regressions_checked=regressions_checked,
@@ -530,6 +535,7 @@ def heal_result_to_dict(result: HealResult) -> dict:
         "edits": {
             "attempted": result.edits_attempted,
             "applied": result.edits_applied,
+            "lobotomized": result.edits_lobotomized,
             "rolled_back": result.edits_rolled_back,
             "skipped": result.edits_skipped,
         },
@@ -558,6 +564,8 @@ def heal_result_to_dict(result: HealResult) -> dict:
                 "target_layer": pr.target_layer,
                 "edit_norm": pr.edit_norm,
                 "rollback_reason": pr.rollback_reason,
+                "before_token": pr.before_token,
+                "after_token": pr.after_token,
             }
             for pr in result.prompt_results
         ],
@@ -585,9 +593,13 @@ def _esc(s: Any) -> str:
     return _html.escape(str(s))
 
 
+_PURPLE = "#ab47bc"
+
+
 def _action_color(action: str) -> str:
     return {
         "healed": _GREEN,
+        "lobotomized": _PURPLE,
         "already_correct": _YELLOW,
         "wrong": _RED,
         "rolled_back": _ORANGE,
@@ -755,11 +767,16 @@ def generate_heal_html(result: HealResult) -> str:
     parts.append(
         "<table><thead><tr>"
         "<th>Prompt</th><th>Answer</th><th>Baseline</th>"
-        "<th>Status</th><th>Action</th><th>Result</th><th>Final</th>"
+        "<th>Status</th><th>Action</th><th>Edit</th>"
+        "<th>Result</th><th>Final</th>"
         "</tr></thead><tbody>"
     )
     for pr in result.prompt_results:
         ac = _action_color(pr.action)
+        if pr.before_token and pr.after_token:
+            edit_cell = f"{_esc(pr.before_token)} &rarr; {_esc(pr.after_token)}"
+        else:
+            edit_cell = "-"
         parts.append(
             f"<tr>"
             f"<td>{_esc(pr.prompt[:50])}</td>"
@@ -768,6 +785,7 @@ def generate_heal_html(result: HealResult) -> str:
             f"<td>{_esc(pr.baseline_status)}</td>"
             f'<td><span class="action-badge" style="background:{ac}">'
             f"{_esc(pr.action.upper())}</span></td>"
+            f"<td>{edit_cell}</td>"
             f"<td>{pr.result_prob:.2%}</td>"
             f"<td>{_esc(pr.final_status)}</td>"
             f"</tr>"

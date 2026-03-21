@@ -174,11 +174,12 @@ def heal(
     console.print(f"  Healed:   {hc}/{total} ({healed_acc:.0%})")
     console.print()
     ea = result.edits_applied
+    lo = result.edits_lobotomized
     rb = result.edits_rolled_back
     sk = result.edits_skipped
     console.print(
-        f"  Edits: {ea} applied, {rb} rolled back,"
-        f" {sk} skipped"
+        f"  Edits: {ea} applied, {lo} lobotomized,"
+        f" {rb} rolled back, {sk} skipped"
     )
 
     if result.regressions_found:
@@ -210,11 +211,13 @@ def heal(
     table.add_column("Answer")
     table.add_column("Baseline", justify="right")
     table.add_column("Action")
+    table.add_column("Edit")
     table.add_column("Result", justify="right")
     table.add_column("Final")
 
     action_styles = {
         "healed": "green",
+        "lobotomized": "magenta",
         "already_correct": "yellow",
         "wrong": "red",
         "rolled_back": "bright_red",
@@ -224,11 +227,16 @@ def heal(
 
     for pr in result.prompt_results:
         style = action_styles.get(pr.action, "")
+        if pr.before_token and pr.after_token:
+            edit_str = f"{pr.before_token} → {pr.after_token}"
+        else:
+            edit_str = "-"
         table.add_row(
             pr.prompt[:40],
             pr.answer,
             f"{pr.baseline_prob:.2%}",
             f"[{style}]{pr.action.upper()}[/{style}]",
+            edit_str,
             f"{pr.result_prob:.2%}",
             pr.final_status,
         )
@@ -325,6 +333,7 @@ def _heal_remote(
                 "prob": prob,
                 "margin": margin,
                 "status": status,
+                "before_token": final_token.strip().lstrip("\u2581\u0120"),
             })
 
         baseline_correct = sum(1 for r in baseline_results if r["status"] == "correct")
@@ -350,6 +359,7 @@ def _heal_remote(
 
         # Step 2: Sequential repair
         edits_applied = 0
+        edits_lobotomized = 0
         edits_rolled_back = 0
         edits_skipped = 0
 
@@ -386,18 +396,69 @@ def _heal_remote(
                     layer, seed=seed,
                 )
                 if edit_result.success:
-                    edits_applied += 1
-                    prompt_results.append(PromptHealResult(
-                        prompt=entry["prompt"],
-                        answer=entry["answer"],
-                        baseline_prob=entry["prob"],
-                        baseline_status="wrong",
-                        action="healed",
-                        result_prob=edit_result.post_prob,
-                        final_status="correct",
-                        target_layer=layer,
-                        edit_norm=0.0,
-                    ))
+                    # Get the after-edit top token
+                    post_fwd = worker.forward(
+                        entry["prompt"], raw=True, top_k=5,
+                        layer_predictions=False, seed=seed,
+                    )
+                    after_token = (
+                        post_fwd.top_tokens[0].token.strip().lstrip("\u2581\u0120")
+                        if post_fwd.top_tokens else "?"
+                    )
+                    post_prob = post_fwd.top_tokens[0].prob if post_fwd.top_tokens else 0.0
+
+                    # Lobotomized: result prob worse than baseline
+                    if post_prob < entry["prob"]:
+                        edits_lobotomized += 1
+                        # Auto-rollback
+                        try:
+                            worker.edit_undo()
+                            edits_rolled_back += 1
+                            prompt_results.append(PromptHealResult(
+                                prompt=entry["prompt"],
+                                answer=entry["answer"],
+                                baseline_prob=entry["prob"],
+                                baseline_status="wrong",
+                                action="lobotomized",
+                                result_prob=post_prob,
+                                final_status="wrong",
+                                target_layer=layer,
+                                edit_norm=0.0,
+                                rollback_reason="auto-rollback: result < baseline",
+                                before_token=entry.get("before_token", "?"),
+                                after_token=after_token,
+                            ))
+                        except Exception:
+                            # Undo not available — lobotomized persists
+                            edits_applied += 1
+                            prompt_results.append(PromptHealResult(
+                                prompt=entry["prompt"],
+                                answer=entry["answer"],
+                                baseline_prob=entry["prob"],
+                                baseline_status="wrong",
+                                action="lobotomized",
+                                result_prob=post_prob,
+                                final_status="wrong",
+                                target_layer=layer,
+                                edit_norm=0.0,
+                                before_token=entry.get("before_token", "?"),
+                                after_token=after_token,
+                            ))
+                    else:
+                        edits_applied += 1
+                        prompt_results.append(PromptHealResult(
+                            prompt=entry["prompt"],
+                            answer=entry["answer"],
+                            baseline_prob=entry["prob"],
+                            baseline_status="wrong",
+                            action="healed",
+                            result_prob=post_prob,
+                            final_status="correct",
+                            target_layer=layer,
+                            edit_norm=0.0,
+                            before_token=entry.get("before_token", "?"),
+                            after_token=after_token,
+                        ))
                 else:
                     edits_skipped += 1
                     prompt_results.append(PromptHealResult(
@@ -481,6 +542,7 @@ def _heal_remote(
         healed_weak=0,
         edits_attempted=len(healable),
         edits_applied=edits_applied,
+        edits_lobotomized=edits_lobotomized,
         edits_rolled_back=edits_rolled_back,
         edits_skipped=edits_skipped,
         regressions_checked=0,
@@ -524,6 +586,7 @@ def _heal_remote(
     console.print(f"  Healed:   {result.healed_correct}/{total} ({healed_acc:.0%})")
     console.print(
         f"  Edits: {edits_applied} applied,"
+        f" {edits_lobotomized} lobotomized,"
         f" {edits_rolled_back} rolled back,"
         f" {edits_skipped} skipped"
     )
@@ -537,10 +600,12 @@ def _heal_remote(
     table.add_column("Answer")
     table.add_column("Baseline", justify="right")
     table.add_column("Action")
+    table.add_column("Edit")
     table.add_column("Result", justify="right")
 
     action_styles = {
         "healed": "green",
+        "lobotomized": "magenta",
         "already_correct": "yellow",
         "wrong": "red",
         "rolled_back": "bright_red",
@@ -550,11 +615,16 @@ def _heal_remote(
 
     for pr in prompt_results:
         style = action_styles.get(pr.action, "")
+        if pr.before_token and pr.after_token:
+            edit_str = f"{pr.before_token} → {pr.after_token}"
+        else:
+            edit_str = "-"
         table.add_row(
             pr.prompt[:40],
             pr.answer,
             f"{pr.baseline_prob:.2%}",
             f"[{style}]{pr.action.upper()}[/{style}]",
+            edit_str,
             f"{pr.result_prob:.2%}",
         )
 

@@ -27,6 +27,7 @@ def _make_heal_result(
     healed_sabotaged=0,
     healed_weak=0,
     edits_applied=8,
+    edits_lobotomized=0,
     edits_rolled_back=1,
     edits_skipped=0,
     ppl_before=1.25,
@@ -95,6 +96,7 @@ def _make_heal_result(
         healed_weak=healed_weak,
         edits_attempted=edits_applied + edits_rolled_back,
         edits_applied=edits_applied,
+        edits_lobotomized=edits_lobotomized,
         edits_rolled_back=edits_rolled_back,
         edits_skipped=edits_skipped,
         regressions_checked=272,
@@ -395,6 +397,146 @@ class TestHealCustomDataset:
         assert len(ds) == 2
         assert ds[0]["prompt"] == "The capital of Germany is"
         assert ds[1]["answer"] == "Au"
+
+
+# ---------------------------------------------------------------------------
+# Lobotomized / before-after token tests
+# ---------------------------------------------------------------------------
+
+
+class TestHealLobotomized:
+    def test_lobotomized_status(self):
+        """Lobotomized action is valid in PromptHealResult."""
+        pr = PromptHealResult(
+            prompt="The atomic number of gold is",
+            answer="79",
+            baseline_prob=0.10,
+            baseline_status="wrong",
+            action="lobotomized",
+            result_prob=0.05,
+            final_status="wrong",
+            target_layer=11,
+            before_token="79",
+            after_token="Au",
+            rollback_reason="auto-rollback: result < baseline",
+        )
+        assert pr.action == "lobotomized"
+        assert pr.before_token == "79"
+        assert pr.after_token == "Au"
+        assert pr.rollback_reason is not None
+
+    def test_before_after_token_fields(self):
+        """Healed entries carry before/after tokens."""
+        pr = PromptHealResult(
+            prompt="The capital of Germany is",
+            answer="Berlin",
+            baseline_prob=0.05,
+            baseline_status="wrong",
+            action="healed",
+            result_prob=0.85,
+            final_status="correct",
+            before_token="located",
+            after_token="Berlin",
+        )
+        assert pr.before_token == "located"
+        assert pr.after_token == "Berlin"
+
+    def test_before_after_default_none(self):
+        """Default values are None for backward compat."""
+        pr = PromptHealResult(
+            prompt="p", answer="a",
+            baseline_prob=0.5, baseline_status="correct",
+            action="already_correct",
+            result_prob=0.5, final_status="correct",
+        )
+        assert pr.before_token is None
+        assert pr.after_token is None
+
+    def test_heal_result_lobotomized_count(self):
+        """HealResult tracks edits_lobotomized."""
+        result = _make_heal_result(edits_lobotomized=3)
+        assert result.edits_lobotomized == 3
+
+    def test_json_includes_lobotomized(self):
+        """JSON output includes lobotomized count and tokens."""
+        pr_list = [
+            PromptHealResult(
+                prompt="The atomic number of gold is",
+                answer="79",
+                baseline_prob=0.10,
+                baseline_status="wrong",
+                action="lobotomized",
+                result_prob=0.05,
+                final_status="wrong",
+                before_token="79",
+                after_token="Au",
+                rollback_reason="auto-rollback: result < baseline",
+            ),
+        ]
+        result = _make_heal_result(
+            edits_lobotomized=1,
+            prompt_results=pr_list,
+        )
+        d = heal_result_to_dict(result)
+        assert d["edits"]["lobotomized"] == 1
+        assert d["prompts"][0]["before_token"] == "79"
+        assert d["prompts"][0]["after_token"] == "Au"
+        assert d["prompts"][0]["action"] == "lobotomized"
+
+    def test_html_includes_edit_column(self):
+        """HTML report includes Edit column with before → after."""
+        pr_list = [
+            PromptHealResult(
+                prompt="The capital of Germany is",
+                answer="Berlin",
+                baseline_prob=0.05,
+                baseline_status="wrong",
+                action="healed",
+                result_prob=0.85,
+                final_status="correct",
+                before_token="located",
+                after_token="Berlin",
+            ),
+            PromptHealResult(
+                prompt="The capital of France is",
+                answer="Paris",
+                baseline_prob=0.85,
+                baseline_status="correct",
+                action="already_correct",
+                result_prob=0.85,
+                final_status="correct",
+            ),
+        ]
+        result = _make_heal_result(prompt_results=pr_list)
+        html = generate_heal_html(result)
+        assert "<th>Edit</th>" in html
+        assert "located" in html
+        assert "&rarr;" in html
+        assert "Berlin" in html
+        # ALREADY_CORRECT should show "-"
+        assert "-</td>" in html
+
+    def test_html_lobotomized_badge(self):
+        """HTML report shows LOBOTOMIZED badge."""
+        pr_list = [
+            PromptHealResult(
+                prompt="Test",
+                answer="79",
+                baseline_prob=0.10,
+                baseline_status="wrong",
+                action="lobotomized",
+                result_prob=0.05,
+                final_status="wrong",
+                before_token="79",
+                after_token="Au",
+            ),
+        ]
+        result = _make_heal_result(
+            edits_lobotomized=1,
+            prompt_results=pr_list,
+        )
+        html = generate_heal_html(result)
+        assert "LOBOTOMIZED" in html
 
 
 # ---------------------------------------------------------------------------
