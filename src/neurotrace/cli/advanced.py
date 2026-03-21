@@ -718,13 +718,8 @@ def _attention_trace_local(
 def _attention_trace_remote(
     remote_url, prompts, layer_spec, seed, model_name_hint,
 ):
-    """Run attention-trace via remote GPU worker."""
-    import base64
-
-    import numpy as np
-
-    from neurotrace.attention_trace import run_attention_trace_remote
-    from neurotrace.models import get_lm_head_and_norm, load_model
+    """Run attention-trace via remote GPU worker using v2 attention()."""
+    from neurotrace.attention_trace import AttentionTraceEntry, AttentionTraceResult
     from neurotrace.remote import WorkerClient
 
     worker = WorkerClient(remote_url)
@@ -747,17 +742,8 @@ def _attention_trace_remote(
         TextColumn("[progress.description]{task.description}"),
         console=err_console,
     ) as progress:
-        task = progress.add_task("Loading tokenizer & lm_head...", total=None)
-        model_obj, tokenizer = load_model(model_name, device="cpu")
-        lm_head, _ = get_lm_head_and_norm(model_obj)
-        lm_head_weight = lm_head.weight.data.cpu().float().numpy()
-
-        progress.update(
-            task,
-            description=(
-                f"Attention-trace: {len(prompts)} prompts"
-                f" \u00d7 {len(layers)} layers"
-            ),
+        task = progress.add_task(
+            f"Attention-trace: {len(prompts)} prompts",
             total=len(prompts),
         )
 
@@ -768,36 +754,71 @@ def _attention_trace_remote(
             )
 
             prompt_text = entry["prompt"]
+            answer_text = entry["answer"]
 
-            # Fetch per-head contributions from remote
-            layer_contributions: dict[int, np.ndarray] = {}
-            for event in worker.attention_contributions_stream(
-                prompt_text, layers, seed=seed,
-            ):
-                etype = event.get("type")
-                if etype == "layer-contributions":
-                    layer_idx = event["layer"]
-                    shape = event["shape"]
-                    dtype = (
-                        np.float16
-                        if event.get("dtype") == "float16"
-                        else np.float32
-                    )
-                    arr = np.frombuffer(
-                        base64.b64decode(event["contributions"]),
-                        dtype=dtype,
-                    ).astype(np.float32).reshape(shape).copy()
-                    layer_contributions[layer_idx] = arr
+            try:
+                attn_result = worker.attention(
+                    prompt_text, answer_text, seed=seed,
+                )
 
-            result = run_attention_trace_remote(
-                layer_contributions=layer_contributions,
-                tokenizer=tokenizer,
-                prompt=prompt_text,
-                answer=entry["answer"],
-                layers=layers,
-                lm_head_weight=lm_head_weight,
-            )
-            all_results.append(result)
+                # Build AttentionTraceResult from per-head contributions
+                entries = []
+                for hc in attn_result.heads:
+                    if hc.layer in layers:
+                        entries.append(AttentionTraceEntry(
+                            prompt=prompt_text,
+                            layer=hc.layer,
+                            head_idx=hc.head,
+                            answer_projection=hc.logit_contribution,
+                            magnitude=abs(hc.logit_contribution),
+                        ))
+
+                all_results.append(AttentionTraceResult(
+                    prompt=prompt_text,
+                    answer=answer_text,
+                    entries=entries,
+                ))
+            except Exception:
+                # Fallback to legacy attention_contributions_stream
+                import base64
+
+                import numpy as np
+
+                from neurotrace.attention_trace import run_attention_trace_remote
+                from neurotrace.models import get_lm_head_and_norm, load_model
+
+                m, t = load_model(model_name, device="cpu")
+                lm, _ = get_lm_head_and_norm(m)
+                lm_w = lm.weight.data.cpu().float().numpy()
+
+                layer_contributions: dict[int, np.ndarray] = {}
+                for event in worker.attention_contributions_stream(
+                    prompt_text, layers, seed=seed,
+                ):
+                    etype = event.get("type")
+                    if etype == "layer-contributions":
+                        layer_idx = event["layer"]
+                        shape = event["shape"]
+                        dt = (
+                            np.float16
+                            if event.get("dtype") == "float16"
+                            else np.float32
+                        )
+                        arr = np.frombuffer(
+                            base64.b64decode(event["contributions"]),
+                            dtype=dt,
+                        ).astype(np.float32).reshape(shape).copy()
+                        layer_contributions[layer_idx] = arr
+
+                result = run_attention_trace_remote(
+                    layer_contributions=layer_contributions,
+                    tokenizer=t,
+                    prompt=prompt_text,
+                    answer=answer_text,
+                    layers=layers,
+                    lm_head_weight=lm_w,
+                )
+                all_results.append(result)
 
         progress.update(task, description="Done.", completed=len(prompts))
 
@@ -807,7 +828,7 @@ def _attention_trace_remote(
 def _token_trace_remote(
     remote_url, prompts, layer_spec, commitment_data, seed, model_name_hint,
 ):
-    """Run token-trace via remote GPU worker."""
+    """Run token-trace via remote GPU worker using v2 hooked()."""
     import base64
 
     import numpy as np
@@ -858,7 +879,8 @@ def _token_trace_remote(
 
             prompt_text = entry["prompt"]
 
-            # Fetch all-position MLP deltas from remote
+            # Fetch all-position MLP deltas via legacy stream
+            # (v2 hooked() doesn't yet support all-position capture)
             all_position_deltas: dict[int, np.ndarray] = {}
             for event in worker.forward_mlp_deltas_all_positions_stream(
                 prompt_text, layers, seed=seed,
@@ -1720,8 +1742,14 @@ def decompose(
 
 
 def _decompose_remote(remote_url, prompts, competitor_list, seed, raw=True):
-    """Run decompose via remote GPU worker."""
-    from neurotrace.decompose import run_decompose_remote
+    """Run decompose via remote GPU worker using v2 decompose()."""
+    from neurotrace.decompose import (
+        DecomposeResult as LocalDecomposeResult,
+    )
+    from neurotrace.decompose import (
+        LayerContribution,
+        TokenDecomposition,
+    )
     from neurotrace.remote import WorkerClient
 
     worker = WorkerClient(remote_url)
@@ -1751,27 +1779,96 @@ def _decompose_remote(remote_url, prompts, competitor_list, seed, raw=True):
             prompt_text = entry["prompt"]
             answer_text = entry["answer"]
 
-            # Determine competitors for this prompt
-            comps = competitor_list
+            # Get decomposition from worker
+            decomp = worker.decompose(
+                prompt_text, answer_text, raw=raw, seed=seed,
+            )
+
+            # Build answer decomposition from worker result
+            a_layers = [
+                LayerContribution(
+                    layer=ld.layer,
+                    attention=ld.attn_logit,
+                    mlp=ld.mlp_logit,
+                )
+                for ld in decomp.layers
+            ]
+            a_decomp = TokenDecomposition(
+                token_str=answer_text,
+                token_id=decomp.answer_token_id,
+                final_logit=decomp.total_logit,
+                embedding=0.0,
+                layers=a_layers,
+                reconstruction_error=decomp.reconstruction_error,
+                norm_scale=1.0,
+            )
+
+            # Build results for each competitor
+            comps = competitor_list or []
+            if not comps and decomp.competitors:
+                comps = [c.token for c in decomp.competitors]
             if not comps:
-                comps = ["the", "a", "is"]  # fallback
+                comps = ["the", "a", "is"]
 
-            tokens = [answer_text] + comps
+            for comp_info in decomp.competitors:
+                if competitor_list and comp_info.token not in competitor_list:
+                    continue
+                c_layers = [
+                    LayerContribution(layer=ld.layer, attention=0.0, mlp=0.0)
+                    for ld in decomp.layers
+                ]
+                c_decomp = TokenDecomposition(
+                    token_str=comp_info.token,
+                    token_id=0,
+                    final_logit=comp_info.total_logit,
+                    embedding=0.0,
+                    layers=c_layers,
+                    reconstruction_error=0.0,
+                    norm_scale=1.0,
+                )
 
-            remote_data = {}
-            for event in worker.decompose_stream(
-                prompt_text, tokens, seed=seed, raw=raw,
-            ):
-                etype = event.get("type")
-                if etype == "decomposition":
-                    remote_data = event.get("decompositions", {})
+                component_margins = [
+                    {
+                        "layer": ld.layer,
+                        "attn_margin": ld.attn_logit,
+                        "mlp_margin": ld.mlp_logit,
+                    }
+                    for ld in decomp.layers
+                ]
 
-            for comp in comps:
-                if comp in remote_data and answer_text in remote_data:
-                    result = run_decompose_remote(
-                        remote_data, prompt_text, answer_text, comp,
-                    )
-                    all_results.append(result)
+                all_results.append(LocalDecomposeResult(
+                    prompt=prompt_text,
+                    answer=answer_text,
+                    competitor=comp_info.token,
+                    answer_logit=decomp.total_logit,
+                    competitor_logit=comp_info.total_logit,
+                    margin=decomp.total_logit - comp_info.total_logit,
+                    embedding_margin=0.0,
+                    component_margins=component_margins,
+                    reconstruction_error=decomp.reconstruction_error,
+                    answer_decomposition=a_decomp,
+                    competitor_decomposition=c_decomp,
+                ))
+
+            # If no competitors matched from the worker, use fallback
+            if not all_results or all_results[-1].prompt != prompt_text:
+                # Fallback: use legacy stream endpoint
+                from neurotrace.decompose import run_decompose_remote as _legacy
+                comps_to_try = competitor_list or ["the", "a", "is"]
+                tokens = [answer_text] + comps_to_try
+                remote_data = {}
+                for event in worker.decompose_stream(
+                    prompt_text, tokens, seed=seed, raw=raw,
+                ):
+                    etype = event.get("type")
+                    if etype == "decomposition":
+                        remote_data = event.get("decompositions", {})
+                for comp in comps_to_try:
+                    if comp in remote_data and answer_text in remote_data:
+                        result = _legacy(
+                            remote_data, prompt_text, answer_text, comp,
+                        )
+                        all_results.append(result)
 
         progress.update(task, description="Done.", completed=len(prompts))
 

@@ -638,7 +638,7 @@ def _scan_remote(
     save_traces, save_flagged, details, output_json, db,
     raw=True,
 ):
-    """Run scan via remote GPU worker."""
+    """Run scan via remote GPU worker using v2 forward() with layer_predictions."""
     from neurotrace.remote import WorkerClient
     from neurotrace.scan import PromptResult, ScanResult
 
@@ -663,38 +663,45 @@ def _scan_remote(
             )
             progress.update(task, completed=i, description=desc)
 
-            trace_data = worker.trace(entry["prompt"], seed=seed, top_k=5, raw=raw)
+            result = worker.forward(
+                entry["prompt"],
+                raw=raw,
+                top_k=5,
+                layer_predictions=True,
+                layer_predictions_top_k=5,
+                seed=seed,
+            )
 
             # Extract per-layer predictions for the expected answer
             answer = entry["answer"]
             ranks = []
             probs = []
 
-            for layer_data in trace_data["layers"]:
-                top_tokens = layer_data["top_tokens"]
-                # Find answer rank and prob
-                found = False
-                for rank_idx, tt in enumerate(top_tokens):
-                    token_text = tt["token"].strip().lstrip("\u2581").lower()
-                    if answer.strip().lower().startswith(token_text) and token_text:
-                        ranks.append(rank_idx + 1)
-                        probs.append(tt["prob"])
-                        found = True
-                        break
-                if not found:
-                    ranks.append(999)
-                    probs.append(0.0)
+            if result.layer_predictions:
+                for lp in result.layer_predictions:
+                    found = False
+                    for rank_idx, tt in enumerate(lp.top_tokens):
+                        token_text = tt.token.strip().lstrip("\u2581").lower()
+                        if (
+                            answer.strip().lower().startswith(token_text)
+                            and token_text
+                        ):
+                            ranks.append(rank_idx + 1)
+                            probs.append(tt.prob)
+                            found = True
+                            break
+                    if not found:
+                        ranks.append(999)
+                        probs.append(0.0)
 
-            # Final prediction
-            final_token = trace_data["final_token"]
-            final_prob = trace_data["final_prob"]
-
-            # Find final rank
-            final_layers = trace_data["layers"]
-            if final_layers:
-                final_rank = 1  # It's the final prediction
-            else:
-                final_rank = 999
+            # Final prediction from top_tokens
+            final_token = (
+                result.top_tokens[0].token if result.top_tokens else ""
+            )
+            final_prob = (
+                result.top_tokens[0].prob if result.top_tokens else 0.0
+            )
+            final_rank = 1 if result.top_tokens else 999
 
             # Compute peak prob and layer
             peak_prob = max(probs) if probs else 0.0

@@ -92,6 +92,163 @@ def test_forward_with_residuals():
         assert body["outputs"]["residual_layers"] == [0, 12]
 
 
+def test_forward_with_layer_predictions():
+    """Test forward() with layer_predictions parses per-layer top-k."""
+    with patch("httpx.Client") as mock_cls:
+        mock_client = mock_cls.return_value
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "top_tokens": [
+                {"token": "Berlin", "token_id": 100, "logit": 12.0, "prob": 0.7},
+            ],
+            "residuals": None,
+            "num_layers": 3,
+            "vocab_size": 32000,
+            "hidden_dim": 256,
+            "layer_predictions": [
+                {"layer": 0, "top_tokens": [
+                    {"token": "the", "token_id": 1, "logit": 5.0, "prob": 0.12},
+                ]},
+                {"layer": 1, "top_tokens": [
+                    {"token": "a", "token_id": 2, "logit": 4.0, "prob": 0.09},
+                ]},
+                {"layer": 2, "top_tokens": [
+                    {"token": "Berlin", "token_id": 100, "logit": 12.0, "prob": 0.44},
+                ]},
+            ],
+        }
+        mock_client.post.return_value = mock_response
+
+        from neurotrace.remote import WorkerClient
+
+        client = WorkerClient("http://localhost:8877")
+        result = client.forward(
+            "The capital of Germany is",
+            layer_predictions=True,
+            layer_predictions_top_k=5,
+        )
+
+        assert result.layer_predictions is not None
+        assert len(result.layer_predictions) == 3
+        assert result.layer_predictions[0].layer == 0
+        assert result.layer_predictions[0].top_tokens[0].token == "the"
+        assert result.layer_predictions[2].top_tokens[0].prob == pytest.approx(0.44)
+
+        body = mock_client.post.call_args[1]["json"]
+        assert body["outputs"]["layer_predictions"] is True
+        assert body["outputs"]["layer_predictions_top_k"] == 5
+
+
+def test_rome_edit():
+    """Test rome_edit() sends correct request and parses response."""
+    with patch("httpx.Client") as mock_cls:
+        mock_client = mock_cls.return_value
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "success": True,
+            "edit_id": 1,
+            "stack_size": 1,
+            "pre_prob": 0.19,
+            "post_prob": 0.67,
+            "pre_margin": -1.94,
+            "post_margin": 3.10,
+        }
+        mock_client.post.return_value = mock_response
+
+        from neurotrace.remote import WorkerClient
+
+        client = WorkerClient("http://localhost:8877")
+        result = client.rome_edit(
+            "The capital of Germany is",
+            "Germany",
+            "Berlin",
+            20,
+        )
+
+        assert result.success is True
+        assert result.edit_id == 1
+        assert result.pre_prob == pytest.approx(0.19)
+        assert result.post_prob == pytest.approx(0.67)
+        assert result.pre_margin == pytest.approx(-1.94)
+        assert result.post_margin == pytest.approx(3.10)
+
+        body = mock_client.post.call_args[1]["json"]
+        assert body["input"] == "The capital of Germany is"
+        assert body["subject"] == "Germany"
+        assert body["target"] == "Berlin"
+        assert body["layer"] == 20
+
+
+def test_decompose():
+    """Test decompose() sends correct request and parses response."""
+    with patch("httpx.Client") as mock_cls:
+        mock_client = mock_cls.return_value
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "answer_token_id": 23456,
+            "total_logit": 14.45,
+            "layers": [
+                {
+                    "layer": 0, "attn_logit": 0.12,
+                    "mlp_logit": -0.03, "cumulative": 0.09,
+                },
+                {
+                    "layer": 1, "attn_logit": 0.50,
+                    "mlp_logit": 0.20, "cumulative": 0.79,
+                },
+            ],
+            "competitors": [
+                {"token": "located", "total_logit": 8.33, "margin": -6.12},
+            ],
+            "reconstruction_error": 0.0001,
+        }
+        mock_client.post.return_value = mock_response
+
+        from neurotrace.remote import WorkerClient
+
+        client = WorkerClient("http://localhost:8877")
+        result = client.decompose(
+            "The capital of Germany is", "Berlin",
+        )
+
+        assert result.answer_token_id == 23456
+        assert result.total_logit == pytest.approx(14.45)
+        assert len(result.layers) == 2
+        assert result.layers[0].attn_logit == pytest.approx(0.12)
+        assert len(result.competitors) == 1
+        assert result.competitors[0].token == "located"
+        assert result.reconstruction_error == pytest.approx(0.0001)
+
+        body = mock_client.post.call_args[1]["json"]
+        assert body["answer"] == "Berlin"
+
+
+def test_attention():
+    """Test attention() sends correct request and parses response."""
+    with patch("httpx.Client") as mock_cls:
+        mock_client = mock_cls.return_value
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "heads": [
+                {"layer": 0, "head": 5, "logit_contribution": 0.42},
+                {"layer": 1, "head": 3, "logit_contribution": -0.18},
+            ],
+        }
+        mock_client.post.return_value = mock_response
+
+        from neurotrace.remote import WorkerClient
+
+        client = WorkerClient("http://localhost:8877")
+        result = client.attention(
+            "The capital of Germany is", "Berlin",
+        )
+
+        assert len(result.heads) == 2
+        assert result.heads[0].layer == 0
+        assert result.heads[0].head == 5
+        assert result.heads[0].logit_contribution == pytest.approx(0.42)
+
+
 # ---------------------------------------------------------------------------
 # 2. WorkerClient.hooked() — hooked forward pass
 # ---------------------------------------------------------------------------
@@ -343,7 +500,14 @@ def test_remote_worker_alias():
 def test_dataclass_imports():
     """Verify all v2 dataclasses are importable."""
     from neurotrace.remote import (
+        AttentionResult,
+        ContrastResult,
+        DecomposeResult,
+        FingerprintResult,
+        HeadContribution,
         Hook,
+        LayerPrediction,
+        RomeEditResult,
         TokenPrediction,
     )
 
@@ -354,3 +518,24 @@ def test_dataclass_imports():
     hook = Hook(layer=0, component="mlp", action="zero")
     assert hook.scale is None
     assert hook.tensor is None
+
+    # Phase 2 types
+    lp = LayerPrediction(layer=0, top_tokens=[tp])
+    assert lp.layer == 0
+    assert len(lp.top_tokens) == 1
+
+    re = RomeEditResult(
+        success=True, edit_id=1, stack_size=1,
+        pre_prob=0.1, post_prob=0.9,
+        pre_margin=-1.0, post_margin=2.0,
+    )
+    assert re.success
+    assert re.post_prob == 0.9
+
+    hc = HeadContribution(layer=5, head=3, logit_contribution=0.5)
+    ar = AttentionResult(heads=[hc])
+    assert len(ar.heads) == 1
+
+    assert DecomposeResult is not None
+    assert FingerprintResult is not None
+    assert ContrastResult is not None

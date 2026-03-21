@@ -255,7 +255,6 @@ def _heal_remote(
         heal_result_to_dict,
     )
     from neurotrace.remote import WorkerClient
-    from neurotrace.repair import build_repair_result_from_remote
 
     worker = WorkerClient(remote_url, timeout=600.0)
     health = worker.health()
@@ -272,25 +271,24 @@ def _heal_remote(
     ) as progress:
         task = progress.add_task("Heal pipeline...", total=None)
 
-        # Step 1: Baseline scan via repair with no-op margin
+        # Step 1: Baseline scan via forward() with layer_predictions
         progress.update(task, description="Baseline scan...")
         baseline_results = []
         for entry in dataset:
-            prob = 0.0
-            margin = 0.0
-            for event in worker.repair_stream(
-                entry["prompt"], entry["answer"],
-                target_margin=-999.0,
-                seed=seed,
-            ):
-                if event.get("type") == "result":
-                    prob = event["before"]["answer_prob"]
-                    margin = event["before"]["margin"]
-            try:
-                worker.repair_undo()
-            except Exception:
-                pass
-            status = "correct" if margin > 0 else "wrong"
+            result = worker.forward(
+                entry["prompt"], raw=True, top_k=5,
+                layer_predictions=False, seed=seed,
+            )
+            # Check if top-1 token matches answer
+            final_token = result.top_tokens[0].token if result.top_tokens else ""
+            prob = result.top_tokens[0].prob if result.top_tokens else 0.0
+            final_clean = final_token.strip().lstrip("\u2581").lower()
+            answer_clean = entry["answer"].strip().lower()
+            is_correct = (
+                answer_clean.startswith(final_clean) and final_clean
+            )
+            margin = prob if is_correct else -prob
+            status = "correct" if is_correct else "wrong"
             baseline_results.append({
                 "prompt": entry["prompt"],
                 "answer": entry["answer"],
@@ -345,29 +343,43 @@ def _heal_remote(
                 description=f"Repair {i + 1}/{len(healable)}: {entry['prompt'][:30]}",
             )
 
-            repair_result = None
-            for event in worker.repair_stream(
-                entry["prompt"], entry["answer"],
-                target_margin=0.0,
-                seed=seed,
-            ):
-                if event.get("type") == "result":
-                    repair_result = build_repair_result_from_remote(event)
+            # Use rome_edit for repair
+            try:
+                from neurotrace.cli.repair import _extract_subject
 
-            if repair_result and repair_result.status != "skipped":
-                edits_applied += 1
-                prompt_results.append(PromptHealResult(
-                    prompt=entry["prompt"],
-                    answer=entry["answer"],
-                    baseline_prob=entry["prob"],
-                    baseline_status="wrong",
-                    action="healed",
-                    result_prob=repair_result.after.answer_prob,
-                    final_status="correct",
-                    target_layer=repair_result.target_layer,
-                    edit_norm=repair_result.edit.norm,
-                ))
-            else:
+                subject = _extract_subject(entry["prompt"])
+                # Auto-detect layer: use middle layer as default
+                layer = health["num_layers"] // 2
+
+                edit_result = worker.rome_edit(
+                    entry["prompt"], subject, entry["answer"],
+                    layer, seed=seed,
+                )
+                if edit_result.success:
+                    edits_applied += 1
+                    prompt_results.append(PromptHealResult(
+                        prompt=entry["prompt"],
+                        answer=entry["answer"],
+                        baseline_prob=entry["prob"],
+                        baseline_status="wrong",
+                        action="healed",
+                        result_prob=edit_result.post_prob,
+                        final_status="correct",
+                        target_layer=layer,
+                        edit_norm=0.0,
+                    ))
+                else:
+                    edits_skipped += 1
+                    prompt_results.append(PromptHealResult(
+                        prompt=entry["prompt"],
+                        answer=entry["answer"],
+                        baseline_prob=entry["prob"],
+                        baseline_status="wrong",
+                        action="skipped",
+                        result_prob=entry["prob"],
+                        final_status="wrong",
+                    ))
+            except Exception:
                 edits_skipped += 1
                 prompt_results.append(PromptHealResult(
                     prompt=entry["prompt"],

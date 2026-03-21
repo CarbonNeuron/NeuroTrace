@@ -269,14 +269,21 @@ def fingerprint(
 
 
 def _fingerprint_remote(remote_url, prompts, seed, dataset_name):
-    """Run fingerprinting via remote GPU worker."""
-    from neurotrace.fingerprint import build_fingerprint_from_remote
+    """Run fingerprinting via remote GPU worker using v2 fingerprint()."""
+    import numpy as np
+
+    from neurotrace.fingerprint import Fingerprint, build_fingerprint_from_remote
     from neurotrace.remote import WorkerClient
 
     worker = WorkerClient(remote_url)
     health = worker.health()
     device_name = health.get("device_name", health.get("device", "unknown"))
+    num_layers = health["num_layers"]
     err_console.print(f"GPU: {device_name} via {remote_url}")
+
+    # Use middle layers for fingerprinting
+    mid = num_layers // 2
+    fp_layers = list(range(max(0, mid - 2), min(num_layers, mid + 3)))
 
     all_fingerprints = []
 
@@ -289,23 +296,54 @@ def _fingerprint_remote(remote_url, prompts, seed, dataset_name):
             "Fingerprinting...", total=len(prompts),
         )
 
-        for event in worker.fingerprint_stream(prompts, seed):
-            etype = event.get("type")
-            if etype == "progress":
-                current = event.get("current", 0)
-                total = event.get("total", len(prompts))
-                progress.update(
-                    task,
-                    completed=current,
-                    total=total,
-                    description=(
-                        f"Fingerprint {current}/{total}"
-                    ),
+        for p_idx, entry in enumerate(prompts):
+            progress.update(
+                task,
+                completed=p_idx,
+                description=f"Fingerprint {p_idx + 1}/{len(prompts)}",
+            )
+
+            try:
+                fp_result = worker.fingerprint(
+                    entry["prompt"], fp_layers, seed=seed,
                 )
-            elif etype == "result":
-                for fp_data in event.get("fingerprints", []):
-                    fp = build_fingerprint_from_remote(fp_data)
-                    all_fingerprints.append(fp)
+
+                # Build key_vectors matrix from captured vectors
+                key_list = []
+                proj_list = []
+                for layer in sorted(fp_result.vectors.keys()):
+                    vec = fp_result.vectors[layer]
+                    key_list.append(vec.key.astype(np.float16))
+                    proj_list.append(vec.projection.astype(np.float16))
+
+                if key_list:
+                    key_vectors = np.stack(key_list)
+                    p_answer = (
+                        proj_list[0]
+                        if proj_list
+                        else np.zeros(1, dtype=np.float16)
+                    )
+                    p_competitor = np.zeros_like(p_answer)
+
+                    all_fingerprints.append(Fingerprint(
+                        prompt=entry["prompt"],
+                        answer=entry["answer"],
+                        competitor="",
+                        answer_logit=0.0,
+                        competitor_logit=0.0,
+                        margin=0.0,
+                        key_vectors=key_vectors,
+                        p_answer=p_answer,
+                        p_competitor=p_competitor,
+                    ))
+            except Exception:
+                # Fallback to legacy fingerprint_stream
+                for event in worker.fingerprint_stream([entry], seed):
+                    etype = event.get("type")
+                    if etype == "result":
+                        for fp_data in event.get("fingerprints", []):
+                            fp = build_fingerprint_from_remote(fp_data)
+                            all_fingerprints.append(fp)
 
         progress.update(
             task, description="Done.", completed=len(prompts),
@@ -761,9 +799,15 @@ def repair(
 
 def _repair_remote(remote_url, prompts, competitor, target_layer, target_component,
                    target_margin, verify_prompts, seed):
-    """Run repair via remote GPU worker."""
+    """Run repair via remote GPU worker using v2 rome_edit()."""
     from neurotrace.remote import WorkerClient
-    from neurotrace.repair import build_repair_result_from_remote
+    from neurotrace.repair import (
+        RepairAfter,
+        RepairBefore,
+        RepairEdit,
+        RepairResult,
+        build_repair_result_from_remote,
+    )
 
     worker = WorkerClient(remote_url)
     health = worker.health()
@@ -789,30 +833,102 @@ def _repair_remote(remote_url, prompts, competitor, target_layer, target_compone
                 description=f"Repair {p_idx + 1}/{len(prompts)}",
             )
 
-            remote_data = None
-            for event in worker.repair_stream(
-                prompt=entry["prompt"],
-                answer=entry["answer"],
-                competitor=competitor,
-                target_layer=target_layer,
-                target_component=target_component,
-                target_margin=target_margin,
-                verify_prompts=verify_prompts,
-                seed=seed,
-            ):
-                etype = event.get("type")
-                if etype == "progress":
-                    progress.update(
-                        task,
-                        description=f"Repair {p_idx + 1}: {event.get('status', '')}",
-                    )
-                elif etype == "result":
-                    remote_data = event
+            prompt_text = entry["prompt"]
+            answer_text = entry["answer"]
+            layer = target_layer
 
-            if remote_data:
-                result = build_repair_result_from_remote(remote_data)
-                all_results.append(result)
+            # Auto-detect layer via decompose if not specified
+            if layer is None:
+                try:
+                    decomp = worker.decompose(prompt_text, answer_text, seed=seed)
+                    # Find worst layer (most negative margin)
+                    worst = min(decomp.layers, key=lambda ld: ld.mlp_logit)
+                    layer = worst.layer
+                except Exception:
+                    layer = health["num_layers"] // 2  # fallback to middle
+
+            # Extract subject from prompt (heuristic: last noun-like word before verb)
+            subject = _extract_subject(prompt_text)
+
+            try:
+                result = worker.rome_edit(
+                    prompt_text, subject, answer_text, layer, seed=seed,
+                )
+
+                before = RepairBefore(
+                    answer_logit=0.0,
+                    competitor_logit=0.0,
+                    margin=result.pre_margin,
+                    component_margin=result.pre_margin,
+                    answer_prob=result.pre_prob,
+                )
+                after = RepairAfter(
+                    answer_logit=0.0,
+                    competitor_logit=0.0,
+                    margin=result.post_margin,
+                    component_margin=result.post_margin,
+                    answer_prob=result.post_prob,
+                )
+                edit = RepairEdit(
+                    matrix=f"L{layer}.mlp",
+                    layer=layer,
+                    rank=1,
+                    norm=0.0,
+                )
+                status = "repaired" if result.success else "skipped"
+
+                all_results.append(RepairResult(
+                    prompt=prompt_text,
+                    answer=answer_text,
+                    competitor=competitor or "",
+                    target_layer=layer,
+                    target_component=target_component,
+                    before=before,
+                    after=after,
+                    edit=edit,
+                    regressions=[],
+                    status=status,
+                ))
+            except Exception:
+                # Fallback to legacy repair_stream
+                remote_data = None
+                for event in worker.repair_stream(
+                    prompt=prompt_text,
+                    answer=answer_text,
+                    competitor=competitor,
+                    target_layer=target_layer,
+                    target_component=target_component,
+                    target_margin=target_margin,
+                    verify_prompts=verify_prompts,
+                    seed=seed,
+                ):
+                    etype = event.get("type")
+                    if etype == "result":
+                        remote_data = event
+                if remote_data:
+                    result = build_repair_result_from_remote(remote_data)
+                    all_results.append(result)
 
         progress.update(task, description="Done.", completed=len(prompts))
 
     return all_results
+
+
+def _extract_subject(prompt: str) -> str:
+    """Extract subject entity from a prompt heuristic."""
+    # Common patterns: "The capital of X is", "The X of Y is"
+    # Try to find the last capitalized word or proper noun
+    words = prompt.split()
+    # Look for pattern "of X is" or "of X"
+    for i, w in enumerate(words):
+        if w.lower() == "of" and i + 1 < len(words):
+            # Take the next word(s) until a stop word
+            subject_parts = []
+            for j in range(i + 1, len(words)):
+                if words[j].lower() in ("is", "are", "was", "were", "has", "have"):
+                    break
+                subject_parts.append(words[j].rstrip(".,;:"))
+            if subject_parts:
+                return " ".join(subject_parts)
+    # Fallback: return the prompt itself
+    return prompt

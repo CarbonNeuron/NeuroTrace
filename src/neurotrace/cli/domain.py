@@ -1087,25 +1087,17 @@ def commitment(
 
 
 def _commitment_remote(remote_url, prompts, seed, threshold, model_name_hint):
-    """Run commitment analysis via remote GPU worker."""
-    import base64
-
-    import numpy as np
-
-    from neurotrace.commitment import run_commitment_remote
-    from neurotrace.models import get_lm_head_and_norm, load_model
+    """Run commitment analysis via remote GPU worker using v2 forward()."""
+    from neurotrace.commitment import CommitmentResult
     from neurotrace.remote import WorkerClient
 
     worker = WorkerClient(remote_url)
     health = worker.health()
     device_name = health.get("device_name", health.get("device", "unknown"))
-    model_name = health["model"]
 
     err_console.print(f"GPU: {device_name} via {remote_url}")
 
-    # Fetch hidden states from remote
-    prompt_texts = [p["prompt"] for p in prompts]
-    hidden_states_list = []
+    results = []
 
     with Progress(
         SpinnerColumn(),
@@ -1113,44 +1105,104 @@ def _commitment_remote(remote_url, prompts, seed, threshold, model_name_hint):
         console=err_console,
     ) as progress:
         task = progress.add_task(
-            "Fetching hidden states...", total=len(prompts),
+            "Commitment analysis...", total=len(prompts),
         )
 
-        for event in worker.forward_states_stream(prompt_texts, seed=seed):
-            etype = event.get("type")
-            if etype == "progress":
-                progress.update(
-                    task,
-                    completed=event.get("current", 0),
-                    description=(
-                        f"Fetching states {event.get('current', 0)}"
-                        f"/{event.get('total', len(prompts))}..."
-                    ),
-                )
-            elif etype == "states":
-                raw = base64.b64decode(event["hidden_states"])
-                shape = event["shape"]
-                arr = np.frombuffer(raw, dtype=np.float32).copy().reshape(shape)
-                hidden_states_list.append(arr)
+        for p_idx, entry in enumerate(prompts):
+            progress.update(
+                task,
+                completed=p_idx,
+                description=f"Prompt {p_idx + 1}/{len(prompts)}",
+            )
 
-        progress.update(task, description="Loading lm_head locally...")
+            prompt_text = entry["prompt"]
+            answer = entry["answer"]
 
-        # Load just model for lm_head + norm (from HF cache)
-        model_obj, tokenizer = load_model(model_name, device="cpu")
-        lm_head, final_ln = get_lm_head_and_norm(model_obj)
+            result = worker.forward(
+                prompt_text, raw=True, top_k=10,
+                layer_predictions=True,
+                layer_predictions_top_k=10,
+                seed=seed,
+            )
 
-        progress.update(task, description="Computing commitment scores...")
+            if not result.layer_predictions:
+                continue
 
-        lm_head_weight = lm_head.weight.data
+            # Build commitment trajectories from layer predictions
+            trajectory = []
+            margin_trajectory = []
+            competitor_trajectory = []
+            competitor_token = ""
+            competitor_peak = 0.0
 
-        results = run_commitment_remote(
-            hidden_states_list,
-            lm_head_weight,
-            final_ln,
-            tokenizer,
-            prompts,
-            threshold=threshold,
-        )
+            for lp in result.layer_predictions:
+                # Find answer prob at this layer
+                answer_prob = 0.0
+                for tt in lp.top_tokens:
+                    tok_clean = tt.token.strip().lstrip("\u2581").lower()
+                    if (
+                        answer.strip().lower().startswith(tok_clean)
+                        and tok_clean
+                    ):
+                        answer_prob = tt.prob
+                        break
+                trajectory.append(answer_prob)
+
+                # Find top competitor (highest prob token that isn't the answer)
+                best_comp_prob = 0.0
+                best_comp_token = ""
+                for tt in lp.top_tokens:
+                    tok_clean = tt.token.strip().lstrip("\u2581").lower()
+                    if (
+                        not answer.strip().lower().startswith(tok_clean)
+                        or not tok_clean
+                    ):
+                        if tt.prob > best_comp_prob:
+                            best_comp_prob = tt.prob
+                            best_comp_token = tt.token.strip()
+                competitor_trajectory.append(best_comp_prob)
+                margin_trajectory.append(answer_prob - best_comp_prob)
+
+                if best_comp_prob > competitor_peak:
+                    competitor_peak = best_comp_prob
+                    competitor_token = best_comp_token
+
+            peak_prob = max(trajectory) if trajectory else 0.0
+            peak_layer = (
+                trajectory.index(peak_prob) if trajectory and peak_prob > 0
+                else 0
+            )
+            final_prob = trajectory[-1] if trajectory else 0.0
+            min_margin = min(margin_trajectory) if margin_trajectory else 0.0
+            margin_at_final = margin_trajectory[-1] if margin_trajectory else 0.0
+
+            # Find crossover layer
+            crossover_layer = None
+            for li, m in enumerate(margin_trajectory):
+                if m < 0:
+                    crossover_layer = li
+                    break
+
+            vulnerable = min_margin < threshold
+
+            results.append(CommitmentResult(
+                prompt=prompt_text,
+                answer=answer,
+                trajectory=trajectory,
+                margin_trajectory=margin_trajectory,
+                competitor_trajectory=competitor_trajectory,
+                peak_prob=peak_prob,
+                peak_layer=peak_layer,
+                final_prob=final_prob,
+                commitment_score=peak_prob,
+                min_margin=min_margin,
+                margin_at_final=margin_at_final,
+                competitor_token=competitor_token,
+                competitor_peak=competitor_peak,
+                crossover_layer=crossover_layer,
+                vulnerable=vulnerable,
+            ))
+
         progress.update(task, description="Done.")
 
     return results
@@ -1456,14 +1508,12 @@ def contrast(
 def _contrast_remote(
     remote_url, domain_prompts, layers, commitment_data, seed, model_name_hint,
 ):
-    """Run contrast analysis via remote GPU worker."""
-    import base64
-
+    """Run contrast analysis via remote GPU worker using v2 hooked() for MLP deltas."""
     import numpy as np
 
     from neurotrace.contrast import run_contrast_remote
     from neurotrace.models import get_lm_head_and_norm, load_model
-    from neurotrace.remote import WorkerClient
+    from neurotrace.remote import Hook, WorkerClient
 
     worker = WorkerClient(remote_url)
     health = worker.health()
@@ -1474,7 +1524,7 @@ def _contrast_remote(
 
     # Flatten all prompts in domain order
     all_prompts = []
-    for domain, prompts in domain_prompts.items():
+    for domain_name, prompts in domain_prompts.items():
         for p in prompts:
             all_prompts.append(p["prompt"])
 
@@ -1489,42 +1539,44 @@ def _contrast_remote(
             "Fetching MLP deltas...", total=len(all_prompts),
         )
 
-        for event in worker.forward_mlp_deltas_stream(
-            all_prompts, layers=layers, seed=seed,
-        ):
-            etype = event.get("type")
-            if etype == "progress":
-                progress.update(
-                    task,
-                    completed=event.get("current", 0),
-                    description=(
-                        f"Fetching MLP deltas "
-                        f"{event.get('current', 0)}"
-                        f"/{event.get('total', len(all_prompts))}..."
-                    ),
+        # Use hooked() to capture MLP input/output at each layer
+        for pidx, prompt_text in enumerate(all_prompts):
+            progress.update(
+                task,
+                completed=pidx,
+                description=f"MLP capture {pidx + 1}/{len(all_prompts)}...",
+            )
+            for layer_idx in layers:
+                hooks = [
+                    Hook(layer=layer_idx, component="mlp", action="capture"),
+                ]
+                result = worker.hooked(
+                    prompt_text, hooks, raw=True, top_k=1, seed=seed,
                 )
-            elif etype == "deltas":
-                pidx = event["prompt_idx"]
-                layer = event["layer"]
-                dtype = np.float16 if event.get("dtype") == "float16" else np.float32
-                mlp_in = np.frombuffer(
-                    base64.b64decode(event["mlp_input"]),
-                    dtype=dtype,
-                ).astype(np.float32).copy()
-                mlp_out = np.frombuffer(
-                    base64.b64decode(event["mlp_output"]),
-                    dtype=dtype,
-                ).astype(np.float32).copy()
+                # Extract captured MLP data
+                mlp_in_key = f"mlp_{layer_idx}_input"
+                mlp_out_key = f"mlp_{layer_idx}_output"
+                mlp_cap_key = f"mlp_{layer_idx}"
+                captured_in = result.captured.get(mlp_in_key)
+                captured_out = result.captured.get(mlp_out_key)
+                captured = result.captured.get(mlp_cap_key)
 
-                mlp_data_by_prompt[pidx][str(layer)] = {
-                    "mlp_input": mlp_in,
-                    "mlp_output": mlp_out,
-                }
+                if captured_in is not None and captured_out is not None:
+                    mlp_data_by_prompt[pidx][str(layer_idx)] = {
+                        "mlp_input": captured_in.astype(np.float32),
+                        "mlp_output": captured_out.astype(np.float32),
+                    }
+                elif captured is not None:
+                    # If only one tensor captured, use it as output
+                    mlp_data_by_prompt[pidx][str(layer_idx)] = {
+                        "mlp_input": np.zeros_like(captured, dtype=np.float32),
+                        "mlp_output": captured.astype(np.float32),
+                    }
 
         progress.update(task, description="Loading lm_head locally...")
 
         model_obj, tokenizer = load_model(model_name, device="cpu")
-        lm_head, final_ln = get_lm_head_and_norm(model_obj)
+        lm_head, _ = get_lm_head_and_norm(model_obj)
         lm_head_weight = lm_head.weight.data.cpu().float().numpy()
 
         progress.update(task, description="Computing contrast metrics...")

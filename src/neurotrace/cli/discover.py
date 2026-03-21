@@ -237,7 +237,6 @@ def _discover_remote(
         insert_discovery,
     )
     from neurotrace.remote import WorkerClient
-    from neurotrace.repair import build_repair_result_from_remote
 
     worker = WorkerClient(remote_url, timeout=600.0)
     health = worker.health()
@@ -258,28 +257,22 @@ def _discover_remote(
     ) as progress:
         task = progress.add_task("Scanning...", total=None)
 
-        # Baseline scan using repair endpoint with no-op margin
+        # Baseline scan using forward() with v2 primitives
         for i, entry in enumerate(facts):
             progress.update(
                 task,
                 description=f"Scan {i + 1}/{len(facts)}: {entry['prompt'][:30]}",
             )
 
-            prob = 0.0
-            margin = 0.0
-            for event in worker.repair_stream(
-                entry["prompt"], entry["answer"],
-                target_margin=-999.0, seed=seed, raw=raw,
-            ):
-                if event.get("type") == "result":
-                    prob = event["before"]["answer_prob"]
-                    margin = event["before"]["margin"]
-            try:
-                worker.repair_undo()
-            except Exception:
-                pass
+            result = worker.forward(
+                entry["prompt"], raw=raw, top_k=5, seed=seed,
+            )
+            final_token = result.top_tokens[0].token if result.top_tokens else ""
+            prob = result.top_tokens[0].prob if result.top_tokens else 0.0
+            final_clean = final_token.strip().lstrip("\u2581").lower()
+            answer_clean = entry["answer"].strip().lower()
+            is_correct = answer_clean.startswith(final_clean) and bool(final_clean)
 
-            is_correct = margin > 0
             fact = DiscoveryFact(
                 id=str(uuid.uuid4())[:8],
                 prompt=entry["prompt"],
@@ -295,6 +288,8 @@ def _discover_remote(
 
         # Heal if requested
         if do_heal and not dry_run:
+            from neurotrace.cli.repair import _extract_subject
+
             failures = [f for f in discovery_facts if not f.baseline_correct]
             edits_done = 0
 
@@ -307,19 +302,20 @@ def _discover_remote(
                     description=f"Heal {i + 1}/{len(failures)}: {fact.prompt[:30]}",
                 )
 
-                repair_result = None
-                for event in worker.repair_stream(
-                    fact.prompt, fact.expected_answer,
-                    target_margin=0.0, seed=seed, raw=raw,
-                ):
-                    if event.get("type") == "result":
-                        repair_result = build_repair_result_from_remote(event)
-
-                if repair_result and repair_result.status != "skipped":
-                    fact.healed = True
-                    fact.healed_prob = repair_result.after.answer_prob
-                    healed_count += 1
-                    edits_done += 1
+                try:
+                    subject = _extract_subject(fact.prompt)
+                    layer = health["num_layers"] // 2
+                    edit_result = worker.rome_edit(
+                        fact.prompt, subject, fact.expected_answer,
+                        layer, raw=raw, seed=seed,
+                    )
+                    if edit_result.success:
+                        fact.healed = True
+                        fact.healed_prob = edit_result.post_prob
+                        healed_count += 1
+                        edits_done += 1
+                except Exception:
+                    pass
 
             if save and edits_done > 0:
                 try:

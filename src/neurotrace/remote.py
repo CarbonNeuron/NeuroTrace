@@ -27,12 +27,19 @@ class TokenPrediction:
 
 
 @dataclass
+class LayerPrediction:
+    layer: int
+    top_tokens: list[TokenPrediction]
+
+
+@dataclass
 class ForwardResult:
     top_tokens: list[TokenPrediction]
     residuals: dict[int, np.ndarray] | None
     num_layers: int
     vocab_size: int
     hidden_dim: int
+    layer_predictions: list[LayerPrediction] | None = None
 
 
 @dataclass
@@ -109,6 +116,82 @@ class ModelConfig:
 
 
 # ---------------------------------------------------------------------------
+# Phase 2 types
+# ---------------------------------------------------------------------------
+
+
+@dataclass
+class DecomposeLayerResult:
+    layer: int
+    attn_logit: float
+    mlp_logit: float
+    cumulative: float
+
+
+@dataclass
+class DecomposeCompetitor:
+    token: str
+    total_logit: float
+    margin: float
+
+
+@dataclass
+class DecomposeResult:
+    answer_token_id: int
+    total_logit: float
+    layers: list[DecomposeLayerResult]
+    competitors: list[DecomposeCompetitor]
+    reconstruction_error: float
+
+
+@dataclass
+class RomeEditResult:
+    success: bool
+    edit_id: int
+    stack_size: int
+    pre_prob: float
+    post_prob: float
+    pre_margin: float
+    post_margin: float
+
+
+@dataclass
+class FingerprintVector:
+    key: np.ndarray
+    projection: np.ndarray
+
+
+@dataclass
+class FingerprintResult:
+    vectors: dict[int, FingerprintVector]  # layer -> vectors
+
+
+@dataclass
+class HeadContribution:
+    layer: int
+    head: int
+    logit_contribution: float
+
+
+@dataclass
+class AttentionResult:
+    heads: list[HeadContribution]
+
+
+@dataclass
+class ContrastLayerResult:
+    layer: int
+    cosine_similarity: float
+    prompt_a_norm: float
+    prompt_b_norm: float
+
+
+@dataclass
+class ContrastResult:
+    layers: list[ContrastLayerResult]
+
+
+# ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
@@ -167,6 +250,8 @@ class WorkerClient:
         raw: bool = True,
         top_k: int = 10,
         residual_layers: list[int] | None = None,
+        layer_predictions: bool = False,
+        layer_predictions_top_k: int = 5,
         seed: int = 42,
     ) -> ForwardResult:
         """Run a forward pass via /inference/forward."""
@@ -181,6 +266,9 @@ class WorkerClient:
         }
         if residual_layers is not None:
             payload["outputs"]["residual_layers"] = residual_layers
+        if layer_predictions:
+            payload["outputs"]["layer_predictions"] = True
+            payload["outputs"]["layer_predictions_top_k"] = layer_predictions_top_k
 
         r = self.client.post(f"{self.base_url}/inference/forward", json=payload)
         r.raise_for_status()
@@ -192,12 +280,23 @@ class WorkerClient:
                 int(k): _decode_residual(v) for k, v in data["residuals"].items()
             }
 
+        lp = None
+        if data.get("layer_predictions"):
+            lp = [
+                LayerPrediction(
+                    layer=lp_data["layer"],
+                    top_tokens=_parse_top_tokens(lp_data["top_tokens"]),
+                )
+                for lp_data in data["layer_predictions"]
+            ]
+
         return ForwardResult(
             top_tokens=_parse_top_tokens(data["top_tokens"]),
             residuals=residuals,
             num_layers=data["num_layers"],
             vocab_size=data["vocab_size"],
             hidden_dim=data["hidden_dim"],
+            layer_predictions=lp,
         )
 
     def hooked(
@@ -285,16 +384,22 @@ class WorkerClient:
         *,
         raw: bool = True,
         top_k: int = 10,
+        layer_predictions: bool = False,
+        layer_predictions_top_k: int = 5,
         seed: int = 42,
         on_progress: Callable[[int, int], None] | None = None,
     ) -> list[ForwardResult]:
         """Batch forward pass via /inference/batch with SSE streaming."""
+        outputs: dict[str, Any] = {"top_k": top_k}
+        if layer_predictions:
+            outputs["layer_predictions"] = True
+            outputs["layer_predictions_top_k"] = layer_predictions_top_k
         requests = [
             {
                 "input": p,
                 "raw": raw,
                 "seed": seed,
-                "outputs": {"top_k": top_k},
+                "outputs": outputs,
             }
             for p in prompts
         ]
@@ -325,12 +430,24 @@ class WorkerClient:
                             int(k): _decode_residual(v)
                             for k, v in data["residuals"].items()
                         }
+                    lp = None
+                    if data.get("layer_predictions"):
+                        lp = [
+                            LayerPrediction(
+                                layer=lp_data["layer"],
+                                top_tokens=_parse_top_tokens(
+                                    lp_data["top_tokens"],
+                                ),
+                            )
+                            for lp_data in data["layer_predictions"]
+                        ]
                     results.append(ForwardResult(
                         top_tokens=_parse_top_tokens(data["top_tokens"]),
                         residuals=residuals,
                         num_layers=data.get("num_layers", 0),
                         vocab_size=data.get("vocab_size", 0),
                         hidden_dim=data.get("hidden_dim", 0),
+                        layer_predictions=lp,
                     ))
 
         return results
@@ -405,6 +522,200 @@ class WorkerClient:
             )
             for e in data["edits"]
         ]
+
+    # -------------------------------------------------------------------
+    # v2 Phase 2: High-level inference primitives
+    # -------------------------------------------------------------------
+
+    def decompose(
+        self,
+        prompt: str,
+        answer: str,
+        *,
+        raw: bool = True,
+        seed: int = 42,
+    ) -> DecomposeResult:
+        """Logit Prism decomposition via /inference/decompose."""
+        payload: dict[str, Any] = {
+            "input": prompt,
+            "answer": answer,
+            "raw": raw,
+            "seed": seed,
+        }
+        r = self.client.post(
+            f"{self.base_url}/inference/decompose", json=payload,
+        )
+        r.raise_for_status()
+        data = r.json()
+        return DecomposeResult(
+            answer_token_id=data["answer_token_id"],
+            total_logit=data["total_logit"],
+            layers=[
+                DecomposeLayerResult(
+                    layer=ld["layer"],
+                    attn_logit=ld["attn_logit"],
+                    mlp_logit=ld["mlp_logit"],
+                    cumulative=ld["cumulative"],
+                )
+                for ld in data["layers"]
+            ],
+            competitors=[
+                DecomposeCompetitor(
+                    token=c["token"],
+                    total_logit=c["total_logit"],
+                    margin=c["margin"],
+                )
+                for c in data.get("competitors", [])
+            ],
+            reconstruction_error=data.get("reconstruction_error", 0.0),
+        )
+
+    def rome_edit(
+        self,
+        prompt: str,
+        subject: str,
+        target: str,
+        layer: int,
+        *,
+        raw: bool = True,
+        seed: int = 42,
+    ) -> RomeEditResult:
+        """ROME rank-one weight edit via /model/edit."""
+        payload: dict[str, Any] = {
+            "input": prompt,
+            "subject": subject,
+            "target": target,
+            "layer": layer,
+            "raw": raw,
+            "seed": seed,
+        }
+        r = self.client.post(f"{self.base_url}/model/edit", json=payload)
+        r.raise_for_status()
+        data = r.json()
+        return RomeEditResult(
+            success=data["success"],
+            edit_id=data["edit_id"],
+            stack_size=data["stack_size"],
+            pre_prob=data.get("pre_prob", 0.0),
+            post_prob=data.get("post_prob", 0.0),
+            pre_margin=data.get("pre_margin", 0.0),
+            post_margin=data.get("post_margin", 0.0),
+        )
+
+    def fingerprint(
+        self,
+        prompt: str,
+        layers: list[int],
+        *,
+        raw: bool = True,
+        seed: int = 42,
+    ) -> FingerprintResult:
+        """Capture key/projection vectors via /inference/fingerprint."""
+        payload: dict[str, Any] = {
+            "input": prompt,
+            "raw": raw,
+            "seed": seed,
+            "layers": layers,
+        }
+        r = self.client.post(
+            f"{self.base_url}/inference/fingerprint", json=payload,
+        )
+        r.raise_for_status()
+        data = r.json()
+        vectors: dict[int, FingerprintVector] = {}
+        for layer_str, vecs in data.get("vectors", {}).items():
+            vectors[int(layer_str)] = FingerprintVector(
+                key=_decode_residual(vecs["key"]),
+                projection=_decode_residual(vecs["projection"]),
+            )
+        return FingerprintResult(vectors=vectors)
+
+    def attention(
+        self,
+        prompt: str,
+        answer: str,
+        *,
+        raw: bool = True,
+        method: str = "o_proj",
+        seed: int = 42,
+    ) -> AttentionResult:
+        """Per-head attention contributions via /inference/attention."""
+        payload: dict[str, Any] = {
+            "input": prompt,
+            "answer": answer,
+            "raw": raw,
+            "method": method,
+            "seed": seed,
+        }
+        r = self.client.post(
+            f"{self.base_url}/inference/attention", json=payload,
+        )
+        r.raise_for_status()
+        data = r.json()
+        return AttentionResult(
+            heads=[
+                HeadContribution(
+                    layer=h["layer"],
+                    head=h["head"],
+                    logit_contribution=h["logit_contribution"],
+                )
+                for h in data.get("heads", [])
+            ],
+        )
+
+    def contrast(
+        self,
+        prompt_a: str,
+        prompt_b: str,
+        *,
+        raw: bool = True,
+        seed: int = 42,
+    ) -> ContrastResult:
+        """Per-layer residual stream contrast via /inference/contrast."""
+        payload: dict[str, Any] = {
+            "prompt_a": prompt_a,
+            "prompt_b": prompt_b,
+            "raw": raw,
+            "seed": seed,
+        }
+        r = self.client.post(
+            f"{self.base_url}/inference/contrast", json=payload,
+        )
+        r.raise_for_status()
+        data = r.json()
+        return ContrastResult(
+            layers=[
+                ContrastLayerResult(
+                    layer=ld["layer"],
+                    cosine_similarity=ld["cosine_similarity"],
+                    prompt_a_norm=ld.get("prompt_a_norm", 0.0),
+                    prompt_b_norm=ld.get("prompt_b_norm", 0.0),
+                )
+                for ld in data.get("layers", [])
+            ],
+        )
+
+    def batch_edit(
+        self,
+        edits: list[dict[str, Any]],
+        *,
+        on_progress: Callable[[int, int], None] | None = None,
+    ) -> list[RomeEditResult]:
+        """Batch ROME edits — sequential calls to /model/edit."""
+        results: list[RomeEditResult] = []
+        for i, edit in enumerate(edits):
+            if on_progress:
+                on_progress(i, len(edits))
+            result = self.rome_edit(
+                prompt=edit["prompt"],
+                subject=edit.get("subject", ""),
+                target=edit["target"],
+                layer=edit["layer"],
+                raw=edit.get("raw", True),
+                seed=edit.get("seed", 42),
+            )
+            results.append(result)
+        return results
 
     # -------------------------------------------------------------------
     # Management
