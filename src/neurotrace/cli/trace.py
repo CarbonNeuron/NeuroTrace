@@ -71,6 +71,10 @@ def _decode_tokens(tokenizer, token_ids: list[int]) -> list[dict]:
     "--remote", default=None, help="GPU worker URL (e.g., http://172.30.0.1:8877)."
 )
 @click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
+@click.option("--raw", "use_raw", is_flag=True, default=None,
+              help="Raw inference (no chat template). Default when --remote is used.")
+@click.option("--chat", "use_chat", is_flag=True, default=False,
+              help="Force chat template mode (override raw default for --remote).")
 def trace(
     model,
     prompt,
@@ -83,14 +87,21 @@ def trace(
     adapter,
     remote,
     device,
+    use_raw,
+    use_chat,
 ):
     """Run a forward-pass trace and store results."""
+    if use_raw and use_chat:
+        raise click.UsageError("Cannot use both --raw and --chat.")
     if prompt is None and prompts_file is None:
         raise click.UsageError("Must provide either --prompt or --prompts-file.")
     if prompt is not None and prompts_file is not None:
         raise click.UsageError("Cannot provide both --prompt and --prompts-file.")
     if remote is None and model is None:
         raise click.UsageError("Must provide --model (local mode) or --remote.")
+
+    # Resolve raw mode: default True for --remote, False for local
+    raw = use_raw if use_raw is not None else (remote is not None and not use_chat)
 
     # Collect prompts
     if prompts_file is not None:
@@ -119,7 +130,7 @@ def trace(
                 err_console.print(
                     f"Tracing prompt {i + 1}/{len(prompts)}..."
                 )
-                trace_result_data = worker.trace(p, seed=seed)
+                trace_result_data = worker.trace(p, seed=seed, raw=raw)
 
                 # Build layer snapshots with just top-1 predictions
                 layer_snapshots = []

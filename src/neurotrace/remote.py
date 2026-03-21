@@ -41,31 +41,48 @@ class RemoteWorker:
         r.raise_for_status()
         return r.json()
 
-    def trace(self, prompt: str, seed: int = 42, top_k: int = 5) -> dict:
-        """Run a single trace on the remote worker."""
-        r = self.client.post(f"{self.base_url}/trace", json={
-            "prompt": prompt, "seed": seed, "top_k": top_k
-        })
+    def trace(
+        self, prompt: str, seed: int = 42, top_k: int = 5, raw: bool = True,
+    ) -> dict:
+        """Run a single trace on the remote worker.
+
+        When raw=True (default), the prompt is fed directly to the tokenizer
+        without chat template wrapping. Set raw=False to use chat template.
+        """
+        payload: dict = {"seed": seed, "top_k": top_k}
+        if raw:
+            payload["prompt"] = prompt
+            payload["raw"] = True
+        else:
+            payload["messages"] = [{"role": "user", "content": prompt}]
+        r = self.client.post(f"{self.base_url}/trace", json=payload)
         r.raise_for_status()
         return r.json()
 
     def batch_ablate_stream(
-        self, prompt: str, num_layers: int, seed: int = 42, top_k: int = 1
+        self, prompt: str, num_layers: int, seed: int = 42, top_k: int = 1,
+        raw: bool = True,
     ) -> Generator[dict, None, None]:
         """Stream batch-ablate results via SSE. Yields parsed event dicts."""
         ablations = [{"zero_mlp_layers": []}]  # baseline first
         for layer in range(num_layers):
             ablations.append({"zero_mlp_layers": [layer]})
 
+        payload: dict = {
+            "ablations": ablations,
+            "seed": seed,
+            "top_k": top_k,
+        }
+        if raw:
+            payload["prompt"] = prompt
+            payload["raw"] = True
+        else:
+            payload["messages"] = [{"role": "user", "content": prompt}]
+
         with self.client.stream(
             "POST",
             f"{self.base_url}/batch-ablate",
-            json={
-                "prompt": prompt,
-                "ablations": ablations,
-                "seed": seed,
-                "top_k": top_k,
-            },
+            json=payload,
         ) as response:
             response.raise_for_status()
             for line in response.iter_lines():
@@ -176,12 +193,18 @@ class RemoteWorker:
         prompt: str,
         layers: list[int] | None = None,
         seed: int = 42,
+        raw: bool = True,
     ) -> Generator[dict, None, None]:
         """Stream per-head attention contributions via SSE.
 
         Yields parsed event dicts with types: layer-contributions, done.
         """
-        payload: dict = {"prompt": prompt, "seed": seed}
+        payload: dict = {"seed": seed}
+        if raw:
+            payload["prompt"] = prompt
+            payload["raw"] = True
+        else:
+            payload["messages"] = [{"role": "user", "content": prompt}]
         if layers is not None:
             payload["layers"] = layers
 
@@ -201,12 +224,18 @@ class RemoteWorker:
         prompt: str,
         layers: list[int] | None = None,
         seed: int = 42,
+        raw: bool = True,
     ) -> Generator[dict, None, None]:
         """Stream MLP deltas at all token positions via SSE.
 
         Yields parsed event dicts with types: layer-deltas, done.
         """
-        payload: dict = {"prompt": prompt, "seed": seed}
+        payload: dict = {"seed": seed}
+        if raw:
+            payload["prompt"] = prompt
+            payload["raw"] = True
+        else:
+            payload["messages"] = [{"role": "user", "content": prompt}]
         if layers is not None:
             payload["layers"] = layers
 
@@ -239,19 +268,23 @@ class RemoteWorker:
         prompt: str,
         tokens: list[str],
         seed: int = 42,
+        raw: bool = True,
     ) -> Generator[dict, None, None]:
         """Stream logit decomposition results via SSE.
 
         Yields parsed event dicts with types: progress, decomposition, done.
         """
+        payload: dict = {"tokens": tokens, "seed": seed}
+        if raw:
+            payload["prompt"] = prompt
+            payload["raw"] = True
+        else:
+            payload["messages"] = [{"role": "user", "content": prompt}]
+
         with self.client.stream(
             "POST",
             f"{self.base_url}/decompose",
-            json={
-                "prompt": prompt,
-                "tokens": tokens,
-                "seed": seed,
-            },
+            json=payload,
             timeout=600.0,
         ) as response:
             response.raise_for_status()
@@ -290,14 +323,19 @@ class RemoteWorker:
         target_margin: float = 0.0,
         verify_prompts: list[dict] | None = None,
         seed: int = 42,
+        raw: bool = True,
     ) -> Generator[dict, None, None]:
         """Stream repair results via SSE."""
         payload: dict = {
-            "prompt": prompt,
             "answer": answer,
             "target_margin": target_margin,
             "seed": seed,
         }
+        if raw:
+            payload["prompt"] = prompt
+            payload["raw"] = True
+        else:
+            payload["messages"] = [{"role": "user", "content": prompt}]
         if competitor is not None:
             payload["competitor"] = competitor
         if target_layer is not None:

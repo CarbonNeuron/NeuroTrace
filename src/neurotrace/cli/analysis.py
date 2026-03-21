@@ -90,6 +90,10 @@ def _parse_sweep_zero_heads(value: str) -> tuple[int, list[int]]:
 @click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
 @click.option("--remote", default=None, help="GPU worker URL (e.g., http://172.30.0.1:8877).")
 @click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
+@click.option("--raw", "use_raw", is_flag=True, default=None,
+              help="Raw inference (no chat template). Default when --remote is used.")
+@click.option("--chat", "use_chat", is_flag=True, default=False,
+              help="Force chat template mode (override raw default for --remote).")
 def ablate(
     db,
     model,
@@ -105,8 +109,12 @@ def ablate(
     adapter,
     remote,
     device,
+    use_raw,
+    use_chat,
 ):
     """Run inference with targeted components disabled and compare to baseline."""
+    if use_raw and use_chat:
+        raise click.UsageError("Cannot use both --raw and --chat.")
     if remote is None and model is None:
         raise click.UsageError("Must provide --model (local mode) or --remote.")
 
@@ -628,6 +636,7 @@ def _scan_remote(
     remote_url, dataset, dataset_name, seed,
     sabotage_threshold, final_threshold,
     save_traces, save_flagged, details, output_json, db,
+    raw=True,
 ):
     """Run scan via remote GPU worker."""
     from neurotrace.remote import RemoteWorker
@@ -654,7 +663,7 @@ def _scan_remote(
             )
             progress.update(task, completed=i, description=desc)
 
-            trace_data = worker.trace(entry["prompt"], seed=seed, top_k=5)
+            trace_data = worker.trace(entry["prompt"], seed=seed, top_k=5, raw=raw)
 
             # Extract per-layer predictions for the expected answer
             answer = entry["answer"]
@@ -797,6 +806,10 @@ def _scan_remote(
 @click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
 @click.option("--remote", default=None, help="GPU worker URL (e.g., http://172.30.0.1:8877).")
 @click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
+@click.option("--raw", "use_raw", is_flag=True, default=None,
+              help="Raw inference (no chat template). Default when --remote is used.")
+@click.option("--chat", "use_chat", is_flag=True, default=False,
+              help="Force chat template mode (override raw default for --remote).")
 def scan(
     db,
     model,
@@ -812,13 +825,20 @@ def scan(
     adapter,
     remote,
     device,
+    use_raw,
+    use_chat,
 ):
     """Scan a dataset for sabotaged predictions."""
     from neurotrace.datasets import get_builtin_dataset, load_dataset
     from neurotrace.scan import run_scan
 
+    if use_raw and use_chat:
+        raise click.UsageError("Cannot use both --raw and --chat.")
     if remote is None and model is None:
         raise click.UsageError("Must provide --model (local mode) or --remote.")
+
+    # Resolve raw mode: default True for --remote, False for local
+    raw = use_raw if use_raw is not None else (remote is not None and not use_chat)
 
     if dataset_path is None and dataset_builtin is None:
         raise click.UsageError("Must provide either --dataset or --dataset-builtin.")
@@ -839,7 +859,7 @@ def scan(
             db_conn = TraceDB(db)
         scan_result = _scan_remote(
             remote, dataset, dataset_name, seed, sabotage_threshold, final_threshold,
-            save_traces, save_flagged, details, output_json, db_conn,
+            save_traces, save_flagged, details, output_json, db_conn, raw=raw,
         )
         if db_conn:
             db_conn.close()

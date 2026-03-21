@@ -71,6 +71,10 @@ from neurotrace.cli import _maybe_load_adapter, _resolve_device, console, err_co
 @click.option("--device", default="cpu", help="Device: cpu, cuda, directml, auto.")
 @click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
 @click.option("--seed", default=42, type=int, help="Random seed.")
+@click.option("--raw", "use_raw", is_flag=True, default=None,
+              help="Raw inference (no chat template). Default when --remote is used.")
+@click.option("--chat", "use_chat", is_flag=True, default=False,
+              help="Force chat template mode (override raw default for --remote).")
 @click.pass_context
 def discover(
     ctx,
@@ -97,6 +101,8 @@ def discover(
     device,
     adapter,
     seed,
+    use_raw,
+    use_chat,
 ):
     """Discover knowledge gaps via structured fact extraction and scanning."""
     from neurotrace.discover import (
@@ -107,12 +113,18 @@ def discover(
         run_discover,
     )
 
+    if use_raw and use_chat:
+        raise click.UsageError("Cannot use both --raw and --chat.")
+
     # Use model from group context if not specified
     if model_name is None:
         model_name = ctx.obj.get("model") if ctx.obj else None
 
     if remote is None and model_name is None:
         raise click.UsageError("Must provide --model (local mode) or --remote.")
+
+    # Resolve raw mode: default True for --remote, False for local
+    raw = use_raw if use_raw is not None else (remote is not None and not use_chat)
 
     # Step 1: Get facts
     facts: list[dict] = []
@@ -159,7 +171,7 @@ def discover(
         _discover_remote(
             remote, facts, topic, source, db, do_heal, fingerprint_path,
             regression_threshold, max_edits, save, dry_run,
-            output_json, report_path, upload, verbose, seed,
+            output_json, report_path, upload, verbose, seed, raw=raw,
         )
         return
 
@@ -212,7 +224,7 @@ def discover(
 def _discover_remote(
     remote_url, facts, topic, source, db, do_heal, fingerprint_path,
     regression_threshold, max_edits, save, dry_run,
-    output_json, report_path, upload, verbose, seed,
+    output_json, report_path, upload, verbose, seed, raw=True,
 ):
     """Run discover pipeline via remote GPU worker."""
     import time
@@ -257,7 +269,7 @@ def _discover_remote(
             margin = 0.0
             for event in worker.repair_stream(
                 entry["prompt"], entry["answer"],
-                target_margin=-999.0, seed=seed,
+                target_margin=-999.0, seed=seed, raw=raw,
             ):
                 if event.get("type") == "result":
                     prob = event["before"]["answer_prob"]
@@ -298,7 +310,7 @@ def _discover_remote(
                 repair_result = None
                 for event in worker.repair_stream(
                     fact.prompt, fact.expected_answer,
-                    target_margin=0.0, seed=seed,
+                    target_margin=0.0, seed=seed, raw=raw,
                 ):
                     if event.get("type") == "result":
                         repair_result = build_repair_result_from_remote(event)

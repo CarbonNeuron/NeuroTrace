@@ -272,6 +272,7 @@ class FormatRequest(BaseModel):
 class TraceRequest(BaseModel):
     prompt: str | None = None
     messages: list[ChatMessage] | None = None
+    raw: bool = False
     seed: int = 42
     top_k: int = 5
 
@@ -301,6 +302,7 @@ class AblationItem(BaseModel):
 class BatchAblateRequest(BaseModel):
     prompt: str | None = None
     messages: list[ChatMessage] | None = None
+    raw: bool = False
     ablations: list[AblationItem]
     seed: int = 42
     top_k: int = 1
@@ -327,6 +329,7 @@ class ForwardMlpDeltasRequest(BaseModel):
 class ForwardMlpDeltasAllPositionsRequest(BaseModel):
     prompt: str | None = None
     messages: list[ChatMessage] | None = None
+    raw: bool = False
     layers: list[int] | None = None
     seed: int = 42
 
@@ -334,6 +337,7 @@ class ForwardMlpDeltasAllPositionsRequest(BaseModel):
 class AttentionContributionsRequest(BaseModel):
     prompt: str | None = None
     messages: list[ChatMessage] | None = None
+    raw: bool = False
     layers: list[int] | None = None
     seed: int = 42
 
@@ -370,6 +374,7 @@ class VerifyPrompt(BaseModel):
 class RepairRequest(BaseModel):
     prompt: str | None = None
     messages: list[ChatMessage] | None = None
+    raw: bool = False
     answer: str
     competitor: str | None = None
     target_layer: int | None = None
@@ -396,9 +401,17 @@ class ReloadRequest(BaseModel):
 def _resolve_prompt(
     prompt: str | None,
     messages: list[ChatMessage] | None,
+    raw: bool = False,
 ) -> str:
-    """Resolve a prompt from either raw string or chat messages."""
+    """Resolve a prompt from either raw string or chat messages.
+
+    When raw=True, the prompt string is used directly (no chat template).
+    When raw=False and messages are provided, the chat template is applied.
+    When only prompt is provided (no messages), it is used directly regardless of raw flag.
+    """
     assert _tokenizer is not None
+    if raw and prompt is not None:
+        return prompt
     if messages is not None:
         msg_dicts = [{"role": m.role, "content": m.content} for m in messages]
         return _tokenizer.apply_chat_template(
@@ -624,7 +637,7 @@ def format_prompt(req: FormatRequest) -> dict[str, Any]:
 def trace(req: TraceRequest) -> TraceResponse:
     assert _model is not None and _tokenizer is not None and _device is not None
 
-    prompt = _resolve_prompt(req.prompt, req.messages)
+    prompt = _resolve_prompt(req.prompt, req.messages, raw=req.raw)
     torch.manual_seed(req.seed)
     inputs = _tokenizer(prompt, return_tensors="pt").to(_device)
 
@@ -684,7 +697,7 @@ def batch_ablate(req: BatchAblateRequest) -> StreamingResponse:
 
     async def _generate():
         total = len(req.ablations)
-        prompt = _resolve_prompt(req.prompt, req.messages)
+        prompt = _resolve_prompt(req.prompt, req.messages, raw=req.raw)
         inputs = _tokenizer(prompt, return_tensors="pt").to(_device)
 
         for idx, ablation in enumerate(req.ablations):
@@ -997,7 +1010,7 @@ def forward_mlp_deltas_all_positions(
             else list(range(len(model_layers)))
         )
 
-        prompt = _resolve_prompt(req.prompt, req.messages)
+        prompt = _resolve_prompt(req.prompt, req.messages, raw=req.raw)
         torch.manual_seed(req.seed)
         inputs = _tokenizer(prompt, return_tensors="pt").to(_device)
         num_positions = inputs["input_ids"].shape[1]
@@ -1081,7 +1094,7 @@ def attention_contributions(
             else list(range(len(model_layers)))
         )
 
-        prompt = _resolve_prompt(req.prompt, req.messages)
+        prompt = _resolve_prompt(req.prompt, req.messages, raw=req.raw)
         torch.manual_seed(req.seed)
         inputs = _tokenizer(prompt, return_tensors="pt").to(_device)
 
@@ -1680,6 +1693,7 @@ def fingerprint(req: FingerprintRequest) -> StreamingResponse:
 class DecomposeRequest(BaseModel):
     prompt: str | None = None
     messages: list[ChatMessage] | None = None
+    raw: bool = False
     tokens: list[str]
     seed: int = 42
 
@@ -1692,7 +1706,7 @@ def decompose(req: DecomposeRequest) -> StreamingResponse:
     async def _generate():
         yield _sse_line({"type": "progress", "status": "computing"})
 
-        prompt = _resolve_prompt(req.prompt, req.messages)
+        prompt = _resolve_prompt(req.prompt, req.messages, raw=req.raw)
         torch.manual_seed(req.seed)
         input_ids = _tokenizer.encode(
             prompt, return_tensors="pt"
@@ -1818,7 +1832,7 @@ def repair(req: RepairRequest) -> StreamingResponse:
     async def _generate():
         torch.manual_seed(req.seed)
         layers = _get_transformer_layers()
-        prompt = _resolve_prompt(req.prompt, req.messages)
+        prompt = _resolve_prompt(req.prompt, req.messages, raw=req.raw)
         answer = req.answer
         competitor = req.competitor
 

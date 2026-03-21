@@ -1463,6 +1463,10 @@ def _diagnose_remote(
 @click.option("--json", "output_json", is_flag=True, help="JSON output.")
 @click.option("--adapter", default=None, help="Path to LoRA adapter directory.")
 @click.option("--seed", default=42, type=int, help="Random seed.")
+@click.option("--raw", "use_raw", is_flag=True, default=None,
+              help="Raw inference (no chat template). Default when --remote is used.")
+@click.option("--chat", "use_chat", is_flag=True, default=False,
+              help="Force chat template mode (override raw default for --remote).")
 def decompose(
     model,
     db,
@@ -1477,6 +1481,8 @@ def decompose(
     output_json,
     adapter,
     seed,
+    use_raw,
+    use_chat,
 ):
     """Logit Prism — exact additive logit attribution per component."""
     import uuid
@@ -1488,6 +1494,9 @@ def decompose(
         generate_decompose_html,
         run_decompose_local,
     )
+
+    if use_raw and use_chat:
+        raise click.UsageError("Cannot use both --raw and --chat.")
 
     # Validate inputs
     has_dataset = dataset_path is not None or dataset_builtin is not None
@@ -1504,6 +1513,9 @@ def decompose(
         raise click.UsageError("--answer is required with --prompt.")
     if remote is None and model is None:
         raise click.UsageError("Must provide --model (local mode) or --remote.")
+
+    # Resolve raw mode: default True for --remote, False for local
+    raw = use_raw if use_raw is not None else (remote is not None and not use_chat)
 
     # Parse competitors
     competitor_list = None
@@ -1531,7 +1543,7 @@ def decompose(
 
     if remote is not None:
         all_results = _decompose_remote(
-            remote, prompts, competitor_list, seed,
+            remote, prompts, competitor_list, seed, raw=raw,
         )
         from neurotrace.remote import RemoteWorker
 
@@ -1707,7 +1719,7 @@ def decompose(
         console.print()
 
 
-def _decompose_remote(remote_url, prompts, competitor_list, seed):
+def _decompose_remote(remote_url, prompts, competitor_list, seed, raw=True):
     """Run decompose via remote GPU worker."""
     from neurotrace.decompose import run_decompose_remote
     from neurotrace.remote import RemoteWorker
@@ -1748,7 +1760,7 @@ def _decompose_remote(remote_url, prompts, competitor_list, seed):
 
             remote_data = {}
             for event in worker.decompose_stream(
-                prompt_text, tokens, seed=seed,
+                prompt_text, tokens, seed=seed, raw=raw,
             ):
                 etype = event.get("type")
                 if etype == "decomposition":
