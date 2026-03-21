@@ -649,13 +649,18 @@ def _is_whitespace_token(token_text: str) -> bool:
 def _token_matches_answer(token_text: str, answer: str) -> bool:
     """Check if a decoded token matches an expected answer.
 
-    Uses prefix matching to handle subword tokenization (e.g. "Bud" matches
-    "Budapest"), but requires at least 2 characters to avoid false matches
-    on single-letter tokens.
+    Exact matches are accepted at any length (handles single-char answers
+    like chemical symbols "B", "H" and single-digit numbers "7", "0").
+    Prefix matches require >= 2 characters to avoid false positives
+    (e.g. "R" should not match "Rome").
     """
     clean = _clean_token(token_text)
     answer_clean = answer.strip().lower()
-    if not clean or len(clean) < 2:
+    if not clean:
+        return False
+    if clean == answer_clean:
+        return True
+    if len(clean) < 2:
         return False
     return answer_clean.startswith(clean)
 

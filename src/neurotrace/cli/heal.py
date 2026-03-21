@@ -299,7 +299,8 @@ def _heal_remote(
             final_clean = final_token.strip().lstrip("\u2581\u0120").lower()
             answer_clean = entry["answer"].strip().lower()
             is_correct = (
-                answer_clean.startswith(final_clean) and len(final_clean) >= 2
+                final_clean == answer_clean
+                or (len(final_clean) >= 2 and answer_clean.startswith(final_clean))
             )
             margin = prob if is_correct else -prob
             status = "correct" if is_correct else "wrong"

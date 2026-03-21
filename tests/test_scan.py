@@ -485,13 +485,32 @@ def test_token_matches_answer_rejects_wrong():
     assert not _token_matches_answer(" Berlin", "Paris")
 
 
-def test_token_matches_answer_rejects_single_char():
-    """Single character tokens should not match to avoid false positives."""
+def test_token_matches_answer_rejects_single_char_prefix():
+    """Single character tokens should not PREFIX-match longer answers."""
     from neurotrace.cli.analysis import _token_matches_answer
 
     assert not _token_matches_answer(" B", "Budapest")
     assert not _token_matches_answer("\u2581N", "Nairobi")
     assert not _token_matches_answer("S", "Stockholm")
+
+
+def test_token_matches_answer_accepts_single_char_exact():
+    """Single character tokens should EXACT-match single-char answers."""
+    from neurotrace.cli.analysis import _token_matches_answer
+
+    # Chemical symbols
+    assert _token_matches_answer(" B", "B")
+    assert _token_matches_answer("\u2581H", "H")
+    assert _token_matches_answer("\u0120O", "O")
+    assert _token_matches_answer("N", "N")
+    assert _token_matches_answer(" C", "C")
+    # Single-digit numbers
+    assert _token_matches_answer(" 7", "7")
+    assert _token_matches_answer("0", "0")
+    assert _token_matches_answer("\u25819", "9")
+    # Wrong single-char should still fail
+    assert not _token_matches_answer(" B", "H")
+    assert not _token_matches_answer(" 7", "9")
 
 
 def test_token_matches_answer_case_insensitive():
