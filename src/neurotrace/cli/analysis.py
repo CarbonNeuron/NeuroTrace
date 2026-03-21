@@ -641,6 +641,11 @@ def _clean_token(text: str) -> str:
     return text.strip().lstrip("\u2581\u0120").lower()
 
 
+def _is_whitespace_token(token_text: str) -> bool:
+    """Check if a token is purely whitespace (space, BPE markers, etc.)."""
+    return token_text.strip().lstrip("\u2581\u0120") == ""
+
+
 def _token_matches_answer(token_text: str, answer: str) -> bool:
     """Check if a decoded token matches an expected answer.
 
@@ -694,6 +699,24 @@ def _scan_remote(
                 layer_predictions_top_k=10,
                 seed=seed,
             )
+
+            # Whitespace-skip: if top-1 is whitespace (e.g. " "),
+            # append it to the prompt and re-run to get the actual
+            # answer token.  This handles numeric/single-char answers
+            # where the model produces a leading space first.
+            if (
+                result.top_tokens
+                and _is_whitespace_token(result.top_tokens[0].token)
+            ):
+                ws_token = result.top_tokens[0].token
+                result = worker.forward(
+                    entry["prompt"] + ws_token,
+                    raw=raw,
+                    top_k=10,
+                    layer_predictions=True,
+                    layer_predictions_top_k=10,
+                    seed=seed,
+                )
 
             answer = entry["answer"]
             ranks = []

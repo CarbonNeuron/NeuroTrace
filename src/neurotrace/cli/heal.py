@@ -282,13 +282,24 @@ def _heal_remote(
                 entry["prompt"], raw=True, top_k=5,
                 layer_predictions=False, seed=seed,
             )
+            # Whitespace-skip: if top-1 is whitespace (e.g. " "),
+            # append it and re-run to get the actual answer token.
+            if (
+                result.top_tokens
+                and result.top_tokens[0].token.strip().lstrip("\u2581\u0120") == ""
+            ):
+                ws_token = result.top_tokens[0].token
+                result = worker.forward(
+                    entry["prompt"] + ws_token, raw=True, top_k=5,
+                    layer_predictions=False, seed=seed,
+                )
             # Check if top-1 token matches answer
             final_token = result.top_tokens[0].token if result.top_tokens else ""
             prob = result.top_tokens[0].prob if result.top_tokens else 0.0
-            final_clean = final_token.strip().lstrip("\u2581").lower()
+            final_clean = final_token.strip().lstrip("\u2581\u0120").lower()
             answer_clean = entry["answer"].strip().lower()
             is_correct = (
-                answer_clean.startswith(final_clean) and final_clean
+                answer_clean.startswith(final_clean) and len(final_clean) >= 2
             )
             margin = prob if is_correct else -prob
             status = "correct" if is_correct else "wrong"
