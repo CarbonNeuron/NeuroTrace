@@ -219,6 +219,7 @@ def heal(
         "wrong": "red",
         "rolled_back": "bright_red",
         "skipped": "dim",
+        "failed": "red",
     }
 
     for pr in result.prompt_results:
@@ -255,6 +256,8 @@ def _heal_remote(
         heal_result_to_dict,
     )
     from neurotrace.remote import WorkerClient
+
+    from neurotrace.remote import WorkerError
 
     worker = WorkerClient(remote_url, timeout=600.0)
     health = worker.health()
@@ -379,16 +382,35 @@ def _heal_remote(
                         result_prob=entry["prob"],
                         final_status="wrong",
                     ))
-            except Exception:
+            except WorkerError as e:
+                if verbose:
+                    err_console.print(f"[red]  Edit failed: {e}[/red]")
                 edits_skipped += 1
                 prompt_results.append(PromptHealResult(
                     prompt=entry["prompt"],
                     answer=entry["answer"],
                     baseline_prob=entry["prob"],
                     baseline_status="wrong",
-                    action="skipped",
+                    action="failed",
                     result_prob=entry["prob"],
                     final_status="wrong",
+                    rollback_reason=str(e),
+                ))
+            except Exception as e:
+                if verbose:
+                    err_console.print(
+                        f"[red]  Edit error: {e}[/red]",
+                    )
+                edits_skipped += 1
+                prompt_results.append(PromptHealResult(
+                    prompt=entry["prompt"],
+                    answer=entry["answer"],
+                    baseline_prob=entry["prob"],
+                    baseline_status="wrong",
+                    action="failed",
+                    result_prob=entry["prob"],
+                    final_status="wrong",
+                    rollback_reason=str(e),
                 ))
 
         # Step 3: Perplexity check
@@ -496,6 +518,7 @@ def _heal_remote(
         "wrong": "red",
         "rolled_back": "bright_red",
         "skipped": "dim",
+        "failed": "red",
     }
 
     for pr in prompt_results:

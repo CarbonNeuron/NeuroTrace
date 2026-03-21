@@ -196,6 +196,16 @@ class ContrastResult:
 # ---------------------------------------------------------------------------
 
 
+class WorkerError(Exception):
+    """Raised when the GPU worker returns a non-200 response."""
+
+    def __init__(self, status_code: int, detail: str, endpoint: str):
+        self.status_code = status_code
+        self.detail = detail
+        self.endpoint = endpoint
+        super().__init__(f"Worker {endpoint} returned {status_code}: {detail}")
+
+
 def _decode_residual(b64_str: str) -> np.ndarray:
     """Decode a base64-encoded float16 array."""
     raw = base64.b64decode(b64_str)
@@ -580,7 +590,7 @@ class WorkerClient:
         raw: bool = True,
         seed: int = 42,
     ) -> RomeEditResult:
-        """ROME rank-one weight edit via /model/edit."""
+        """ROME rank-one weight edit via /model/rome-edit."""
         payload: dict[str, Any] = {
             "input": prompt,
             "subject": subject,
@@ -589,8 +599,15 @@ class WorkerClient:
             "raw": raw,
             "seed": seed,
         }
-        r = self.client.post(f"{self.base_url}/model/edit", json=payload)
-        r.raise_for_status()
+        endpoint = "/model/rome-edit"
+        r = self.client.post(f"{self.base_url}{endpoint}", json=payload)
+        if r.status_code != 200:
+            ct = r.headers.get("content-type", "")
+            if ct.startswith("application/json"):
+                detail = r.json().get("detail", r.text)
+            else:
+                detail = r.text
+            raise WorkerError(r.status_code, str(detail), endpoint)
         data = r.json()
         return RomeEditResult(
             success=data["success"],

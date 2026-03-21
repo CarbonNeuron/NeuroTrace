@@ -243,3 +243,90 @@ def test_remote_connection_error():
 
         with pytest.raises(httpx.ConnectError, match="Connection refused"):
             worker.health()
+
+
+# ---------------------------------------------------------------------------
+# 7. WorkerError on non-200 responses
+# ---------------------------------------------------------------------------
+
+def test_worker_error_attributes():
+    """WorkerError stores status_code, detail, and endpoint."""
+    from neurotrace.remote import WorkerError
+
+    err = WorkerError(422, "Validation failed", "/model/rome-edit")
+    assert err.status_code == 422
+    assert err.detail == "Validation failed"
+    assert err.endpoint == "/model/rome-edit"
+    assert "422" in str(err)
+    assert "/model/rome-edit" in str(err)
+
+
+def test_rome_edit_raises_worker_error_on_422():
+    """rome_edit() raises WorkerError when the worker returns 422."""
+    with patch("httpx.Client") as mock_cls:
+        mock_client = mock_cls.return_value
+        mock_response = MagicMock()
+        mock_response.status_code = 422
+        mock_response.headers = {"content-type": "application/json"}
+        mock_response.json.return_value = {
+            "detail": "[{'msg': 'field required', 'type': 'value_error'}]",
+        }
+        mock_response.text = "validation error"
+        mock_client.post.return_value = mock_response
+
+        from neurotrace.remote import WorkerClient, WorkerError
+
+        worker = WorkerClient("http://localhost:8877")
+        with pytest.raises(WorkerError, match="422") as exc_info:
+            worker.rome_edit("The capital of France is", "France", "Paris", 14)
+
+        assert exc_info.value.status_code == 422
+        assert exc_info.value.endpoint == "/model/rome-edit"
+
+
+def test_rome_edit_raises_worker_error_on_500():
+    """rome_edit() raises WorkerError on 500 with text body."""
+    with patch("httpx.Client") as mock_cls:
+        mock_client = mock_cls.return_value
+        mock_response = MagicMock()
+        mock_response.status_code = 500
+        mock_response.headers = {"content-type": "text/plain"}
+        mock_response.text = "Internal Server Error"
+        mock_client.post.return_value = mock_response
+
+        from neurotrace.remote import WorkerClient, WorkerError
+
+        worker = WorkerClient("http://localhost:8877")
+        with pytest.raises(WorkerError) as exc_info:
+            worker.rome_edit("test", "subj", "target", 5)
+
+        assert exc_info.value.status_code == 500
+        assert "Internal Server Error" in exc_info.value.detail
+
+
+def test_rome_edit_success():
+    """rome_edit() returns RomeEditResult on 200."""
+    with patch("httpx.Client") as mock_cls:
+        mock_client = mock_cls.return_value
+        mock_response = MagicMock()
+        mock_response.status_code = 200
+        mock_response.json.return_value = {
+            "success": True,
+            "edit_id": 1,
+            "stack_size": 1,
+            "pre_prob": 0.05,
+            "post_prob": 0.82,
+            "pre_margin": -3.2,
+            "post_margin": 1.5,
+        }
+        mock_client.post.return_value = mock_response
+
+        from neurotrace.remote import WorkerClient
+
+        worker = WorkerClient("http://localhost:8877")
+        result = worker.rome_edit("prompt", "subj", "target", 14)
+
+        assert result.success is True
+        assert result.edit_id == 1
+        assert result.pre_prob == pytest.approx(0.05)
+        assert result.post_prob == pytest.approx(0.82)

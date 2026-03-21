@@ -144,6 +144,7 @@ def test_rome_edit():
     with patch("httpx.Client") as mock_cls:
         mock_client = mock_cls.return_value
         mock_response = MagicMock()
+        mock_response.status_code = 200
         mock_response.json.return_value = {
             "success": True,
             "edit_id": 1,

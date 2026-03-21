@@ -30,8 +30,9 @@ from typing import Any
 
 import torch
 import uvicorn
-from fastapi import FastAPI, HTTPException
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exceptions import RequestValidationError
+from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, Field
 from transformers import AutoModelForCausalLM, AutoTokenizer
 
@@ -205,6 +206,19 @@ def _safe_topk(probs: torch.Tensor, k: int) -> tuple[torch.Tensor, torch.Tensor]
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="NeuroTrace GPU Worker", version="1.0.0")
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    log.error(
+        "%s %s: Validation error: %s",
+        request.method, request.url.path, exc.errors(),
+    )
+    return JSONResponse(
+        status_code=422,
+        content={"detail": str(exc.errors())},
+    )
+
 
 START_TIME = time.time()
 
@@ -452,6 +466,17 @@ class ModelEditRequest(BaseModel):
     action: str = "rome_rank_one"
     key_vector: str  # base64 float16
     value_vector: str  # base64 float16
+
+
+class RomeEditRequest(BaseModel):
+    """High-level ROME edit: compute key/value vectors on the worker."""
+
+    input: str
+    subject: str
+    target: str
+    layer: int
+    raw: bool = True
+    seed: int = 42
 
 
 # ---------------------------------------------------------------------------
@@ -1094,6 +1119,122 @@ def model_edit(req: ModelEditRequest) -> dict[str, Any]:
         "success": True,
         "edit_id": edit_id,
         "stack_size": len(_v2_edit_stack),
+    }
+
+
+@app.post("/model/rome-edit")
+def model_rome_edit(req: RomeEditRequest) -> dict[str, Any]:
+    """High-level ROME edit: auto-compute key/value vectors and apply."""
+    assert _model is not None and _tokenizer is not None and _device is not None
+
+    torch.manual_seed(req.seed)
+    layers = _get_transformer_layers()
+    if req.layer < 0 or req.layer >= len(layers):
+        raise HTTPException(
+            status_code=400, detail=f"Layer {req.layer} out of range",
+        )
+
+    prompt = req.input
+    answer = req.target
+    subject = req.subject
+
+    # Forward pass to get baseline
+    input_ids = _tokenizer.encode(prompt, return_tensors="pt").to(_device)
+    with torch.no_grad():
+        outputs = _model(input_ids)
+
+    logits = outputs.logits[0, -1, :]
+    probs = _safe_softmax(logits)
+
+    # Resolve answer token id
+    answer_ids = _tokenizer.encode(answer, add_special_tokens=False)
+    if not answer_ids:
+        answer_ids = _tokenizer.encode(" " + answer, add_special_tokens=False)
+    answer_tid = answer_ids[0] if answer_ids else 0
+
+    before_prob = probs[answer_tid].item()
+
+    # Auto-detect competitor (top non-answer token)
+    top_probs, top_ids = _safe_topk(probs, 10)
+    answer_ids_sp = _tokenizer.encode(" " + answer, add_special_tokens=False)
+    answer_ids_raw = _tokenizer.encode(answer, add_special_tokens=False)
+    exclude = set(answer_ids_sp + answer_ids_raw)
+    competitor = "the"
+    competitor_tid = 0
+    for tid in top_ids.tolist():
+        if tid not in exclude:
+            c = _tokenizer.decode([tid]).strip()
+            if c:
+                competitor = c
+                competitor_tid = tid
+                break
+
+    before_margin = logits[answer_tid].item() - logits[competitor_tid].item()
+
+    # Compute key vector k* from the target layer's MLP down_proj input
+    k_star_holder: dict[str, Any] = {}
+
+    def kstar_hook(module, args):
+        inp = args[0] if isinstance(args, tuple) else args
+        if inp.dim() == 3:
+            k_star_holder["value"] = inp[0, -1, :].detach().clone()
+        elif inp.dim() == 2:
+            k_star_holder["value"] = inp[-1, :].detach().clone()
+        else:
+            k_star_holder["value"] = inp.detach().clone()
+
+    handle = layers[req.layer].mlp.down_proj.register_forward_pre_hook(kstar_hook)
+    try:
+        with torch.no_grad():
+            _model(input_ids)
+    finally:
+        handle.remove()
+
+    k_star = k_star_holder["value"]
+
+    # Compute correction delta
+    ln_weight = _model.model.norm.weight.detach()
+    w_unembed = _model.lm_head.weight
+    p_answer = w_unembed[answer_tid] * ln_weight
+    p_comp = w_unembed[competitor_tid] * ln_weight
+    p_margin = p_answer - p_comp
+    dot = (p_margin @ p_margin).item()
+
+    deficit = -before_margin  # we want margin to become positive
+    if dot < 1e-10:
+        delta = torch.zeros_like(p_margin)
+    else:
+        delta = (deficit / dot) * p_margin
+
+    # Apply rank-one edit to mlp.down_proj
+    down_proj = layers[req.layer].mlp.down_proj
+    k_dot = (k_star @ k_star).item()
+    if k_dot < 1e-10:
+        raise HTTPException(status_code=400, detail="Key vector is near-zero")
+
+    update = torch.outer(delta, k_star) / k_dot
+    down_proj.weight.data += update
+
+    edit_id = len(_v2_edit_stack) + 1
+    _v2_edit_stack.append((req.layer, "mlp.down_proj", k_star.cpu(), delta.cpu()))
+
+    # Verify
+    with torch.no_grad():
+        outputs_after = _model(input_ids)
+
+    after_logits = outputs_after.logits[0, -1, :]
+    after_probs = _safe_softmax(after_logits)
+    after_prob = after_probs[answer_tid].item()
+    after_margin = after_logits[answer_tid].item() - after_logits[competitor_tid].item()
+
+    return {
+        "success": True,
+        "edit_id": edit_id,
+        "stack_size": len(_v2_edit_stack),
+        "pre_prob": before_prob,
+        "post_prob": after_prob,
+        "pre_margin": before_margin,
+        "post_margin": after_margin,
     }
 
 

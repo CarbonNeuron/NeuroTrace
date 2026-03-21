@@ -592,6 +592,7 @@ def _action_color(action: str) -> str:
         "wrong": _RED,
         "rolled_back": _ORANGE,
         "skipped": _DIM,
+        "failed": _RED,
     }.get(action, _DIM)
 
 
