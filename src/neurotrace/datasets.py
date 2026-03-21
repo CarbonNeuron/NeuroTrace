@@ -529,11 +529,178 @@ SCIENCE_SYMBOLS = [
     },
 ]
 
+MULTI_HOP = [
+    # Geography chains (12)
+    {
+        "prompt": "The capital of the largest country in South America is",
+        "intermediate": "Brazil",
+        "answer": "Brasilia",
+    },
+    {
+        "prompt": "The capital of the country east of France is",
+        "intermediate": "Germany",
+        "answer": "Berlin",
+    },
+    {
+        "prompt": "The capital of the country north of Mexico is",
+        "intermediate": "United States",
+        "answer": "Washington",
+    },
+    {
+        "prompt": "The currency used in the capital of Japan is the",
+        "intermediate": "Tokyo",
+        "answer": "yen",
+    },
+    {
+        "prompt": "The capital of the country where the Nile ends is",
+        "intermediate": "Egypt",
+        "answer": "Cairo",
+    },
+    {
+        "prompt": "The capital of the country that borders Canada to the south is",
+        "intermediate": "United States",
+        "answer": "Washington",
+    },
+    {
+        "prompt": "The official language of the country south of the United States is",
+        "intermediate": "Mexico",
+        "answer": "Spanish",
+    },
+    {
+        "prompt": "The continent where the country with the Great Wall is located is",
+        "intermediate": "China",
+        "answer": "Asia",
+    },
+    {
+        "prompt": "The capital of the smallest country in the world is",
+        "intermediate": "Vatican",
+        "answer": "Vatican",
+    },
+    {
+        "prompt": "The ocean east of the country shaped like a boot is the",
+        "intermediate": "Italy",
+        "answer": "Mediterranean",
+    },
+    {
+        "prompt": "The capital of the country where the Amazon River originates is",
+        "intermediate": "Peru",
+        "answer": "Lima",
+    },
+    {
+        "prompt": "The capital of the island country south of India is",
+        "intermediate": "Sri Lanka",
+        "answer": "Colombo",
+    },
+    # Science chains (10)
+    {
+        "prompt": "The atomic number of the lightest noble gas is",
+        "intermediate": "helium",
+        "answer": "2",
+    },
+    {
+        "prompt": "The chemical symbol for the most abundant gas in air is",
+        "intermediate": "nitrogen",
+        "answer": "N",
+    },
+    {
+        "prompt": "The number of protons in a gold atom is",
+        "intermediate": "gold",
+        "answer": "79",
+    },
+    {
+        "prompt": "The boiling point in Celsius of the liquid in thermometers is",
+        "intermediate": "mercury",
+        "answer": "357",
+    },
+    {
+        "prompt": "The chemical symbol for the element in table salt with atomic number 11 is",
+        "intermediate": "sodium",
+        "answer": "Na",
+    },
+    {
+        "prompt": "The number of electrons in a neutral carbon atom is",
+        "intermediate": "carbon",
+        "answer": "6",
+    },
+    {
+        "prompt": "The state of matter of the element with symbol Hg at room temperature is",
+        "intermediate": "mercury",
+        "answer": "liquid",
+    },
+    {
+        "prompt": "The color of the element with symbol Au is",
+        "intermediate": "gold",
+        "answer": "yellow",
+    },
+    {
+        "prompt": "The atomic mass of the lightest element is approximately",
+        "intermediate": "hydrogen",
+        "answer": "1",
+    },
+    {
+        "prompt": "The number of valence electrons in the element with symbol O is",
+        "intermediate": "oxygen",
+        "answer": "6",
+    },
+    # Compositional reasoning (10)
+    {
+        "prompt": "The number of legs on the animal that says meow is",
+        "intermediate": "cat",
+        "answer": "4",
+    },
+    {
+        "prompt": "The language spoken in the country shaped like a boot is",
+        "intermediate": "Italy",
+        "answer": "Italian",
+    },
+    {
+        "prompt": "The color of the fruit that monkeys are known to eat is",
+        "intermediate": "banana",
+        "answer": "yellow",
+    },
+    {
+        "prompt": "The number of strings on the instrument played by a violinist is",
+        "intermediate": "violin",
+        "answer": "4",
+    },
+    {
+        "prompt": "The material of the tower in Paris that is a famous landmark is",
+        "intermediate": "Eiffel",
+        "answer": "iron",
+    },
+    {
+        "prompt": "The sport played at Wimbledon uses a",
+        "intermediate": "tennis",
+        "answer": "racket",
+    },
+    {
+        "prompt": "The number of sides on the shape of a stop sign is",
+        "intermediate": "octagon",
+        "answer": "8",
+    },
+    {
+        "prompt": "The habitat of the largest mammal on Earth is the",
+        "intermediate": "whale",
+        "answer": "ocean",
+    },
+    {
+        "prompt": "The number of players on a team in the sport with a touchdown is",
+        "intermediate": "football",
+        "answer": "11",
+    },
+    {
+        "prompt": "The color of the precious stone in a ruby ring is",
+        "intermediate": "ruby",
+        "answer": "red",
+    },
+]
+
 RELATION_KEYWORDS: dict[str, set[str]] = {
     "capitals": {"capital"},
     "science_symbols": {"symbol", "number", "atomic", "chemical"},
     "math_simple": set(),
     "history_dates": set(),
+    "multi_hop": {"intermediate", "hop", "chain"},
 }
 
 _BUILTIN_DATASETS = {
@@ -541,6 +708,7 @@ _BUILTIN_DATASETS = {
     "math_simple": MATH_SIMPLE,
     "history_dates": HISTORY_DATES,
     "science_symbols": SCIENCE_SYMBOLS,
+    "multi_hop": MULTI_HOP,
 }
 
 

@@ -138,3 +138,7 @@ cli.add_command(heal)
 from neurotrace.cli.discover import discover  # noqa: E402
 
 cli.add_command(discover)
+
+from neurotrace.cli.chain import chain  # noqa: E402
+
+cli.add_command(chain)

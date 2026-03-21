@@ -111,9 +111,12 @@ def test_get_builtin_dataset_science_symbols():
 
 def test_get_builtin_dataset_all():
     ds = get_builtin_dataset("all")
+    from neurotrace.datasets import MULTI_HOP
+
     expected_len = (
         len(CAPITALS) + len(MATH_SIMPLE)
         + len(HISTORY_DATES) + len(SCIENCE_SYMBOLS)
+        + len(MULTI_HOP)
     )
     assert len(ds) == expected_len
     # Should contain entries from all datasets
