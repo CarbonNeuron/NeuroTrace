@@ -2466,6 +2466,23 @@ def decompose(req: DecomposeRequest) -> StreamingResponse:
 
         W_unembed = _model.lm_head.weight
 
+        # Compute cumulative rank at each layer by projecting the running
+        # residual stream through RMSNorm + lm_head and ranking across the
+        # full vocabulary.
+        eps = _model.model.norm.variance_epsilon
+        cum_residual = embed.clone()
+        per_layer_cum_ranks: dict[int, dict[int, int]] = {}
+        for i in range(len(layers)):
+            cum_residual = cum_residual + components[i]["attn"] + components[i]["mlp"]
+            var = cum_residual.pow(2).mean(-1, keepdim=False)
+            scale = torch.sqrt(var + eps)
+            normed = (cum_residual * ln_weight) / scale
+            logits_full = normed @ W_unembed.T
+            layer_ranks = {}
+            for tid in target_ids:
+                layer_ranks[tid] = int((logits_full > logits_full[tid]).sum().item()) + 1
+            per_layer_cum_ranks[i] = layer_ranks
+
         decompositions: dict[str, Any] = {}
         for token_str, token_id in zip(req.tokens, target_ids):
             unembed_vec = W_unembed[token_id]
@@ -2480,6 +2497,7 @@ def decompose(req: DecomposeRequest) -> StreamingResponse:
                 mlp_c = (P * components[i]["mlp"]).sum().item()
                 layer_contribs.append({
                     "layer": i, "attention": attn_c, "mlp": mlp_c,
+                    "cumulative_rank": per_layer_cum_ranks[i][token_id],
                 })
                 total += attn_c + mlp_c
 
