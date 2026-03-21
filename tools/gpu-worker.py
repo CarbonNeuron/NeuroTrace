@@ -251,8 +251,10 @@ _num_layers: int = 0
 _dtype: str = "auto"
 # adapter_id -> path on disk
 _adapters: dict[str, Path] = {}
-# Stack of (layer, k_star, delta) for undo
+# Stack of (layer, k_star, delta) for legacy /repair undo
 _edit_stack: list[tuple[int, Any, Any]] = []
+# v2 edit stack: (layer, component, key_vec, val_vec) for /model/edit
+_v2_edit_stack: list[tuple[int, str, Any, Any]] = []
 
 
 # ---------------------------------------------------------------------------
@@ -391,6 +393,65 @@ class RepairSaveRequest(BaseModel):
 class ReloadRequest(BaseModel):
     model: str | None = None
     dtype: str | None = None
+
+
+# ---------------------------------------------------------------------------
+# v2 Pydantic models — inference primitives
+# ---------------------------------------------------------------------------
+
+
+class OutputSpec(BaseModel):
+    logits: bool = False
+    top_k: int = 10
+    residuals: bool = False
+    residual_layers: list[int] | None = None
+    hidden_states: bool = False
+
+
+class InferenceForwardRequest(BaseModel):
+    input: str | None = None
+    messages: list[ChatMessage] | None = None
+    raw: bool = False
+    seed: int = 42
+    outputs: OutputSpec = Field(default_factory=OutputSpec)
+
+
+class HookSpec(BaseModel):
+    layer: int
+    component: str  # "mlp" | "attn" | "layer"
+    action: str  # "zero" | "capture" | "scale" | "replace"
+    scale: float | None = None
+    tensor: str | None = None  # base64-encoded float16
+
+
+class InferenceHookedRequest(BaseModel):
+    input: str | None = None
+    messages: list[ChatMessage] | None = None
+    raw: bool = False
+    seed: int = 42
+    hooks: list[HookSpec] = Field(default_factory=list)
+    outputs: OutputSpec = Field(default_factory=OutputSpec)
+
+
+class InferenceGenerateRequest(BaseModel):
+    input: str | None = None
+    messages: list[ChatMessage] | None = None
+    raw: bool = False
+    seed: int = 42
+    max_tokens: int = 20
+    temperature: float = 0.0
+
+
+class InferenceBatchRequest(BaseModel):
+    requests: list[InferenceForwardRequest]
+
+
+class ModelEditRequest(BaseModel):
+    layer: int
+    component: str  # e.g. "mlp.down_proj"
+    action: str = "rome_rank_one"
+    key_vector: str  # base64 float16
+    value_vector: str  # base64 float16
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +650,7 @@ async def reload(req: ReloadRequest) -> StreamingResponse:
         _model = None
         _tokenizer = None
         _edit_stack.clear()
+        _v2_edit_stack.clear()
 
         import gc
         gc.collect()
@@ -631,6 +693,487 @@ def format_prompt(req: FormatRequest) -> dict[str, Any]:
     )
     num_tokens = len(_tokenizer.encode(formatted))
     return {"formatted": formatted, "num_tokens": num_tokens}
+
+
+# ---------------------------------------------------------------------------
+# v2 Inference Primitive Endpoints
+# ---------------------------------------------------------------------------
+
+
+def _resolve_input(
+    input_str: str | None,
+    messages: list[ChatMessage] | None,
+    raw: bool = False,
+) -> str:
+    """Resolve input for v2 endpoints — same logic as _resolve_prompt."""
+    return _resolve_prompt(input_str, messages, raw)
+
+
+def _encode_residual(tensor: torch.Tensor) -> str:
+    """Encode a tensor as base64 float16."""
+    import base64
+
+    arr = tensor.detach().cpu().float().numpy().astype("float16")
+    return base64.b64encode(arr.tobytes()).decode("ascii")
+
+
+def _decode_tensor_b64(b64_str: str, dtype: str = "float16") -> torch.Tensor:
+    """Decode a base64-encoded tensor."""
+    import base64
+
+    import numpy as np
+
+    raw = base64.b64decode(b64_str)
+    arr = np.frombuffer(raw, dtype=dtype)
+    return torch.from_numpy(arr.copy()).float()
+
+
+def _build_top_tokens(logits: torch.Tensor, k: int) -> list[dict[str, Any]]:
+    """Build top-k token predictions with logit and prob values."""
+    assert _tokenizer is not None
+    probs = _safe_softmax(logits)
+    top_probs, top_ids = _safe_topk(probs, min(k, probs.shape[-1]))
+    logits_cpu = logits.float().cpu()
+    results: list[dict[str, Any]] = []
+    for prob, tid in zip(top_probs.tolist(), top_ids.tolist()):
+        results.append({
+            "token": _tokenizer.decode([tid]),
+            "token_id": tid,
+            "logit": round(logits_cpu[tid].item(), 4),
+            "prob": round(prob, 6),
+        })
+    return results
+
+
+@app.post("/inference/forward")
+def inference_forward(req: InferenceForwardRequest) -> dict[str, Any]:
+    """v2 forward pass — return logits, top-k predictions, and optional residuals."""
+    assert _model is not None and _tokenizer is not None and _device is not None
+
+    prompt = _resolve_input(req.input, req.messages, raw=req.raw)
+    torch.manual_seed(req.seed)
+    inputs = _tokenizer(prompt, return_tensors="pt").to(_device)
+
+    layers = _get_transformer_layers()
+    residuals: dict[int, torch.Tensor] = {}
+    hooks: list[torch.utils.hooks.RemovableHandle] = []
+
+    # Determine which layers to capture residuals for
+    if req.outputs.residuals:
+        target_layers = (
+            req.outputs.residual_layers
+            if req.outputs.residual_layers is not None
+            else list(range(len(layers)))
+        )
+        for layer_idx in target_layers:
+            if 0 <= layer_idx < len(layers):
+                def _make_hook(li: int):
+                    def hook_fn(module: torch.nn.Module, input: Any, output: Any) -> None:
+                        hidden = output[0] if isinstance(output, tuple) else output
+                        residuals[li] = hidden[:, -1, :].detach()
+                    return hook_fn
+                hooks.append(layers[layer_idx].register_forward_hook(_make_hook(layer_idx)))
+
+    try:
+        with torch.no_grad():
+            outputs = _model(**inputs)
+    finally:
+        for h in hooks:
+            h.remove()
+
+    final_logits = outputs.logits[:, -1, :].float().cpu()
+    top_tokens = _build_top_tokens(final_logits[0], req.outputs.top_k)
+
+    result: dict[str, Any] = {
+        "top_tokens": top_tokens,
+        "num_layers": _num_layers,
+        "vocab_size": getattr(_model.config, "vocab_size", 0),
+        "hidden_dim": getattr(_model.config, "hidden_size", 0),
+    }
+
+    if req.outputs.residuals:
+        result["residuals"] = {
+            str(li): _encode_residual(residuals[li][0])
+            for li in sorted(residuals.keys())
+        }
+    else:
+        result["residuals"] = None
+
+    return result
+
+
+@app.post("/inference/hooked")
+def inference_hooked(req: InferenceHookedRequest) -> dict[str, Any]:
+    """v2 hooked forward pass — apply hooks (zero/capture/scale/replace) during inference."""
+    assert _model is not None and _tokenizer is not None and _device is not None
+
+    prompt = _resolve_input(req.input, req.messages, raw=req.raw)
+    torch.manual_seed(req.seed)
+    inputs = _tokenizer(prompt, return_tensors="pt").to(_device)
+
+    layers = _get_transformer_layers()
+    hooks_handles: list[torch.utils.hooks.RemovableHandle] = []
+    captured: dict[str, torch.Tensor] = {}
+
+    for hook_spec in req.hooks:
+        layer_idx = hook_spec.layer
+        if layer_idx < 0 or layer_idx >= len(layers):
+            continue
+
+        layer = layers[layer_idx]
+        component = hook_spec.component
+        action = hook_spec.action
+
+        # Resolve the target module
+        if component == "mlp":
+            target = layer.mlp
+        elif component == "attn":
+            target = layer.self_attn
+        elif component == "layer":
+            target = layer
+        else:
+            continue
+
+        if action == "zero":
+            def _make_zero_hook(target_module: torch.nn.Module):
+                def hook_fn(module: torch.nn.Module, input: Any, output: Any):
+                    if isinstance(output, tuple):
+                        return (torch.zeros_like(output[0]),) + output[1:]
+                    return torch.zeros_like(output)
+                return hook_fn
+            hooks_handles.append(target.register_forward_hook(_make_zero_hook(target)))
+
+        elif action == "capture":
+            capture_key = f"{layer_idx}.{component}"
+            def _make_capture_hook(key: str):
+                def hook_fn(module: torch.nn.Module, input: Any, output: Any) -> None:
+                    out = output[0] if isinstance(output, tuple) else output
+                    captured[key] = out[:, -1, :].detach()
+                return hook_fn
+            hooks_handles.append(target.register_forward_hook(_make_capture_hook(capture_key)))
+
+        elif action == "scale":
+            scale_factor = hook_spec.scale if hook_spec.scale is not None else 1.0
+            def _make_scale_hook(s: float):
+                def hook_fn(module: torch.nn.Module, input: Any, output: Any):
+                    if isinstance(output, tuple):
+                        return (output[0] * s,) + output[1:]
+                    return output * s
+                return hook_fn
+            hooks_handles.append(target.register_forward_hook(_make_scale_hook(scale_factor)))
+
+        elif action == "replace":
+            if hook_spec.tensor is not None:
+                replacement = _decode_tensor_b64(hook_spec.tensor).to(_device)
+                def _make_replace_hook(rep: torch.Tensor):
+                    def hook_fn(module: torch.nn.Module, input: Any, output: Any):
+                        if isinstance(output, tuple):
+                            out = output[0].clone()
+                            out[:, -1, :] = rep
+                            return (out,) + output[1:]
+                        out = output.clone()
+                        out[:, -1, :] = rep
+                        return out
+                    return hook_fn
+                hooks_handles.append(target.register_forward_hook(_make_replace_hook(replacement)))
+
+    try:
+        with torch.no_grad():
+            outputs = _model(**inputs)
+    finally:
+        for h in hooks_handles:
+            h.remove()
+
+    final_logits = outputs.logits[:, -1, :].float().cpu()
+    top_tokens = _build_top_tokens(final_logits[0], req.outputs.top_k)
+
+    result: dict[str, Any] = {
+        "top_tokens": top_tokens,
+        "num_layers": _num_layers,
+        "vocab_size": getattr(_model.config, "vocab_size", 0),
+        "hidden_dim": getattr(_model.config, "hidden_size", 0),
+    }
+
+    if captured:
+        result["captured"] = {
+            key: _encode_residual(val[0]) for key, val in captured.items()
+        }
+    else:
+        result["captured"] = {}
+
+    return result
+
+
+@app.post("/inference/generate")
+def inference_generate(req: InferenceGenerateRequest) -> dict[str, Any]:
+    """v2 generate — produce multiple tokens sequentially."""
+    assert _model is not None and _tokenizer is not None and _device is not None
+
+    prompt = _resolve_input(req.input, req.messages, raw=req.raw)
+    torch.manual_seed(req.seed)
+    inputs = _tokenizer(prompt, return_tensors="pt").to(_device)
+
+    tokens_out: list[dict[str, Any]] = []
+
+    with torch.no_grad():
+        input_ids = inputs["input_ids"]
+        attention_mask = inputs.get("attention_mask", None)
+
+        for _ in range(req.max_tokens):
+            outputs = _model(input_ids=input_ids, attention_mask=attention_mask)
+            logits = outputs.logits[:, -1, :].float().cpu()
+            probs = _safe_softmax(logits[0])
+
+            if req.temperature == 0.0:
+                top_prob, top_id = _safe_topk(probs, 1)
+                next_id = top_id[0].item()
+                next_prob = top_prob[0].item()
+                next_logit = logits[0, next_id].item()
+            else:
+                scaled = logits[0] / req.temperature
+                scaled_probs = torch.softmax(scaled, dim=-1)
+                next_id = torch.multinomial(scaled_probs, 1).item()
+                next_prob = probs[next_id].item()
+                next_logit = logits[0, next_id].item()
+
+            token_str = _tokenizer.decode([next_id])
+            tokens_out.append({
+                "token": token_str,
+                "token_id": next_id,
+                "logit": round(next_logit, 4),
+                "prob": round(next_prob, 6),
+            })
+
+            # Check for EOS
+            if next_id == _tokenizer.eos_token_id:
+                break
+
+            # Append to input for next step
+            next_tensor = torch.tensor([[next_id]], device=_device)
+            input_ids = torch.cat([input_ids, next_tensor], dim=1)
+            if attention_mask is not None:
+                attention_mask = torch.cat(
+                    [attention_mask, torch.ones((1, 1), device=_device, dtype=attention_mask.dtype)],
+                    dim=1,
+                )
+
+    generated_text = "".join(t["token"] for t in tokens_out)
+
+    return {
+        "text": generated_text,
+        "tokens": tokens_out,
+        "num_tokens": len(tokens_out),
+    }
+
+
+@app.post("/inference/batch")
+def inference_batch(req: InferenceBatchRequest) -> StreamingResponse:
+    """v2 batch forward — process multiple forward requests with SSE progress."""
+    assert _model is not None and _tokenizer is not None and _device is not None
+
+    async def _generate():
+        total = len(req.requests)
+        start = time.time()
+
+        for idx, sub_req in enumerate(req.requests):
+            prompt = _resolve_input(sub_req.input, sub_req.messages, raw=sub_req.raw)
+
+            yield _sse_event("progress", {
+                "completed": idx,
+                "total": total,
+                "current": prompt[:80],
+                "elapsed_s": round(time.time() - start, 1),
+            })
+
+            torch.manual_seed(sub_req.seed)
+            inputs = _tokenizer(prompt, return_tensors="pt").to(_device)
+
+            layers = _get_transformer_layers()
+            residuals: dict[int, torch.Tensor] = {}
+            hooks: list[torch.utils.hooks.RemovableHandle] = []
+
+            if sub_req.outputs.residuals:
+                target_layers = (
+                    sub_req.outputs.residual_layers
+                    if sub_req.outputs.residual_layers is not None
+                    else list(range(len(layers)))
+                )
+                for layer_idx in target_layers:
+                    if 0 <= layer_idx < len(layers):
+                        def _make_hook(li: int):
+                            def hook_fn(module, input, output):
+                                hidden = output[0] if isinstance(output, tuple) else output
+                                residuals[li] = hidden[:, -1, :].detach()
+                            return hook_fn
+                        hooks.append(layers[layer_idx].register_forward_hook(_make_hook(layer_idx)))
+
+            try:
+                with torch.no_grad():
+                    outputs = _model(**inputs)
+            finally:
+                for h in hooks:
+                    h.remove()
+
+            final_logits = outputs.logits[:, -1, :].float().cpu()
+            top_tokens = _build_top_tokens(final_logits[0], sub_req.outputs.top_k)
+
+            result_data: dict[str, Any] = {
+                "index": idx,
+                "top_tokens": top_tokens,
+                "num_layers": _num_layers,
+                "vocab_size": getattr(_model.config, "vocab_size", 0),
+                "hidden_dim": getattr(_model.config, "hidden_size", 0),
+            }
+
+            if sub_req.outputs.residuals:
+                result_data["residuals"] = {
+                    str(li): _encode_residual(residuals[li][0])
+                    for li in sorted(residuals.keys())
+                }
+            else:
+                result_data["residuals"] = None
+
+            yield _sse_event("result", result_data)
+            await asyncio.sleep(0)
+
+        yield _sse_event("done", {
+            "total": total,
+            "elapsed_s": round(time.time() - start, 1),
+        })
+
+    return StreamingResponse(_generate(), media_type="text/event-stream")
+
+
+# ---------------------------------------------------------------------------
+# v2 Weight Editing Endpoints
+# ---------------------------------------------------------------------------
+
+
+@app.post("/model/edit")
+def model_edit(req: ModelEditRequest) -> dict[str, Any]:
+    """Apply a rank-one weight update: W += value_vector @ key_vector.T"""
+    assert _model is not None
+
+    layers = _get_transformer_layers()
+    if req.layer < 0 or req.layer >= len(layers):
+        raise HTTPException(status_code=400, detail=f"Layer {req.layer} out of range")
+
+    key_vec = _decode_tensor_b64(req.key_vector).to(_device)
+    val_vec = _decode_tensor_b64(req.value_vector).to(_device)
+
+    # Navigate to the target weight matrix
+    layer = layers[req.layer]
+    parts = req.component.split(".")
+    target = layer
+    for part in parts:
+        target = getattr(target, part, None)
+        if target is None:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Component '{req.component}' not found in layer {req.layer}",
+            )
+
+    if not hasattr(target, "weight"):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Component '{req.component}' has no weight matrix",
+        )
+
+    # Store original for undo: save the delta so we can subtract it
+    k_dot = (key_vec @ key_vec).item()
+    if k_dot < 1e-10:
+        raise HTTPException(status_code=400, detail="Key vector is near-zero")
+
+    update = torch.outer(val_vec, key_vec) / k_dot
+    target.weight.data += update
+
+    edit_id = len(_v2_edit_stack) + 1
+    _v2_edit_stack.append((req.layer, req.component, key_vec.cpu(), val_vec.cpu()))
+
+    return {
+        "success": True,
+        "edit_id": edit_id,
+        "stack_size": len(_v2_edit_stack),
+    }
+
+
+@app.post("/model/edit/undo")
+def model_edit_undo() -> dict[str, Any]:
+    """Pop the last edit from the stack, restore previous weights."""
+    assert _model is not None
+    if not _v2_edit_stack:
+        raise HTTPException(status_code=400, detail="No edits to undo")
+
+    layer_idx, component, key_vec, val_vec = _v2_edit_stack.pop()
+    layers = _get_transformer_layers()
+    layer = layers[layer_idx]
+
+    parts = component.split(".")
+    target = layer
+    for part in parts:
+        target = getattr(target, part)
+
+    key_vec_d = key_vec.to(_device)
+    val_vec_d = val_vec.to(_device)
+    k_dot = (key_vec_d @ key_vec_d).item()
+    if k_dot >= 1e-10:
+        update = torch.outer(val_vec_d, key_vec_d) / k_dot
+        target.weight.data -= update
+
+    return {
+        "success": True,
+        "edits_remaining": len(_v2_edit_stack),
+    }
+
+
+@app.post("/model/edit/clear")
+def model_edit_clear() -> dict[str, Any]:
+    """Clear all edits, restore original weights."""
+    assert _model is not None
+
+    # Undo all edits in reverse order
+    layers = _get_transformer_layers()
+    while _v2_edit_stack:
+        layer_idx, component, key_vec, val_vec = _v2_edit_stack.pop()
+        layer = layers[layer_idx]
+
+        parts = component.split(".")
+        target = layer
+        for part in parts:
+            target = getattr(target, part)
+
+        key_vec_d = key_vec.to(_device)
+        val_vec_d = val_vec.to(_device)
+        k_dot = (key_vec_d @ key_vec_d).item()
+        if k_dot >= 1e-10:
+            update = torch.outer(val_vec_d, key_vec_d) / k_dot
+            target.weight.data -= update
+
+    return {
+        "success": True,
+        "edits_remaining": 0,
+    }
+
+
+@app.get("/model/edit/stack")
+def model_edit_stack() -> dict[str, Any]:
+    """Return current edit stack."""
+    stack_info = []
+    for i, (layer_idx, component, _key, _val) in enumerate(_v2_edit_stack):
+        stack_info.append({
+            "edit_id": i + 1,
+            "layer": layer_idx,
+            "component": component,
+        })
+    return {
+        "stack_size": len(_v2_edit_stack),
+        "edits": stack_info,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Legacy endpoints (kept for backward compatibility)
+# ---------------------------------------------------------------------------
 
 
 @app.post("/trace", response_model=TraceResponse)
