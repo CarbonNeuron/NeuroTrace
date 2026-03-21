@@ -261,7 +261,7 @@ def run_scan(
                     top1_decoded = (
                         tokenizer.decode(top1_id)
                         .strip()
-                        .lstrip("\u2581")
+                        .lstrip("\u2581\u0120")
                         .lower()
                     )
                     if top1_decoded and answer_lower.startswith(

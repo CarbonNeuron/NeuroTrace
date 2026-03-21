@@ -632,6 +632,29 @@ def sweep(
     console.print(table)
 
 
+def _clean_token(text: str) -> str:
+    """Normalize a token string for comparison.
+
+    Strips whitespace, BPE space markers (SentencePiece \u2581, GPT-2 \u0120),
+    and lowercases.
+    """
+    return text.strip().lstrip("\u2581\u0120").lower()
+
+
+def _token_matches_answer(token_text: str, answer: str) -> bool:
+    """Check if a decoded token matches an expected answer.
+
+    Uses prefix matching to handle subword tokenization (e.g. "Bud" matches
+    "Budapest"), but requires at least 2 characters to avoid false matches
+    on single-letter tokens.
+    """
+    clean = _clean_token(token_text)
+    answer_clean = answer.strip().lower()
+    if not clean or len(clean) < 2:
+        return False
+    return answer_clean.startswith(clean)
+
+
 def _scan_remote(
     remote_url, dataset, dataset_name, seed,
     sabotage_threshold, final_threshold,
@@ -640,7 +663,7 @@ def _scan_remote(
 ):
     """Run scan via remote GPU worker using v2 forward() with layer_predictions."""
     from neurotrace.remote import WorkerClient
-    from neurotrace.scan import PromptResult, ScanResult
+    from neurotrace.scan import PromptResult, ScanResult, detect_sabotage
 
     worker = WorkerClient(remote_url)
     health = worker.health()
@@ -666,85 +689,50 @@ def _scan_remote(
             result = worker.forward(
                 entry["prompt"],
                 raw=raw,
-                top_k=5,
+                top_k=10,
                 layer_predictions=True,
-                layer_predictions_top_k=5,
+                layer_predictions_top_k=10,
                 seed=seed,
             )
 
-            # Extract per-layer predictions for the expected answer
             answer = entry["answer"]
             ranks = []
-            probs = []
+            probs_list = []
 
             if result.layer_predictions:
                 for lp in result.layer_predictions:
                     found = False
                     for rank_idx, tt in enumerate(lp.top_tokens):
-                        token_text = tt.token.strip().lstrip("\u2581").lower()
-                        if (
-                            answer.strip().lower().startswith(token_text)
-                            and token_text
-                        ):
+                        if _token_matches_answer(tt.token, answer):
                             ranks.append(rank_idx + 1)
-                            probs.append(tt.prob)
+                            probs_list.append(tt.prob)
                             found = True
                             break
                     if not found:
                         ranks.append(999)
-                        probs.append(0.0)
+                        probs_list.append(0.0)
 
-            # Final prediction from top_tokens
+            # Final prediction: find answer rank in top_tokens
             final_token = (
                 result.top_tokens[0].token if result.top_tokens else ""
             )
-            final_prob = (
-                result.top_tokens[0].prob if result.top_tokens else 0.0
-            )
-            final_rank = 1 if result.top_tokens else 999
-
-            # Compute peak prob and layer
-            peak_prob = max(probs) if probs else 0.0
-            peak_layer = probs.index(peak_prob) if probs and peak_prob > 0 else None
-
-            # Compute commitment layer (first layer where answer prob > threshold)
-            commitment_layer = None
-            for li, p in enumerate(probs):
-                if p > 0.1:
-                    commitment_layer = li
+            final_rank = 999
+            final_prob = 0.0
+            for rank_idx, tt in enumerate(result.top_tokens):
+                if _token_matches_answer(tt.token, answer):
+                    final_rank = rank_idx + 1
+                    final_prob = tt.prob
                     break
 
-            # Detect sabotage layers
-            sabotage_layers = []
-            if peak_prob > 0:
-                for li, p in enumerate(probs):
-                    if li > 0 and peak_layer is not None and li > peak_layer:
-                        drop = (peak_prob - p) / peak_prob
-                        if drop >= sabotage_threshold:
-                            sabotage_layers.append(li)
-
-            # Classify
-            final_token_clean = final_token.strip().lstrip("\u2581").lower()
-            answer_clean = answer.strip().lower()
-
-            flags = []
-            if answer_clean.startswith(final_token_clean) and final_token_clean:
-                if sabotage_layers:
-                    status = "sabotaged"
-                    flags.append("sabotage_detected")
-                elif final_prob < final_threshold:
-                    status = "weak"
-                    flags.append("weak_confidence")
-                else:
-                    status = "correct"
-            else:
-                if sabotage_layers:
-                    status = "sabotaged"
-                    flags.append("sabotage_detected")
-                    flags.append("wrong_final")
-                else:
-                    status = "wrong"
-                    flags.append("wrong_final")
+            # Use shared detect_sabotage for consistent classification
+            sab = detect_sabotage(
+                ranks,
+                probs_list,
+                final_rank,
+                final_prob,
+                sabotage_threshold,
+                final_threshold,
+            )
 
             prompt_results.append(PromptResult(
                 prompt=entry["prompt"],
@@ -752,14 +740,14 @@ def _scan_remote(
                 final_token=final_token,
                 final_prob=final_prob,
                 final_rank=final_rank,
-                peak_prob=peak_prob,
-                peak_layer=peak_layer,
-                commitment_layer=commitment_layer,
-                sabotage_layers=sabotage_layers,
-                flags=flags,
-                status=status,
+                peak_prob=sab.peak_prob,
+                peak_layer=sab.peak_layer_idx,
+                commitment_layer=sab.commitment_layer_idx,
+                sabotage_layers=sab.sabotage_layers,
+                flags=sab.flags,
+                status=sab.status,
                 ranks=ranks,
-                probs=probs,
+                probs=probs_list,
             ))
 
         progress.update(task, description="Done.", completed=len(dataset))

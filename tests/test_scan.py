@@ -432,6 +432,196 @@ def test_answer_matching_prefix_fallback():
         )
 
 
+# --- Remote scan helpers tests ---
+
+
+def test_clean_token_strips_sentencepiece_marker():
+    from neurotrace.cli.analysis import _clean_token
+
+    assert _clean_token("\u2581Rome") == "rome"
+    assert _clean_token(" Rome") == "rome"
+    assert _clean_token("Rome") == "rome"
+
+
+def test_clean_token_strips_gpt2_marker():
+    """GPT-2/Qwen-style BPE uses \u0120 (Ġ) as space prefix."""
+    from neurotrace.cli.analysis import _clean_token
+
+    assert _clean_token("\u0120Rome") == "rome"
+    assert _clean_token("\u0120Budapest") == "budapest"
+
+
+def test_clean_token_strips_combined_whitespace():
+    from neurotrace.cli.analysis import _clean_token
+
+    assert _clean_token("  \u2581\u0120Rome  ") == "rome"
+
+
+def test_token_matches_answer_basic():
+    from neurotrace.cli.analysis import _token_matches_answer
+
+    assert _token_matches_answer(" Rome", "Rome")
+    assert _token_matches_answer("\u2581Rome", "Rome")
+    assert _token_matches_answer("\u0120Rome", "Rome")
+    assert _token_matches_answer("Rome", "Rome")
+
+
+def test_token_matches_answer_prefix():
+    """Subword prefix should match: 'Bud' matches 'Budapest'."""
+    from neurotrace.cli.analysis import _token_matches_answer
+
+    assert _token_matches_answer("\u2581Bud", "Budapest")
+    assert _token_matches_answer(" Stock", "Stockholm")
+    assert _token_matches_answer("\u0120Jer", "Jerusalem")
+    assert _token_matches_answer(" Can", "Canberra")
+    assert _token_matches_answer(" New", "New Delhi")
+
+
+def test_token_matches_answer_rejects_wrong():
+    from neurotrace.cli.analysis import _token_matches_answer
+
+    assert not _token_matches_answer(" Vienna", "Budapest")
+    assert not _token_matches_answer(" Ky", "Tokyo")
+    assert not _token_matches_answer(" Berlin", "Paris")
+
+
+def test_token_matches_answer_rejects_single_char():
+    """Single character tokens should not match to avoid false positives."""
+    from neurotrace.cli.analysis import _token_matches_answer
+
+    assert not _token_matches_answer(" B", "Budapest")
+    assert not _token_matches_answer("\u2581N", "Nairobi")
+    assert not _token_matches_answer("S", "Stockholm")
+
+
+def test_token_matches_answer_case_insensitive():
+    from neurotrace.cli.analysis import _token_matches_answer
+
+    assert _token_matches_answer(" ROME", "Rome")
+    assert _token_matches_answer(" rome", "Rome")
+    assert _token_matches_answer(" Rome", "ROME")
+
+
+def test_scan_remote_final_rank_correct_match():
+    """When top-1 token matches the answer, final_rank should be 1."""
+    from unittest.mock import MagicMock, patch
+
+    from neurotrace.remote import ForwardResult, LayerPrediction, TokenPrediction
+
+    worker = MagicMock()
+    worker.health.return_value = {"model": "test-model", "device": "cpu"}
+    worker.forward.return_value = ForwardResult(
+        top_tokens=[
+            TokenPrediction(token=" Rome", token_id=1, logit=5.0, prob=0.213),
+            TokenPrediction(token=" Paris", token_id=2, logit=3.0, prob=0.05),
+        ],
+        residuals=None,
+        num_layers=2,
+        vocab_size=100,
+        hidden_dim=64,
+        layer_predictions=[
+            LayerPrediction(layer=0, top_tokens=[
+                TokenPrediction(token=" The", token_id=10, logit=1.0, prob=0.1),
+            ]),
+            LayerPrediction(layer=1, top_tokens=[
+                TokenPrediction(token=" Rome", token_id=1, logit=5.0, prob=0.213),
+            ]),
+        ],
+    )
+
+    dataset = [{"prompt": "The capital of Italy is", "answer": "Rome"}]
+    with patch("neurotrace.remote.WorkerClient", return_value=worker):
+        from neurotrace.cli.analysis import _scan_remote
+
+        result = _scan_remote(
+            "http://fake:8877", dataset, "test", 42,
+            0.5, 0.3, False, False, False, False, None,
+        )
+
+    pr = result.prompt_results[0]
+    assert pr.final_rank == 1
+    assert pr.final_prob == pytest.approx(0.213)
+    # final_prob=0.213 < final_threshold=0.3, so detect_sabotage marks as "weak"
+    assert pr.status == "weak"
+
+
+def test_scan_remote_final_rank_wrong():
+    """When no top token matches the answer, final_rank should be 999."""
+    from unittest.mock import MagicMock, patch
+
+    from neurotrace.remote import ForwardResult, LayerPrediction, TokenPrediction
+
+    worker = MagicMock()
+    worker.health.return_value = {"model": "test-model", "device": "cpu"}
+    worker.forward.return_value = ForwardResult(
+        top_tokens=[
+            TokenPrediction(token=" Paris", token_id=2, logit=5.0, prob=0.4),
+        ],
+        residuals=None,
+        num_layers=1,
+        vocab_size=100,
+        hidden_dim=64,
+        layer_predictions=[
+            LayerPrediction(layer=0, top_tokens=[
+                TokenPrediction(token=" Paris", token_id=2, logit=5.0, prob=0.4),
+            ]),
+        ],
+    )
+
+    dataset = [{"prompt": "The capital of Italy is", "answer": "Rome"}]
+    with patch("neurotrace.remote.WorkerClient", return_value=worker):
+        from neurotrace.cli.analysis import _scan_remote
+
+        result = _scan_remote(
+            "http://fake:8877", dataset, "test", 42,
+            0.5, 0.3, False, False, False, False, None,
+        )
+
+    pr = result.prompt_results[0]
+    assert pr.final_rank == 999
+    assert pr.status == "wrong"
+
+
+def test_scan_remote_gpt2_token_format():
+    """Tokens with GPT-2 \u0120 prefix should still match correctly."""
+    from unittest.mock import MagicMock, patch
+
+    from neurotrace.remote import ForwardResult, LayerPrediction, TokenPrediction
+
+    worker = MagicMock()
+    worker.health.return_value = {"model": "test-model", "device": "cpu"}
+    worker.forward.return_value = ForwardResult(
+        top_tokens=[
+            TokenPrediction(
+                token="\u0120Rome", token_id=1, logit=5.0, prob=0.3,
+            ),
+        ],
+        residuals=None,
+        num_layers=1,
+        vocab_size=100,
+        hidden_dim=64,
+        layer_predictions=[
+            LayerPrediction(layer=0, top_tokens=[
+                TokenPrediction(
+                    token="\u0120Rome", token_id=1, logit=5.0, prob=0.3,
+                ),
+            ]),
+        ],
+    )
+
+    dataset = [{"prompt": "The capital of Italy is", "answer": "Rome"}]
+    with patch("neurotrace.remote.WorkerClient", return_value=worker):
+        from neurotrace.cli.analysis import _scan_remote
+
+        result = _scan_remote(
+            "http://fake:8877", dataset, "test", 42,
+            0.5, 0.3, False, False, False, False, None,
+        )
+
+    assert result.prompt_results[0].status == "correct"
+    assert result.prompt_results[0].final_rank == 1
+
+
 # --- CLI tests ---
 
 
