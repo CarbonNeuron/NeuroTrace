@@ -30,7 +30,6 @@ def chain(ctx, prompt_text, intermediate, answer, dataset_name, remote, model_na
     from neurotrace.chain import (
         ChainResult,
         chain_result_to_dict,
-        run_chain_batch,
         run_chain_remote,
     )
     from neurotrace.datasets import get_builtin_dataset

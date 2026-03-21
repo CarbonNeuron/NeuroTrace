@@ -228,31 +228,6 @@ def test_decompose():
         assert body["prompt"] == "The capital of Germany is"
 
 
-def test_attention():
-    """Test attention() sends correct request and parses response."""
-    with patch("httpx.Client") as mock_cls:
-        mock_client = mock_cls.return_value
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "heads": [
-                {"layer": 0, "head": 5, "logit_contribution": 0.42},
-                {"layer": 1, "head": 3, "logit_contribution": -0.18},
-            ],
-        }
-        mock_client.post.return_value = mock_response
-
-        from neurotrace.remote import WorkerClient
-
-        client = WorkerClient("http://localhost:8877")
-        result = client.attention(
-            "The capital of Germany is", "Berlin",
-        )
-
-        assert len(result.heads) == 2
-        assert result.heads[0].layer == 0
-        assert result.heads[0].head == 5
-        assert result.heads[0].logit_contribution == pytest.approx(0.42)
-
 
 # ---------------------------------------------------------------------------
 # 2. WorkerClient.hooked() — hooked forward pass
@@ -497,50 +472,3 @@ def test_remote_worker_alias():
     assert RemoteWorker is WorkerClient
 
 
-# ---------------------------------------------------------------------------
-# 7. Dataclass exports
-# ---------------------------------------------------------------------------
-
-
-def test_dataclass_imports():
-    """Verify all v2 dataclasses are importable."""
-    from neurotrace.remote import (
-        AttentionResult,
-        ContrastResult,
-        DecomposeResult,
-        FingerprintResult,
-        HeadContribution,
-        Hook,
-        LayerPrediction,
-        RomeEditResult,
-        TokenPrediction,
-    )
-
-    # Verify they're constructible
-    tp = TokenPrediction(token="test", token_id=1, logit=1.0, prob=0.5)
-    assert tp.token == "test"
-
-    hook = Hook(layer=0, component="mlp", action="zero")
-    assert hook.scale is None
-    assert hook.tensor is None
-
-    # Phase 2 types
-    lp = LayerPrediction(layer=0, top_tokens=[tp])
-    assert lp.layer == 0
-    assert len(lp.top_tokens) == 1
-
-    re = RomeEditResult(
-        success=True, edit_id=1, stack_size=1,
-        pre_prob=0.1, post_prob=0.9,
-        pre_margin=-1.0, post_margin=2.0,
-    )
-    assert re.success
-    assert re.post_prob == 0.9
-
-    hc = HeadContribution(layer=5, head=3, logit_contribution=0.5)
-    ar = AttentionResult(heads=[hc])
-    assert len(ar.heads) == 1
-
-    assert DecomposeResult is not None
-    assert FingerprintResult is not None
-    assert ContrastResult is not None

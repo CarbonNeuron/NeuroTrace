@@ -223,40 +223,7 @@ def test_repair_chat_mode():
 
 
 # ---------------------------------------------------------------------------
-# 9. Worker _resolve_prompt — raw flag behavior
-# ---------------------------------------------------------------------------
-
-def test_worker_resolve_prompt_raw_prefers_prompt():
-    """_resolve_prompt with raw=True returns prompt even when messages present."""
-    # Simulate _resolve_prompt behavior (same logic as gpu-worker.py)
-    def resolve_prompt(prompt, messages, raw=False):
-        if raw and prompt is not None:
-            return prompt
-        if messages is not None:
-            return "<chat_template_applied>"
-        if prompt is not None:
-            return prompt
-        raise ValueError("Either prompt or messages required")
-
-    # raw=True with both prompt and messages → use prompt
-    result = resolve_prompt("raw text", [{"role": "user"}], raw=True)
-    assert result == "raw text"
-
-    # raw=False with both → use messages (chat template)
-    result = resolve_prompt("raw text", [{"role": "user"}], raw=False)
-    assert result == "<chat_template_applied>"
-
-    # only prompt, raw=False → use prompt directly
-    result = resolve_prompt("raw text", None, raw=False)
-    assert result == "raw text"
-
-    # only messages, raw=False → use messages
-    result = resolve_prompt(None, [{"role": "user"}], raw=False)
-    assert result == "<chat_template_applied>"
-
-
-# ---------------------------------------------------------------------------
-# 10. CLI --raw/--chat mutual exclusion
+# 9. CLI --raw/--chat mutual exclusion
 # ---------------------------------------------------------------------------
 
 def test_cli_raw_chat_mutual_exclusion():

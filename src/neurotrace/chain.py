@@ -231,24 +231,6 @@ def run_chain_local(
     )
 
 
-def run_chain_batch(
-    results_fn,
-    entries: list[dict],
-) -> list[ChainResult]:
-    """Run chain trace for a batch of dataset entries.
-
-    results_fn: callable(prompt, intermediate, answer) -> ChainResult
-    """
-    results = []
-    for entry in entries:
-        result = results_fn(
-            entry["prompt"],
-            entry["intermediate"],
-            entry["answer"],
-        )
-        results.append(result)
-    return results
-
 
 def chain_result_to_dict(r: ChainResult) -> dict:
     """Serialize ChainResult to dict for JSON output."""

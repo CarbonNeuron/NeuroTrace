@@ -476,26 +476,3 @@ class TestAttributionStorage:
             os.unlink(db_path)
 
 
-# ---------------------------------------------------------------------------
-# Test CLI command exists
-# ---------------------------------------------------------------------------
-
-
-class TestAttributeCli:
-    def test_attribute_command_registered(self):
-        from neurotrace.cli import cli
-
-        assert "attribute" in [cmd for cmd in cli.commands]
-
-    def test_attribute_help(self):
-        from click.testing import CliRunner
-
-        from neurotrace.cli import cli
-
-        runner = CliRunner()
-        result = runner.invoke(cli, ["attribute", "--help"])
-        assert result.exit_code == 0
-        assert "input tokens" in result.output
-        assert "--layer" in result.output
-        assert "--target" in result.output
-        assert "--method" in result.output

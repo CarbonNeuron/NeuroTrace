@@ -269,21 +269,14 @@ def fingerprint(
 
 
 def _fingerprint_remote(remote_url, prompts, seed, dataset_name):
-    """Run fingerprinting via remote GPU worker using v2 fingerprint()."""
-    import numpy as np
-
-    from neurotrace.fingerprint import Fingerprint, build_fingerprint_from_remote
+    """Run fingerprinting via remote GPU worker."""
+    from neurotrace.fingerprint import build_fingerprint_from_remote
     from neurotrace.remote import WorkerClient
 
     worker = WorkerClient(remote_url)
     health = worker.health()
     device_name = health.get("device_name", health.get("device", "unknown"))
-    num_layers = health["num_layers"]
     err_console.print(f"GPU: {device_name} via {remote_url}")
-
-    # Use middle layers for fingerprinting
-    mid = num_layers // 2
-    fp_layers = list(range(max(0, mid - 2), min(num_layers, mid + 3)))
 
     all_fingerprints = []
 
@@ -303,47 +296,12 @@ def _fingerprint_remote(remote_url, prompts, seed, dataset_name):
                 description=f"Fingerprint {p_idx + 1}/{len(prompts)}",
             )
 
-            try:
-                fp_result = worker.fingerprint(
-                    entry["prompt"], fp_layers, seed=seed,
-                )
-
-                # Build key_vectors matrix from captured vectors
-                key_list = []
-                proj_list = []
-                for layer in sorted(fp_result.vectors.keys()):
-                    vec = fp_result.vectors[layer]
-                    key_list.append(vec.key.astype(np.float16))
-                    proj_list.append(vec.projection.astype(np.float16))
-
-                if key_list:
-                    key_vectors = np.stack(key_list)
-                    p_answer = (
-                        proj_list[0]
-                        if proj_list
-                        else np.zeros(1, dtype=np.float16)
-                    )
-                    p_competitor = np.zeros_like(p_answer)
-
-                    all_fingerprints.append(Fingerprint(
-                        prompt=entry["prompt"],
-                        answer=entry["answer"],
-                        competitor="",
-                        answer_logit=0.0,
-                        competitor_logit=0.0,
-                        margin=0.0,
-                        key_vectors=key_vectors,
-                        p_answer=p_answer,
-                        p_competitor=p_competitor,
-                    ))
-            except Exception:
-                # Fallback to legacy fingerprint_stream
-                for event in worker.fingerprint_stream([entry], seed):
-                    etype = event.get("type")
-                    if etype == "result":
-                        for fp_data in event.get("fingerprints", []):
-                            fp = build_fingerprint_from_remote(fp_data)
-                            all_fingerprints.append(fp)
+            for event in worker.fingerprint_stream([entry], seed):
+                etype = event.get("type")
+                if etype == "result":
+                    for fp_data in event.get("fingerprints", []):
+                        fp = build_fingerprint_from_remote(fp_data)
+                        all_fingerprints.append(fp)
 
         progress.update(
             task, description="Done.", completed=len(prompts),

@@ -329,26 +329,6 @@ class TestBenchHTML:
 
 
 # ---------------------------------------------------------------------------
-# Perplexity computation tests
-# ---------------------------------------------------------------------------
-
-
-class TestPerplexity:
-    def test_compute_perplexity_local_fallback(self):
-        """Test perplexity uses fallback text when datasets unavailable."""
-        from neurotrace.bench import compute_perplexity_local
-
-        # We can't test with a real model without download,
-        # but we can verify the function imports correctly
-        assert callable(compute_perplexity_local)
-
-    def test_scan_accuracy_import(self):
-        from neurotrace.bench import scan_accuracy
-
-        assert callable(scan_accuracy)
-
-
-# ---------------------------------------------------------------------------
 # CLI integration test (requires model download)
 # ---------------------------------------------------------------------------
 

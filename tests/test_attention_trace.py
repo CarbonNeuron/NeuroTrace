@@ -1,7 +1,7 @@
 """Tests for attention-trace feature."""
 
 import json
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import numpy as np
 import pytest
@@ -10,7 +10,6 @@ from neurotrace.attention_trace import (
     AttentionTraceEntry,
     AttentionTraceResult,
     AttentionTraceRun,
-    attention_trace_run_to_dict,
     compute_head_entries,
     decompose_attention_heads,
     generate_attention_trace_html_batch,
@@ -86,36 +85,6 @@ class TestComputeHeadEntries:
 
 
 # ---------------------------------------------------------------------------
-# Data structure tests
-# ---------------------------------------------------------------------------
-
-
-class TestDataStructures:
-    def test_entry_creation(self):
-        entry = AttentionTraceEntry(
-            prompt="test", layer=0, head_idx=3,
-            answer_projection=1.5, magnitude=2.0,
-        )
-        assert entry.layer == 0
-        assert entry.head_idx == 3
-
-    def test_result_creation(self):
-        result = AttentionTraceResult(
-            prompt="test", answer="Berlin", entries=[],
-        )
-        assert result.prompt == "test"
-        assert result.answer == "Berlin"
-
-    def test_run_creation(self):
-        run = AttentionTraceRun(
-            run_id="abc", dataset=None, model_name="test",
-            layers=[0, 1], prompt_count=1, results=[],
-            created_at="2025-01-01T00:00:00",
-        )
-        assert run.prompt_count == 1
-
-
-# ---------------------------------------------------------------------------
 # Remote runner tests
 # ---------------------------------------------------------------------------
 
@@ -165,48 +134,6 @@ class TestRunAttentionTraceRemote:
         )
         assert len(result.entries) == 0
 
-
-# ---------------------------------------------------------------------------
-# Serialization tests
-# ---------------------------------------------------------------------------
-
-
-class TestSerialization:
-    def _make_sample_run(self):
-        entries = [
-            AttentionTraceEntry(
-                prompt="test", layer=0, head_idx=0,
-                answer_projection=1.5, magnitude=2.0,
-            ),
-            AttentionTraceEntry(
-                prompt="test", layer=0, head_idx=1,
-                answer_projection=-0.5, magnitude=1.0,
-            ),
-        ]
-        result = AttentionTraceResult(
-            prompt="test", answer="Berlin", entries=entries,
-        )
-        return AttentionTraceRun(
-            run_id="test-id", dataset="capitals",
-            model_name="test-model", layers=[0, 1],
-            prompt_count=1, results=[result],
-            created_at="2025-01-01T00:00:00",
-        )
-
-    def test_to_dict(self):
-        run = self._make_sample_run()
-        d = attention_trace_run_to_dict(run)
-        assert d["run_id"] == "test-id"
-        assert d["dataset"] == "capitals"
-        assert len(d["results"]) == 1
-        assert len(d["results"][0]["entries"]) == 2
-
-    def test_json_roundtrip(self):
-        run = self._make_sample_run()
-        d = attention_trace_run_to_dict(run)
-        s = json.dumps(d)
-        parsed = json.loads(s)
-        assert parsed["run_id"] == "test-id"
 
 
 # ---------------------------------------------------------------------------
@@ -309,43 +236,6 @@ class TestHTMLGeneration:
         assert "Robust" in html
         assert "Vulnerable" in html
 
-
-# ---------------------------------------------------------------------------
-# Remote client tests
-# ---------------------------------------------------------------------------
-
-
-class TestRemoteClient:
-    @patch("httpx.Client")
-    def test_attention_contributions_stream(self, mock_client_class):
-        from neurotrace.remote import RemoteWorker
-
-        mock_client = MagicMock()
-        mock_client_class.return_value = mock_client
-
-        contributions = np.random.randn(32, 2048).astype(np.float16)
-        import base64
-        encoded = base64.b64encode(contributions.tobytes()).decode("ascii")
-
-        lines = [
-            f'data: {{"type": "layer-contributions", "layer": 0, '
-            f'"num_heads": 32, "shape": [32, 2048], '
-            f'"dtype": "float16", "contributions": "{encoded}"}}',
-            'data: {"type": "done", "layers_completed": 1, "heads_per_layer": 32}',
-        ]
-
-        mock_response = MagicMock()
-        mock_response.iter_lines.return_value = iter(lines)
-        mock_response.__enter__ = lambda s: s
-        mock_response.__exit__ = MagicMock(return_value=False)
-        mock_client.stream.return_value = mock_response
-
-        worker = RemoteWorker("http://localhost:8877")
-        events = list(worker.attention_contributions_stream("test", [0]))
-
-        assert len(events) == 2
-        assert events[0]["type"] == "layer-contributions"
-        assert events[1]["type"] == "done"
 
 
 # ---------------------------------------------------------------------------

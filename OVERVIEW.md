@@ -34,7 +34,9 @@ Reference document for AI agents writing code against this codebase.
 │   ├── fingerprint.py       # compute_fingerprint_local, check_regressions_fast
 │   ├── bench.py             # run_bench_local, run_bench_remote
 │   ├── heal.py              # run_heal_local — autonomous scan→repair→verify pipeline
-│   ├── remote.py            # RemoteWorker — HTTP/SSE client for GPU worker
+│   ├── discover.py          # discover knowledge gaps via structured fact extraction
+│   ├── chain.py             # chain trace — multi-hop reasoning through residual streams
+│   ├── remote.py            # WorkerClient — HTTP/SSE client for GPU worker
 │   ├── report.py            # generate_report, generate_comparison_report (HTML)
 │   ├── upload.py            # upload_report to CarbonFiles
 │   └── cli/
@@ -46,6 +48,8 @@ Reference document for AI agents writing code against this codebase.
 │       ├── repair.py        # repair, fingerprint
 │       ├── bench.py         # bench
 │       ├── heal.py          # heal
+│       ├── discover.py      # discover
+│       ├── chain.py         # chain
 │       ├── report.py        # report
 │       └── worker.py        # worker (version, update, reload)
 ├── tools/
@@ -57,12 +61,14 @@ Reference document for AI agents writing code against this codebase.
 │   ├── test_attention_trace.py
 │   ├── test_attribute.py
 │   ├── test_bench.py
+│   ├── test_chain.py
 │   ├── test_circuit.py
 │   ├── test_cli.py
 │   ├── test_commitment.py
 │   ├── test_contrast.py
 │   ├── test_decompose.py
 │   ├── test_diagnose.py
+│   ├── test_discover.py
 │   ├── test_experiment.py
 │   ├── test_finetune.py
 │   ├── test_fingerprint.py
@@ -73,6 +79,7 @@ Reference document for AI agents writing code against this codebase.
 │   ├── test_neurons.py
 │   ├── test_probe.py
 │   ├── test_probe_universal.py
+│   ├── test_raw_inference.py
 │   ├── test_remote.py
 │   ├── test_repair.py
 │   ├── test_report.py
@@ -82,7 +89,8 @@ Reference document for AI agents writing code against this codebase.
 │   ├── test_tracer.py
 │   ├── test_types.py
 │   ├── test_upload.py
-│   └── test_worker.py
+│   ├── test_worker.py
+│   └── test_worker_v2.py
 ├── adapters/
 │   └── tinyllama-capitals-fix/  # LoRA adapter (~1.5MB)
 ├── .gitignore
@@ -110,9 +118,11 @@ Reference document for AI agents writing code against this codebase.
 Both coexist during ablated traces. Both have `cleanup()`.
 
 ### Remote Worker Pattern
-- `RemoteWorker` (remote.py) wraps all GPU worker HTTP endpoints
+- `WorkerClient` (remote.py) wraps all GPU worker HTTP endpoints
+- `RemoteWorker` kept as backward-compat alias for `WorkerClient`
 - SSE streaming for long operations (batch-ablate, extract-activations, repair, etc.)
-- Worker endpoints mirror local function signatures
+- v2 primitives: `forward()`, `hooked()`, `generate()`, `batch_forward()`, `decompose()`, `rome_edit()`
+- Legacy streaming methods for backward compatibility with existing worker endpoints
 - Most CLI commands check `--remote` flag and dispatch to either local or remote path
 
 ### HTML Report Pattern
@@ -128,161 +138,48 @@ Both coexist during ablated traces. Both have `cleanup()`.
 - `format_prompt(raw_prompt, tokenizer)` applies chat template
 
 ### Test Pattern
-- `@pytest.mark.slow` for tests requiring real model download
+- `@pytest.mark.model_download` for tests requiring real model download
 - `model_available()` helper for conditional skipping
 - `conftest.py` has session-scoped TinyLlama fixture
 - Non-slow tests use synthetic data + mocks
+- **Test counts: 649 total, 564 quick (non-model_download)**
 
-## 3. Key Module Signatures
+## 3. CLI Commands (30 total)
 
-### scan.py
-```python
-class ScanResult:
-    model_name: str; dataset_name: str; prompt_results: list[PromptResult]
-    # Properties: correct_count, sabotaged_count, weak_count, wrong_count
-
-def run_scan(model, tokenizer, dataset: list[dict], dataset_name: str,
-             seed: int = 42, ...) -> ScanResult
-```
-
-### diagnose.py
-```python
-class DiagnosisResult:
-    prompt: str; answer: str; circuit: CircuitAnalysis
-    suppression: SuppressionAnalysis; verdict: Verdict
-    repair: RepairPrescription | None
-
-def run_diagnosis(attn_result, token_result) -> DiagnosisResult
-```
-
-### repair.py
-```python
-class RepairResult:
-    prompt: str; answer: str; status: str  # "repaired"|"skipped"|"regression"
-    before: RepairBefore; after: RepairAfter; edit: RepairEdit
-    regressions: list[RegressionResult]
-
-def run_repair_local(model, tokenizer, prompt, answer, ...) -> RepairResult
-def apply_rank_one_edit(model, layer: int, k_star, delta)
-def undo_rank_one_edit(model, layer: int, k_star, delta)
-```
-
-### fingerprint.py
-```python
-class Fingerprint:
-    prompt: str; answer: str; competitor: str
-    margin: float; key_vectors: np.ndarray; p_answer: np.ndarray; p_competitor: np.ndarray
-
-def compute_fingerprint_local(model, tokenizer, prompt, answer, seed=42) -> Fingerprint
-def check_regressions_fast(delta, k_star, layer, fingerprints, threshold=0.5) -> list[AnalyticalRegression]
-```
-
-### bench.py
-```python
-class BenchRun:
-    run_id: str; model_name: str; domain_results: list[DomainBenchResult]
-    baseline_ppl: float; combined_ppl: float
-
-def run_bench_local(model, tokenizer, dataset_names, ...) -> BenchRun
-def run_bench_remote(remote_url, dataset_names, ...) -> BenchRun
-def compute_perplexity_local(model, tokenizer, ...) -> dict
-```
-
-### heal.py
-```python
-class HealResult:
-    model_name: str; dataset_name: str
-    baseline_total: int; baseline_correct: int; baseline_wrong: int
-    baseline_sabotaged: int; baseline_weak: int
-    healed_total: int; healed_correct: int; healed_wrong: int
-    healed_sabotaged: int; healed_weak: int
-    edits_attempted: int; edits_applied: int; edits_rolled_back: int; edits_skipped: int
-    regressions_checked: int; regressions_found: int
-    ppl_before: float | None; ppl_after: float | None; ppl_delta: float | None
-    output_path: str | None; duration_seconds: float
-    prompt_results: list[PromptHealResult]; catastrophic_undo: bool
-
-def run_heal_local(model, tokenizer, dataset, dataset_name, db_path="demo.db",
-                   max_edits=500, regression_threshold=0.05, ppl_threshold=0.1,
-                   dry_run=False, seed=42, output_path=None,
-                   progress_callback=None) -> HealResult
-def heal_result_to_dict(result: HealResult) -> dict
-def generate_heal_html(result: HealResult) -> str
-```
-
-### decompose.py
-```python
-class DecomposeResult:
-    prompt: str; answer: str; margin: float
-    component_margins: list[dict]  # [{layer, attn_margin, mlp_margin}]
-
-def run_decompose_local(model, tokenizer, prompt, answer, competitors, seed=42) -> list[DecomposeResult]
-def run_decompose_remote(worker, prompt, tokens, seed=42) -> DecomposeResult
-```
-
-### remote.py — RemoteWorker endpoints
-```python
-class RemoteWorker:
-    def __init__(self, base_url: str, timeout: float = 300.0)
-    def health(self) -> dict
-    def get_model_config(self) -> dict
-    def format_prompt(self, messages: list[dict]) -> dict
-    def trace(self, prompt, seed=42, top_k=5) -> dict
-    def batch_ablate_stream(self, prompt, num_layers, seed=42) -> Generator[dict]
-    def extract_activations_stream(self, prompts, layer_start, layer_end) -> Generator[dict]
-    def forward_states_stream(self, prompts, seed=42) -> Generator[dict]
-    def forward_mlp_deltas_stream(self, prompts, layers=None) -> Generator[dict]
-    def forward_mlp_deltas_all_positions_stream(self, prompt, layers=None) -> Generator[dict]
-    def attribute_gradients_stream(self, prompts, layer, target_token_ids) -> Generator[dict]
-    def attention_contributions_stream(self, prompt, layers=None) -> Generator[dict]
-    def decompose_stream(self, prompt, tokens, seed=42) -> Generator[dict]
-    def fingerprint_stream(self, prompts, seed=42) -> Generator[dict]
-    def repair_stream(self, prompt, answer, ...) -> Generator[dict]
-    def perplexity_stream(self, max_samples=100) -> Generator[dict]
-    def repair_and_measure_stream(self, prompts, target_margin=0.0) -> Generator[dict]
-    def repair_undo(self) -> dict
-    def repair_save(self, path: str) -> dict
-    def worker_version(self) -> dict
-    def reload_stream(self, model=None, dtype=None) -> Generator[dict]
-    def worker_update_stream(self) -> Generator[dict]
-    def finetune_stream(self, config: dict) -> Generator[dict]
-    def download_adapter(self, adapter_id, output_path) -> None
-```
-
-## 4. CLI Commands (30 total)
-
-| Command | Module | Description |
-|---------|--------|-------------|
-| `trace` | trace.py | Forward-pass trace, store to DB |
-| `list` | trace.py | List stored traces |
-| `inspect` | trace.py | Inspect trace metadata + layer stats |
-| `diff` | trace.py | Compare two traces |
-| `predict` | trace.py | Top-K predictions at every layer |
-| `decode` | trace.py | Decode token IDs to strings |
-| `compare` | trace.py | Trace + diff two prompts |
-| `ablate` | analysis.py | Run with components disabled |
-| `sweep` | analysis.py | Parameter sweep (MLP scale factors) |
-| `scan` | analysis.py | Batch sabotage detection |
-| `finetune` | analysis.py | LoRA fine-tuning |
-| `neurons` | analysis.py | Neuron-level MLP attribution |
-| `probe` | analysis.py | Per-domain linear probe |
-| `circuit` | analysis.py | MLP circuit analysis |
-| `probe-universal` | analysis.py | Cross-domain probe |
-| `experiment` | domain.py | Run dataset through trace pipeline |
-| `heatmap` | domain.py | Full layer×prompt ablation matrix |
-| `commitment` | domain.py | Margin tracking across layers |
-| `contrast` | domain.py | Cross-domain MLP geometry |
-| `attribute` | domain.py | Gradient/ablation input attribution |
-| `token-trace` | advanced.py | Position×layer MLP projection |
-| `attention-trace` | advanced.py | Per-head contribution decomposition |
-| `diagnose` | advanced.py | Combined diagnostic pipeline |
-| `decompose` | advanced.py | Logit Prism per-layer decomposition |
-| `repair` | repair.py | ROME rank-one weight edits |
-| `fingerprint` | repair.py | Fast regression checking |
-| `bench` | bench.py | Benchmark with repair + perplexity |
-| `heal` | heal.py | Autonomous self-repair loop (scan→repair→verify) |
-| `report` | report.py | HTML report generation |
-| `worker` | worker.py | GPU worker management (version/update/reload) |
+| Command | Module | Remote | Description |
+|---------|--------|--------|-------------|
+| `trace` | trace.py | yes | Forward-pass trace, store to DB |
+| `list` | trace.py | no | List stored traces |
+| `inspect` | trace.py | no | Inspect trace metadata + layer stats |
+| `diff` | trace.py | no | Compare two traces |
+| `predict` | trace.py | yes | Top-K predictions at every layer |
+| `decode` | trace.py | yes | Decode token IDs to strings |
+| `compare` | trace.py | yes | Trace + diff two prompts |
+| `ablate` | analysis.py | yes | Run with components disabled |
+| `sweep` | analysis.py | yes | Parameter sweep (MLP scale factors) |
+| `scan` | analysis.py | yes | Batch sabotage detection |
+| `finetune` | analysis.py | yes | LoRA fine-tuning |
+| `neurons` | analysis.py | yes | Neuron-level MLP attribution |
+| `probe` | analysis.py | yes | Per-domain linear probe |
+| `circuit` | analysis.py | yes | MLP circuit analysis |
+| `probe-universal` | analysis.py | yes | Cross-domain probe |
+| `experiment` | domain.py | yes | Run dataset through trace pipeline |
+| `heatmap` | domain.py | yes | Full layer×prompt ablation matrix |
+| `commitment` | domain.py | yes | Margin tracking across layers |
+| `contrast` | domain.py | yes | Cross-domain MLP geometry |
+| `attribute` | domain.py | yes | Gradient/ablation input attribution |
+| `token-trace` | advanced.py | yes | Position×layer MLP projection |
+| `attention-trace` | advanced.py | yes | Per-head contribution decomposition |
+| `diagnose` | advanced.py | yes | Combined diagnostic pipeline |
+| `decompose` | advanced.py | yes | Logit Prism per-layer decomposition |
+| `repair` | repair.py | yes | ROME rank-one weight edits |
+| `fingerprint` | repair.py | yes | Fast regression checking |
+| `bench` | bench.py | yes | Benchmark with repair + perplexity |
+| `heal` | heal.py | yes | Autonomous self-repair loop (scan→repair→verify) |
+| `discover` | discover.py | yes | Knowledge gap discovery via fact extraction |
+| `chain` | chain.py | yes | Multi-hop reasoning trace through residual streams |
+| `report` | report.py | no | HTML report generation |
+| `worker` | worker.py | — | GPU worker management (version/update/reload) |
 
 ### Common CLI Flags
 | Flag | Description |
@@ -298,12 +195,89 @@ class RemoteWorker:
 | `--device` | Compute device (cpu/cuda/auto) |
 | `--dtype` | Data type (auto/float16/float32/bfloat16) |
 
-## 5. Data Schema (DuckDB)
+## 4. WorkerClient → Worker Endpoint Mapping
+
+| WorkerClient Method | Endpoint | Type |
+|---------------------|----------|------|
+| `forward()` | `POST /inference/forward` | v2 |
+| `hooked()` | `POST /inference/hooked` | v2 |
+| `generate()` | `POST /inference/generate` | v2 |
+| `batch_forward()` | `POST /inference/batch` | v2 SSE |
+| `batch_hooked()` | (sequential `hooked()` calls) | v2 |
+| `edit()` | `POST /model/edit` | v2 |
+| `edit_undo()` | `POST /model/edit/undo` | v2 |
+| `edit_clear()` | `POST /model/edit/clear` | v2 |
+| `edit_stack()` | `GET /model/edit/stack` | v2 |
+| `decompose()` | `POST /decompose` | v2 SSE |
+| `rome_edit()` | `POST /model/rome-edit` | v2 |
+| `batch_edit()` | (sequential `rome_edit()` calls) | v2 |
+| `health()` | `GET /health` | mgmt |
+| `get_model_config()` | `GET /model/config` | mgmt |
+| `format_prompt()` | `POST /format` | mgmt |
+| `worker_version()` | `GET /version` | mgmt |
+| `reload_stream()` | `POST /reload` | mgmt SSE |
+| `worker_update_stream()` | `POST /update` | mgmt SSE |
+| `trace()` | `POST /trace` | legacy |
+| `batch_ablate_stream()` | `POST /batch-ablate` | legacy SSE |
+| `extract_activations_stream()` | `POST /extract-activations` | legacy SSE |
+| `forward_states_stream()` | `POST /forward-states` | legacy SSE |
+| `forward_mlp_deltas_stream()` | `POST /forward-mlp-deltas` | legacy SSE |
+| `forward_mlp_deltas_all_positions_stream()` | `POST /forward-mlp-deltas-all-positions` | legacy SSE |
+| `attribute_gradients_stream()` | `POST /attribute-gradients` | legacy SSE |
+| `attention_contributions_stream()` | `POST /attention-contributions` | legacy SSE |
+| `finetune_stream()` | `POST /finetune` | legacy SSE |
+| `download_adapter()` | `GET /finetune/{id}/download` | legacy |
+| `decompose_stream()` | `POST /decompose` | legacy SSE |
+| `fingerprint_stream()` | `POST /fingerprint` | legacy SSE |
+| `repair_stream()` | `POST /repair` | legacy SSE |
+| `perplexity_stream()` | `POST /bench/perplexity` | legacy SSE |
+| `repair_and_measure_stream()` | `POST /bench/repair-and-measure` | legacy SSE |
+| `repair_undo()` | `POST /repair/undo` | legacy |
+| `repair_save()` | `POST /repair/save` | legacy |
+
+## 5. Worker Endpoints (tools/gpu-worker.py)
+
+| Endpoint | Method | Format |
+|----------|--------|--------|
+| `/health` | GET | JSON |
+| `/model/config` | GET | JSON |
+| `/version` | GET | JSON |
+| `/format` | POST | JSON |
+| `/inference/forward` | POST | JSON |
+| `/inference/hooked` | POST | JSON |
+| `/inference/generate` | POST | JSON |
+| `/inference/batch` | POST | SSE stream |
+| `/model/edit` | POST | JSON |
+| `/model/rome-edit` | POST | JSON |
+| `/model/edit/undo` | POST | JSON |
+| `/model/edit/clear` | POST | JSON |
+| `/model/edit/stack` | GET | JSON |
+| `/trace` | POST | JSON |
+| `/batch-ablate` | POST | SSE stream |
+| `/forward-states` | POST | SSE stream |
+| `/extract-activations` | POST | SSE stream |
+| `/forward-mlp-deltas` | POST | SSE stream |
+| `/forward-mlp-deltas-all-positions` | POST | SSE stream |
+| `/attention-contributions` | POST | SSE stream |
+| `/attribute-gradients` | POST | SSE stream |
+| `/finetune` | POST | SSE stream |
+| `/finetune/{id}/download` | GET | tar.gz stream |
+| `/fingerprint` | POST | SSE stream |
+| `/decompose` | POST | SSE stream |
+| `/repair` | POST | SSE stream |
+| `/repair/undo` | POST | JSON |
+| `/repair/save` | POST | JSON |
+| `/bench/perplexity` | POST | SSE stream |
+| `/bench/repair-and-measure` | POST | SSE stream |
+| `/reload` | POST | SSE stream |
+| `/update` | POST | SSE stream |
+
+## 6. Data Schema (DuckDB)
 
 4 tables: `traces`, `layer_snapshots`, `attention_maps`, `token_predictions`.
 Tensor blob format: `[ndim:i32][dims:i32...][float32 data]`, little-endian.
 
-## 6. Dependencies
+## 7. Dependencies
 
 ```toml
 [project]
@@ -321,47 +295,36 @@ dev = ["pytest>=8.0", "ruff>=0.4", "pyright>=1.1"]
 
 Build: hatchling. Console script: `neurotrace = neurotrace.cli:cli`
 
-## 7. Makefile
+## 8. Makefile
 
 | Target | Command |
 |--------|---------|
 | `setup` | `uv sync --all-extras` |
 | `test` | `uv run pytest tests/ -v` |
-| `test-quick` | `uv run pytest tests/ -v -m "not slow"` |
+| `test-quick` | `uv run pytest tests/ -v -m "not model_download"` |
 | `lint` | `uv run ruff check src/ tests/` |
 | `install` | `uv tool install --force --reinstall --from '.[upload,finetune,probe]' neurotrace` |
 | `clean` | Remove __pycache__, .pytest_cache, *.db |
 
-## 8. GPU Worker (tools/gpu-worker.py)
+## 9. Cleanup Audit (2026-03-21)
 
-FastAPI server running on Windows with torch-directml.
+**Before:** 695 tests (564 quick)
+**After:** 649 tests (564 quick)
 
-**Key endpoints:**
-- `GET /health` — model info + device
-- `GET /model/config` — architecture details
-- `GET /version` — git commit, branch, uptime, device
-- `POST /format` — apply chat template
-- `POST /trace` — single forward-pass trace
-- `POST /batch-ablate` — SSE stream of ablation results
-- `POST /extract-activations` — SSE stream of hidden states
-- `POST /forward-states` — SSE stream of all-layer hidden states
-- `POST /forward-mlp-deltas` — SSE stream of MLP input/output
-- `POST /forward-mlp-deltas-all-positions` — SSE all positions×layers
-- `POST /attribute-gradients` — SSE gradient attribution
-- `POST /attention-contributions` — SSE per-head o_proj decomposition
-- `POST /decompose` — SSE logit decomposition
-- `POST /fingerprint` — SSE MLP key vector caching
-- `POST /repair` — SSE ROME edit with before/after/regression
-- `POST /repair/undo` — undo last edit
-- `POST /repair/save` — save edited weights
-- `POST /bench/perplexity` — SSE perplexity computation
-- `POST /bench/repair-and-measure` — SSE batch repair + measure
-- `POST /reload` — SSE model reload (switch model/dtype)
-- `POST /update` — SSE git pull + restart
-- `POST /finetune` — SSE LoRA training
-- `GET /finetune/{id}/download` — download adapter tarball
+**Dead code removed:**
+- `run_chain_batch()` from chain.py (never called)
+- `run_commitment_remote()` from commitment.py (never called)
+- `WorkerClient.fingerprint()` — called `/inference/fingerprint` which doesn't exist in worker; CLI uses `fingerprint_stream()` instead
+- `WorkerClient.attention()` — called `/inference/attention` which doesn't exist in worker; CLI uses `attention_contributions_stream()` instead
+- `WorkerClient.contrast()` — called `/inference/contrast` which doesn't exist in worker; never called by CLI
+- `FingerprintVector`, `FingerprintResult`, `HeadContribution`, `AttentionResult`, `ContrastLayerResult`, `ContrastResult` dataclasses from remote.py (only used by deleted methods)
+- Unused import `run_chain_batch` from cli/chain.py
 
-**DirectML notes:**
-- bfloat16 unsupported, auto-selects float16
-- REPO_DIR = Path(__file__).resolve().parent.parent
-- torch-directml 0.2.5.dev240914 requires torch ~2.4
+**Theatrical tests deleted (131 tests):**
+- Dataclass instantiation tests (test_types.py, test_attention_trace.py)
+- CLI registration tests (test_attribute.py, test_chain.py, test_commitment.py, test_contrast.py)
+- Mock-the-function-under-test tests (test_remote.py, test_worker.py, test_upload.py)
+- Import/callable tests (test_bench.py)
+- Tests for deleted methods (test_worker_v2.py: test_attention, test_dataclass_imports)
+
+**No behavioral changes.** All remaining tests pass.

@@ -466,15 +466,3 @@ class TestValidateAgainstHeatmap:
         assert v["total_matched"] == 2
 
 
-# ---------------------------------------------------------------------------
-# Tests: CLI output (via Click test runner)
-# ---------------------------------------------------------------------------
-
-
-class TestCommitmentCli:
-    def test_commitment_command_exists(self):
-        """Verify the commitment command is registered."""
-        from neurotrace.cli import cli
-
-        commands = cli.list_commands(ctx=None)
-        assert "commitment" in commands

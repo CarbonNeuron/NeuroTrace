@@ -719,7 +719,6 @@ def _attention_trace_remote(
     remote_url, prompts, layer_spec, seed, model_name_hint,
 ):
     """Run attention-trace via remote GPU worker using v2 attention()."""
-    from neurotrace.attention_trace import AttentionTraceEntry, AttentionTraceResult
     from neurotrace.remote import WorkerClient
 
     worker = WorkerClient(remote_url)
@@ -756,69 +755,45 @@ def _attention_trace_remote(
             prompt_text = entry["prompt"]
             answer_text = entry["answer"]
 
-            try:
-                attn_result = worker.attention(
-                    prompt_text, answer_text, seed=seed,
-                )
+            import base64
 
-                # Build AttentionTraceResult from per-head contributions
-                entries = []
-                for hc in attn_result.heads:
-                    if hc.layer in layers:
-                        entries.append(AttentionTraceEntry(
-                            prompt=prompt_text,
-                            layer=hc.layer,
-                            head_idx=hc.head,
-                            answer_projection=hc.logit_contribution,
-                            magnitude=abs(hc.logit_contribution),
-                        ))
+            import numpy as np
 
-                all_results.append(AttentionTraceResult(
-                    prompt=prompt_text,
-                    answer=answer_text,
-                    entries=entries,
-                ))
-            except Exception:
-                # Fallback to legacy attention_contributions_stream
-                import base64
+            from neurotrace.attention_trace import run_attention_trace_remote
+            from neurotrace.models import get_lm_head_and_norm, load_model
 
-                import numpy as np
+            m, t = load_model(model_name, device="cpu")
+            lm, _ = get_lm_head_and_norm(m)
+            lm_w = lm.weight.data.cpu().float().numpy()
 
-                from neurotrace.attention_trace import run_attention_trace_remote
-                from neurotrace.models import get_lm_head_and_norm, load_model
+            layer_contributions: dict[int, np.ndarray] = {}
+            for event in worker.attention_contributions_stream(
+                prompt_text, layers, seed=seed,
+            ):
+                etype = event.get("type")
+                if etype == "layer-contributions":
+                    layer_idx = event["layer"]
+                    shape = event["shape"]
+                    dt = (
+                        np.float16
+                        if event.get("dtype") == "float16"
+                        else np.float32
+                    )
+                    arr = np.frombuffer(
+                        base64.b64decode(event["contributions"]),
+                        dtype=dt,
+                    ).astype(np.float32).reshape(shape).copy()
+                    layer_contributions[layer_idx] = arr
 
-                m, t = load_model(model_name, device="cpu")
-                lm, _ = get_lm_head_and_norm(m)
-                lm_w = lm.weight.data.cpu().float().numpy()
-
-                layer_contributions: dict[int, np.ndarray] = {}
-                for event in worker.attention_contributions_stream(
-                    prompt_text, layers, seed=seed,
-                ):
-                    etype = event.get("type")
-                    if etype == "layer-contributions":
-                        layer_idx = event["layer"]
-                        shape = event["shape"]
-                        dt = (
-                            np.float16
-                            if event.get("dtype") == "float16"
-                            else np.float32
-                        )
-                        arr = np.frombuffer(
-                            base64.b64decode(event["contributions"]),
-                            dtype=dt,
-                        ).astype(np.float32).reshape(shape).copy()
-                        layer_contributions[layer_idx] = arr
-
-                result = run_attention_trace_remote(
-                    layer_contributions=layer_contributions,
-                    tokenizer=t,
-                    prompt=prompt_text,
-                    answer=answer_text,
-                    layers=layers,
-                    lm_head_weight=lm_w,
-                )
-                all_results.append(result)
+            result = run_attention_trace_remote(
+                layer_contributions=layer_contributions,
+                tokenizer=t,
+                prompt=prompt_text,
+                answer=answer_text,
+                layers=layers,
+                lm_head_weight=lm_w,
+            )
+            all_results.append(result)
 
         progress.update(task, description="Done.", completed=len(prompts))
 

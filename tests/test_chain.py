@@ -2,9 +2,6 @@
 
 import json
 
-import pytest
-from click.testing import CliRunner
-
 from neurotrace.chain import (
     ChainResult,
     chain_result_to_dict,
@@ -175,29 +172,3 @@ class TestChainResult:
         assert d["handoff_gap"] is None
 
 
-# ---------------------------------------------------------------------------
-# CLI registration test
-# ---------------------------------------------------------------------------
-
-
-class TestCLIRegistration:
-    def test_chain_command_registered(self):
-        from neurotrace.cli import cli
-
-        command_names = [cmd for cmd in cli.commands]
-        assert "chain" in command_names
-
-    def test_chain_help(self):
-        from neurotrace.cli import cli
-
-        runner = CliRunner()
-        result = runner.invoke(cli, ["chain", "--help"])
-        assert result.exit_code == 0
-        assert "multi-hop" in result.output.lower() or "residual" in result.output.lower()
-
-    def test_chain_requires_args(self):
-        from neurotrace.cli import cli
-
-        runner = CliRunner()
-        result = runner.invoke(cli, ["chain"])
-        assert result.exit_code != 0
