@@ -358,13 +358,68 @@ def _heal_remote(
                 ))
 
         # Step 2: Sequential repair
-        edits_applied = 0
+        edits_healed = 0
+        edits_failed = 0
         edits_lobotomized = 0
         edits_rolled_back = 0
         edits_skipped = 0
 
+        from neurotrace.cli.analysis import (
+            _is_answer_prefix,
+            _is_whitespace_token,
+            _token_matches_answer,
+            _verify_via_generate,
+        )
+
+        def _verify_answer_after_edit(prompt, answer):
+            """Run scan logic (whitespace-skip + multi-token) on post-edit model.
+
+            Returns (is_answer_top1, answer_prob, after_token_str).
+            """
+            post_fwd = worker.forward(
+                prompt, raw=True, top_k=10,
+                layer_predictions=False, seed=seed,
+            )
+            effective = prompt
+            if (
+                post_fwd.top_tokens
+                and _is_whitespace_token(post_fwd.top_tokens[0].token)
+            ):
+                effective = prompt + post_fwd.top_tokens[0].token
+                post_fwd = worker.forward(
+                    effective, raw=True, top_k=10,
+                    layer_predictions=False, seed=seed,
+                )
+
+            top1 = post_fwd.top_tokens[0] if post_fwd.top_tokens else None
+            after_tok = (
+                top1.token.strip().lstrip("\u2581\u0120") if top1 else "?"
+            )
+            top1_prob = top1.prob if top1 else 0.0
+
+            # Check if expected answer is top-1
+            if top1 and _token_matches_answer(top1.token, answer):
+                return True, top1_prob, after_tok
+
+            # Multi-token: top-1 is a prefix of answer → generate to verify
+            if top1 and _is_answer_prefix(top1.token, answer):
+                gen_match, gen_prob = _verify_via_generate(
+                    worker, effective, answer, top1_prob,
+                    raw=True, seed=seed,
+                )
+                if gen_match:
+                    return True, gen_prob, after_tok
+
+            # Answer not top-1 — find its prob in top_tokens if present
+            ans_prob = 0.0
+            for tt in post_fwd.top_tokens:
+                if _token_matches_answer(tt.token, answer):
+                    ans_prob = tt.prob
+                    break
+            return False, ans_prob, after_tok
+
         for i, entry in enumerate(healable):
-            if edits_applied >= max_edits:
+            if edits_healed >= max_edits:
                 for remaining in healable[i:]:
                     prompt_results.append(PromptHealResult(
                         prompt=remaining["prompt"],
@@ -396,56 +451,15 @@ def _heal_remote(
                     layer, seed=seed,
                 )
                 if edit_result.success:
-                    # Get the after-edit top token
-                    post_fwd = worker.forward(
-                        entry["prompt"], raw=True, top_k=5,
-                        layer_predictions=False, seed=seed,
+                    # Verify: is the expected answer now top-1?
+                    is_top1, post_prob, after_token = _verify_answer_after_edit(
+                        entry["prompt"], entry["answer"],
                     )
-                    after_token = (
-                        post_fwd.top_tokens[0].token.strip().lstrip("\u2581\u0120")
-                        if post_fwd.top_tokens else "?"
-                    )
-                    post_prob = post_fwd.top_tokens[0].prob if post_fwd.top_tokens else 0.0
+                    before_tok = entry.get("before_token", "?")
 
-                    # Lobotomized: result prob worse than baseline
-                    if post_prob < entry["prob"]:
-                        edits_lobotomized += 1
-                        # Auto-rollback
-                        try:
-                            worker.edit_undo()
-                            edits_rolled_back += 1
-                            prompt_results.append(PromptHealResult(
-                                prompt=entry["prompt"],
-                                answer=entry["answer"],
-                                baseline_prob=entry["prob"],
-                                baseline_status="wrong",
-                                action="lobotomized",
-                                result_prob=post_prob,
-                                final_status="wrong",
-                                target_layer=layer,
-                                edit_norm=0.0,
-                                rollback_reason="auto-rollback: result < baseline",
-                                before_token=entry.get("before_token", "?"),
-                                after_token=after_token,
-                            ))
-                        except Exception:
-                            # Undo not available — lobotomized persists
-                            edits_applied += 1
-                            prompt_results.append(PromptHealResult(
-                                prompt=entry["prompt"],
-                                answer=entry["answer"],
-                                baseline_prob=entry["prob"],
-                                baseline_status="wrong",
-                                action="lobotomized",
-                                result_prob=post_prob,
-                                final_status="wrong",
-                                target_layer=layer,
-                                edit_norm=0.0,
-                                before_token=entry.get("before_token", "?"),
-                                after_token=after_token,
-                            ))
-                    else:
-                        edits_applied += 1
+                    if is_top1 and post_prob > entry["prob"]:
+                        # HEALED: answer is top-1 and prob improved
+                        edits_healed += 1
                         prompt_results.append(PromptHealResult(
                             prompt=entry["prompt"],
                             answer=entry["answer"],
@@ -456,7 +470,51 @@ def _heal_remote(
                             final_status="correct",
                             target_layer=layer,
                             edit_norm=0.0,
-                            before_token=entry.get("before_token", "?"),
+                            before_token=before_tok,
+                            after_token=after_token,
+                        ))
+                    elif post_prob < entry["prob"]:
+                        # LOBOTOMIZED: prob got worse
+                        edits_lobotomized += 1
+                        try:
+                            worker.edit_undo()
+                            edits_rolled_back += 1
+                        except Exception:
+                            pass  # undo not available
+                        prompt_results.append(PromptHealResult(
+                            prompt=entry["prompt"],
+                            answer=entry["answer"],
+                            baseline_prob=entry["prob"],
+                            baseline_status="wrong",
+                            action="lobotomized",
+                            result_prob=post_prob,
+                            final_status="wrong",
+                            target_layer=layer,
+                            edit_norm=0.0,
+                            rollback_reason="auto-rollback: result < baseline",
+                            before_token=before_tok,
+                            after_token=after_token,
+                        ))
+                    else:
+                        # FAILED: edit didn't make answer top-1, roll back
+                        edits_failed += 1
+                        try:
+                            worker.edit_undo()
+                            edits_rolled_back += 1
+                        except Exception:
+                            pass  # undo not available
+                        prompt_results.append(PromptHealResult(
+                            prompt=entry["prompt"],
+                            answer=entry["answer"],
+                            baseline_prob=entry["prob"],
+                            baseline_status="wrong",
+                            action="failed",
+                            result_prob=post_prob,
+                            final_status="wrong",
+                            target_layer=layer,
+                            edit_norm=0.0,
+                            rollback_reason="auto-rollback: answer not top-1",
+                            before_token=before_tok,
                             after_token=after_token,
                         ))
                 else:
@@ -506,7 +564,7 @@ def _heal_remote(
         ppl_before = None
         ppl_delta = None
 
-        if edits_applied > 0:
+        if edits_healed > 0:
             progress.update(task, description="Computing perplexity...")
             try:
                 for event in worker.perplexity_stream(50):
@@ -516,7 +574,7 @@ def _heal_remote(
                 pass
 
         # Save if requested
-        if output and not dry_run and edits_applied > 0:
+        if output and not dry_run and edits_healed > 0:
             progress.update(task, description=f"Saving to {output}...")
             try:
                 worker.repair_save(output)
@@ -536,12 +594,12 @@ def _heal_remote(
         baseline_sabotaged=0,
         baseline_weak=0,
         healed_total=total,
-        healed_correct=baseline_correct + edits_applied,
-        healed_wrong=baseline_wrong - edits_applied,
+        healed_correct=baseline_correct + edits_healed,
+        healed_wrong=baseline_wrong - edits_healed,
         healed_sabotaged=0,
         healed_weak=0,
         edits_attempted=len(healable),
-        edits_applied=edits_applied,
+        edits_applied=edits_healed,
         edits_lobotomized=edits_lobotomized,
         edits_rolled_back=edits_rolled_back,
         edits_skipped=edits_skipped,
@@ -585,7 +643,8 @@ def _heal_remote(
     console.print(f"  Baseline: {baseline_correct}/{total} ({baseline_acc:.0%})")
     console.print(f"  Healed:   {result.healed_correct}/{total} ({healed_acc:.0%})")
     console.print(
-        f"  Edits: {edits_applied} applied,"
+        f"  Edits: {edits_healed} healed,"
+        f" {edits_failed} failed,"
         f" {edits_lobotomized} lobotomized,"
         f" {edits_rolled_back} rolled back,"
         f" {edits_skipped} skipped"

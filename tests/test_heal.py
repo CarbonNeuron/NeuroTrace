@@ -516,6 +516,32 @@ class TestHealLobotomized:
         # ALREADY_CORRECT should show "-"
         assert "-</td>" in html
 
+    def test_failed_status_when_answer_not_top1(self):
+        """Edit that doesn't make answer top-1 should be FAILED, not HEALED.
+
+        Example: 'planets = 8' — before edit top-1 is 'a' at 21.58%,
+        after edit top-1 is still 'a' at 23.02%. The answer '8' is not
+        top-1, so this should be FAILED even though prob increased.
+        """
+        pr = PromptHealResult(
+            prompt="The number of planets in our solar system is",
+            answer="8",
+            baseline_prob=0.2158,
+            baseline_status="wrong",
+            action="failed",
+            result_prob=0.2302,
+            final_status="wrong",
+            target_layer=11,
+            before_token="a",
+            after_token="a",
+            rollback_reason="auto-rollback: answer not top-1",
+        )
+        assert pr.action == "failed"
+        assert pr.rollback_reason == "auto-rollback: answer not top-1"
+        # Prob went up but answer is still wrong
+        assert pr.result_prob > pr.baseline_prob
+        assert pr.final_status == "wrong"
+
     def test_html_lobotomized_badge(self):
         """HTML report shows LOBOTOMIZED badge."""
         pr_list = [
