@@ -181,29 +181,27 @@ def test_rome_edit():
 
 
 def test_decompose():
-    """Test decompose() sends correct request and parses response."""
+    """Test decompose() sends correct request and parses SSE response."""
     with patch("httpx.Client") as mock_cls:
         mock_client = mock_cls.return_value
-        mock_response = MagicMock()
-        mock_response.json.return_value = {
-            "answer_token_id": 23456,
-            "total_logit": 14.45,
-            "layers": [
-                {
-                    "layer": 0, "attn_logit": 0.12,
-                    "mlp_logit": -0.03, "cumulative": 0.09,
-                },
-                {
-                    "layer": 1, "attn_logit": 0.50,
-                    "mlp_logit": 0.20, "cumulative": 0.79,
-                },
-            ],
-            "competitors": [
-                {"token": "located", "total_logit": 8.33, "margin": -6.12},
-            ],
-            "reconstruction_error": 0.0001,
-        }
-        mock_client.post.return_value = mock_response
+
+        # Mock SSE streaming response
+        sse_lines = [
+            'data: {"type": "progress", "status": "computing"}',
+            'data: {"type": "decomposition", "prompt": "The capital of Germany is", '
+            '"decompositions": {"Berlin": {"token_id": 23456, "final_logit": 14.45, '
+            '"embedding": 0.5, "layers": ['
+            '{"layer": 0, "attention": 0.12, "mlp": -0.03}, '
+            '{"layer": 1, "attention": 0.50, "mlp": 0.20}], '
+            '"reconstruction_error": 0.0001, "norm_scale": 1.0}}}',
+            'data: {"type": "done"}',
+        ]
+        mock_stream = MagicMock()
+        mock_stream.__enter__ = MagicMock(return_value=mock_stream)
+        mock_stream.__exit__ = MagicMock(return_value=False)
+        mock_stream.raise_for_status = MagicMock()
+        mock_stream.iter_lines = MagicMock(return_value=iter(sse_lines))
+        mock_client.stream.return_value = mock_stream
 
         from neurotrace.remote import WorkerClient
 
@@ -216,12 +214,18 @@ def test_decompose():
         assert result.total_logit == pytest.approx(14.45)
         assert len(result.layers) == 2
         assert result.layers[0].attn_logit == pytest.approx(0.12)
-        assert len(result.competitors) == 1
-        assert result.competitors[0].token == "located"
+        # cumulative = embedding(0.5) + attn(0.12) + mlp(-0.03) = 0.59
+        assert result.layers[0].cumulative == pytest.approx(0.59)
+        # cumulative = 0.59 + attn(0.50) + mlp(0.20) = 1.29
+        assert result.layers[1].cumulative == pytest.approx(1.29)
         assert result.reconstruction_error == pytest.approx(0.0001)
 
-        body = mock_client.post.call_args[1]["json"]
-        assert body["answer"] == "Berlin"
+        # Verify correct endpoint and payload
+        call_args = mock_client.stream.call_args
+        assert call_args[0] == ("POST", "http://localhost:8877/decompose")
+        body = call_args[1]["json"]
+        assert body["tokens"] == ["Berlin"]
+        assert body["prompt"] == "The capital of Germany is"
 
 
 def test_attention():

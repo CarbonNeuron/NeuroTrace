@@ -545,39 +545,59 @@ class WorkerClient:
         raw: bool = True,
         seed: int = 42,
     ) -> DecomposeResult:
-        """Logit Prism decomposition via /inference/decompose."""
+        """Logit Prism decomposition via /decompose SSE endpoint."""
         payload: dict[str, Any] = {
-            "input": prompt,
-            "answer": answer,
-            "raw": raw,
+            "tokens": [answer],
             "seed": seed,
         }
-        r = self.client.post(
-            f"{self.base_url}/inference/decompose", json=payload,
-        )
-        r.raise_for_status()
-        data = r.json()
+        if raw:
+            payload["prompt"] = prompt
+            payload["raw"] = True
+        else:
+            payload["messages"] = [{"role": "user", "content": prompt}]
+
+        # Consume SSE stream to find the decomposition event
+        data = None
+        with self.client.stream(
+            "POST",
+            f"{self.base_url}/decompose",
+            json=payload,
+            timeout=120.0,
+        ) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line.startswith("data: "):
+                    event = json.loads(line[6:])
+                    if event.get("type") == "decomposition":
+                        data = event
+                        break
+
+        if data is None:
+            raise WorkerError("No decomposition event received from worker")
+
+        decomp = data["decompositions"][answer]
+        token_id = decomp["token_id"]
+        total_logit = decomp["final_logit"]
+        embedding = decomp["embedding"]
+
+        # Build per-layer results with cumulative logits
+        layers = []
+        cumulative = embedding
+        for lc in decomp["layers"]:
+            cumulative += lc["attention"] + lc["mlp"]
+            layers.append(DecomposeLayerResult(
+                layer=lc["layer"],
+                attn_logit=lc["attention"],
+                mlp_logit=lc["mlp"],
+                cumulative=cumulative,
+            ))
+
         return DecomposeResult(
-            answer_token_id=data["answer_token_id"],
-            total_logit=data["total_logit"],
-            layers=[
-                DecomposeLayerResult(
-                    layer=ld["layer"],
-                    attn_logit=ld["attn_logit"],
-                    mlp_logit=ld["mlp_logit"],
-                    cumulative=ld["cumulative"],
-                )
-                for ld in data["layers"]
-            ],
-            competitors=[
-                DecomposeCompetitor(
-                    token=c["token"],
-                    total_logit=c["total_logit"],
-                    margin=c["margin"],
-                )
-                for c in data.get("competitors", [])
-            ],
-            reconstruction_error=data.get("reconstruction_error", 0.0),
+            answer_token_id=token_id,
+            total_logit=total_logit,
+            layers=layers,
+            competitors=[],
+            reconstruction_error=decomp.get("reconstruction_error", 0.0),
         )
 
     def rome_edit(
