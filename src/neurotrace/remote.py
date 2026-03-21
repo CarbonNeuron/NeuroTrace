@@ -126,6 +126,7 @@ class DecomposeLayerResult:
     attn_logit: float
     mlp_logit: float
     cumulative: float
+    cumulative_rank: int | None = None
 
 
 @dataclass
@@ -590,6 +591,7 @@ class WorkerClient:
                 attn_logit=lc["attention"],
                 mlp_logit=lc["mlp"],
                 cumulative=cumulative,
+                cumulative_rank=lc.get("cumulative_rank"),
             ))
 
         return DecomposeResult(

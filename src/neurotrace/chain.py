@@ -67,31 +67,18 @@ def run_chain_remote(
     int_cumulatives = [lc.cumulative for lc in int_result.layers]
     ans_cumulatives = [lc.cumulative for lc in ans_result.layers]
 
-    # We don't get per-layer ranks from decompose, so use forward with
-    # layer_predictions to get ranks. Fall back to logit-based estimation.
-    try:
-        fwd = client.forward(
-            prompt, raw=raw, seed=seed, top_k=10,
-            layer_predictions=True, layer_predictions_top_k=50,
-        )
-        int_ranks = []
-        ans_ranks = []
-        if fwd.layer_predictions:
-            for lp in fwd.layer_predictions:
-                int_rank = _find_rank(lp.top_tokens, intermediate)
-                ans_rank = _find_rank(lp.top_tokens, answer)
-                int_ranks.append(int_rank)
-                ans_ranks.append(ans_rank)
-        else:
-            int_ranks = [999] * num_layers
-            ans_ranks = [999] * num_layers
-    except Exception:
-        int_ranks = [999] * num_layers
-        ans_ranks = [999] * num_layers
-
-    # Pad/trim to match num_layers
-    int_ranks = _pad_to(int_ranks, num_layers, 999)
-    ans_ranks = _pad_to(ans_ranks, num_layers, 999)
+    # Use cumulative_rank from decompose response (computed from full vocab
+    # logits at each cumulative residual state). The forward endpoint's
+    # layer_predictions are delta-based, not cumulative, so ranks from those
+    # are incorrect.
+    int_ranks = [
+        lc.cumulative_rank if lc.cumulative_rank is not None else 999
+        for lc in int_result.layers
+    ]
+    ans_ranks = [
+        lc.cumulative_rank if lc.cumulative_rank is not None else 999
+        for lc in ans_result.layers
+    ]
 
     int_peak = min(int_ranks) if int_ranks else 999
     ans_peak = min(ans_ranks) if ans_ranks else 999
