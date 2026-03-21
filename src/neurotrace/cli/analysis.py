@@ -119,8 +119,8 @@ def ablate(
         raise click.UsageError("Must provide --model (local mode) or --remote.")
 
     if remote is not None:
-        from neurotrace.remote import RemoteWorker
-        worker = RemoteWorker(remote)
+        from neurotrace.remote import WorkerClient
+        worker = WorkerClient(remote)
         health = worker.health()
         model = health["model"]
         err_console.print(
@@ -363,8 +363,8 @@ def sweep(
         raise click.UsageError("Must provide --model (local mode) or --remote.")
 
     if remote is not None:
-        from neurotrace.remote import RemoteWorker
-        worker = RemoteWorker(remote)
+        from neurotrace.remote import WorkerClient
+        worker = WorkerClient(remote)
         health = worker.health()
         model = health["model"]
         err_console.print(
@@ -639,10 +639,10 @@ def _scan_remote(
     raw=True,
 ):
     """Run scan via remote GPU worker."""
-    from neurotrace.remote import RemoteWorker
+    from neurotrace.remote import WorkerClient
     from neurotrace.scan import PromptResult, ScanResult
 
-    worker = RemoteWorker(remote_url)
+    worker = WorkerClient(remote_url)
     health = worker.health()
     model_name = health["model"]
     device_name = health.get("device_name", health.get("device", "unknown"))
@@ -1418,8 +1418,8 @@ def neurons(
         raise click.UsageError("Must provide --model (local mode) or --remote.")
 
     if remote is not None:
-        from neurotrace.remote import RemoteWorker
-        worker = RemoteWorker(remote)
+        from neurotrace.remote import WorkerClient
+        worker = WorkerClient(remote)
         health = worker.health()
         model = health["model"]
         err_console.print(
@@ -2253,9 +2253,9 @@ def _finetune_remote(
     db,
 ):
     """Run LoRA fine-tuning on a remote GPU worker."""
-    from neurotrace.remote import RemoteWorker
+    from neurotrace.remote import WorkerClient
 
-    worker = RemoteWorker(remote, timeout=600.0)
+    worker = WorkerClient(remote, timeout=600.0)
     health = worker.health()
     device_name = health.get("device_name", health.get("device", "unknown"))
 
@@ -2634,9 +2634,9 @@ def _probe_universal_remote(
 
     import numpy as np
 
-    from neurotrace.remote import RemoteWorker
+    from neurotrace.remote import WorkerClient
 
-    worker = RemoteWorker(remote_url)
+    worker = WorkerClient(remote_url)
     health = worker.health()
     device_name = health.get(
         "device_name", health.get("device", "unknown"),

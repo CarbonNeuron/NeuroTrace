@@ -70,9 +70,9 @@ def bench(
             progress.update(task, description=msg)
 
         if remote is not None:
-            from neurotrace.remote import RemoteWorker
+            from neurotrace.remote import WorkerClient
 
-            worker = RemoteWorker(remote)
+            worker = WorkerClient(remote)
             health = worker.health()
             gpu_info = health.get("device_name", health.get("device", "unknown"))
             err_console.print(f"GPU: {gpu_info} via {remote}")

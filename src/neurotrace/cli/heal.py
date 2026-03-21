@@ -254,10 +254,10 @@ def _heal_remote(
         generate_heal_html,
         heal_result_to_dict,
     )
-    from neurotrace.remote import RemoteWorker
+    from neurotrace.remote import WorkerClient
     from neurotrace.repair import build_repair_result_from_remote
 
-    worker = RemoteWorker(remote_url, timeout=600.0)
+    worker = WorkerClient(remote_url, timeout=600.0)
     health = worker.health()
     model_name = health["model"]
     device_name = health.get("device_name", health.get("device", "unknown"))

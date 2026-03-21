@@ -53,8 +53,8 @@ def experiment(
         raise click.UsageError("Must provide --model (local mode) or --remote.")
 
     if remote is not None:
-        from neurotrace.remote import RemoteWorker
-        worker = RemoteWorker(remote)
+        from neurotrace.remote import WorkerClient
+        worker = WorkerClient(remote)
         health = worker.health()
         if model is None:
             model = health["model"]
@@ -578,9 +578,9 @@ def heatmap(
     if remote is not None:
         cells = _heatmap_remote(remote, prompts, seed)
         # Get model name and num_layers from worker
-        from neurotrace.remote import RemoteWorker
+        from neurotrace.remote import WorkerClient
 
-        worker = RemoteWorker(remote)
+        worker = WorkerClient(remote)
         health = worker.health()
         model_name = health["model"]
         num_layers = health["num_layers"]
@@ -709,11 +709,11 @@ def heatmap(
 
 
 def _heatmap_remote(remote_url, prompts, seed):
-    """Run heatmap via remote GPU worker with SSE streaming."""
+    """Run heatmap via remote GPU worker using v2 inference primitives."""
     from neurotrace.heatmap import HeatmapCell, check_correct
-    from neurotrace.remote import RemoteWorker
+    from neurotrace.remote import Hook, WorkerClient
 
-    worker = RemoteWorker(remote_url)
+    worker = WorkerClient(remote_url)
     health = worker.health()
     num_layers = health["num_layers"]
     device_name = health.get("device_name", health.get("device", "unknown"))
@@ -744,59 +744,62 @@ def _heatmap_remote(remote_url, prompts, seed):
             )
             progress.update(inner_task, completed=0)
 
-            baseline_token = None
-            baseline_prob = 0.0
-            baseline_correct = False
+            # Baseline: forward pass with no hooks
+            baseline = worker.forward(
+                prompt, raw=True, top_k=1, seed=seed,
+            )
+            baseline_token = (
+                baseline.top_tokens[0].token if baseline.top_tokens else ""
+            )
+            baseline_prob = (
+                baseline.top_tokens[0].prob if baseline.top_tokens else 0.0
+            )
+            baseline_correct = check_correct(baseline_token, answer)
+            progress.update(inner_task, completed=1)
 
-            for event in worker.batch_ablate_stream(
-                prompt, num_layers, seed=seed
-            ):
-                etype = event.get("type")
-                if etype == "progress":
-                    idx = event.get("index", 0)
-                    progress.update(inner_task, completed=idx)
-                elif etype == "result":
-                    idx = event.get("index", 0)
-                    token = event.get("final_token", "")
-                    prob = event.get("final_prob", 0.0)
-                    zero_layers = event.get("zero_mlp_layers", [])
+            # Ablate each MLP layer
+            for layer_idx in range(num_layers):
+                hooks = [Hook(
+                    layer=layer_idx, component="mlp", action="zero",
+                )]
+                result = worker.hooked(
+                    prompt, hooks, raw=True, top_k=1, seed=seed,
+                )
+                token = (
+                    result.top_tokens[0].token if result.top_tokens else ""
+                )
+                prob = (
+                    result.top_tokens[0].prob if result.top_tokens else 0.0
+                )
+                ablated_correct = check_correct(token, answer)
 
-                    if idx == 0:
-                        # Baseline
-                        baseline_token = token
-                        baseline_prob = prob
-                        baseline_correct = check_correct(token, answer)
-                    else:
-                        # Ablated — zero_layers has one element
-                        layer = zero_layers[0] if zero_layers else idx - 1
-                        ablated_correct = check_correct(token, answer)
+                if not baseline_correct and ablated_correct:
+                    flip_dir = "fixed"
+                elif baseline_correct and not ablated_correct:
+                    flip_dir = "broke"
+                elif token != baseline_token:
+                    flip_dir = "changed"
+                else:
+                    flip_dir = "none"
 
-                        if not baseline_correct and ablated_correct:
-                            flip_dir = "fixed"
-                        elif baseline_correct and not ablated_correct:
-                            flip_dir = "broke"
-                        elif token != baseline_token:
-                            flip_dir = "changed"
-                        else:
-                            flip_dir = "none"
-
-                        cells.append(
-                            HeatmapCell(
-                                prompt_index=prompt_idx,
-                                prompt=prompt,
-                                expected_answer=answer,
-                                layer=layer,
-                                baseline_token=baseline_token,
-                                baseline_prob=baseline_prob,
-                                baseline_correct=baseline_correct,
-                                ablated_token=token,
-                                ablated_prob=prob,
-                                ablated_correct=ablated_correct,
-                                delta_correct_prob=prob - baseline_prob,
-                                flipped=token != baseline_token,
-                                flip_direction=flip_dir,
-                            )
-                        )
+                cells.append(
+                    HeatmapCell(
+                        prompt_index=prompt_idx,
+                        prompt=prompt,
+                        expected_answer=answer,
+                        layer=layer_idx,
+                        baseline_token=baseline_token,
+                        baseline_prob=baseline_prob,
+                        baseline_correct=baseline_correct,
+                        ablated_token=token,
+                        ablated_prob=prob,
+                        ablated_correct=ablated_correct,
+                        delta_correct_prob=prob - baseline_prob,
+                        flipped=token != baseline_token,
+                        flip_direction=flip_dir,
+                    )
+                )
+                progress.update(inner_task, completed=layer_idx + 2)
 
             progress.update(outer_task, advance=1)
 
@@ -898,9 +901,9 @@ def commitment(
         results = _commitment_remote(
             remote, prompts, seed, threshold, model,
         )
-        from neurotrace.remote import RemoteWorker
+        from neurotrace.remote import WorkerClient
 
-        worker = RemoteWorker(remote)
+        worker = WorkerClient(remote)
         health = worker.health()
         model_name = health["model"]
         num_layers = health["num_layers"]
@@ -1091,9 +1094,9 @@ def _commitment_remote(remote_url, prompts, seed, threshold, model_name_hint):
 
     from neurotrace.commitment import run_commitment_remote
     from neurotrace.models import get_lm_head_and_norm, load_model
-    from neurotrace.remote import RemoteWorker
+    from neurotrace.remote import WorkerClient
 
-    worker = RemoteWorker(remote_url)
+    worker = WorkerClient(remote_url)
     health = worker.health()
     device_name = health.get("device_name", health.get("device", "unknown"))
     model_name = health["model"]
@@ -1240,9 +1243,9 @@ def contrast(
         cells, domain_deltas = _contrast_remote(
             remote, domain_prompts, layers, commitment_data, seed, model,
         )
-        from neurotrace.remote import RemoteWorker
+        from neurotrace.remote import WorkerClient
 
-        worker = RemoteWorker(remote)
+        worker = WorkerClient(remote)
         health = worker.health()
         model_name = health["model"]
     else:
@@ -1460,9 +1463,9 @@ def _contrast_remote(
 
     from neurotrace.contrast import run_contrast_remote
     from neurotrace.models import get_lm_head_and_norm, load_model
-    from neurotrace.remote import RemoteWorker
+    from neurotrace.remote import WorkerClient
 
-    worker = RemoteWorker(remote_url)
+    worker = WorkerClient(remote_url)
     health = worker.health()
     device_name = health.get("device_name", health.get("device", "unknown"))
     model_name = health["model"]
@@ -1653,9 +1656,9 @@ def attribute(
                 remote, prompts, layer, target_dir, method,
                 commitment_data, seed, model,
             )
-            from neurotrace.remote import RemoteWorker
+            from neurotrace.remote import WorkerClient
 
-            worker = RemoteWorker(remote)
+            worker = WorkerClient(remote)
             health = worker.health()
             model_name = health["model"]
         else:
@@ -1866,9 +1869,9 @@ def _attribute_remote(
         run_attribution_ablation_remote,
     )
     from neurotrace.models import get_lm_head_and_norm, load_model
-    from neurotrace.remote import RemoteWorker
+    from neurotrace.remote import WorkerClient
 
-    worker = RemoteWorker(remote_url)
+    worker = WorkerClient(remote_url)
     health = worker.health()
     device_name = health.get("device_name", health.get("device", "unknown"))
     model_name = health["model"]

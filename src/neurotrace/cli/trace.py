@@ -114,12 +114,13 @@ def trace(
         import uuid
         from datetime import datetime, timezone
 
-        from neurotrace.remote import RemoteWorker
+        from neurotrace.remote import WorkerClient
         from neurotrace.types import LayerSnapshot, TraceMetadata, TraceResult
 
-        worker = RemoteWorker(remote)
+        worker = WorkerClient(remote)
         health = worker.health()
         model_name = health["model"]
+        num_layers = health["num_layers"]
         err_console.print(
             f"GPU: {health.get('device_name', 'unknown')} via {remote}"
         )
@@ -130,31 +131,46 @@ def trace(
                 err_console.print(
                     f"Tracing prompt {i + 1}/{len(prompts)}..."
                 )
-                trace_result_data = worker.trace(p, seed=seed, raw=raw)
+                all_layers = list(range(num_layers))
+                fwd = worker.forward(
+                    p, raw=raw, top_k=5,
+                    residual_layers=all_layers, seed=seed,
+                )
 
-                # Build layer snapshots with just top-1 predictions
+                # Build layer snapshots from residuals
                 layer_snapshots = []
-                for layer_data in trace_result_data["layers"]:
-                    top_tokens = layer_data["top_tokens"]
-                    top1_id = 0  # We don't have token IDs from remote
-                    top1_prob = (
-                        top_tokens[0]["prob"] if top_tokens else 0.0
-                    )
+                for layer_idx in range(fwd.num_layers):
+                    import numpy as np
+
+                    residual = None
+                    res_norm = 0.0
+                    if fwd.residuals and layer_idx in fwd.residuals:
+                        residual = fwd.residuals[layer_idx].astype(
+                            np.float32,
+                        )
+                        res_norm = float(np.linalg.norm(residual))
+
                     snap = LayerSnapshot(
-                        layer_index=layer_data["layer"],
+                        layer_index=layer_idx,
                         residual_in=None,
-                        residual_out=None,
+                        residual_out=residual,
                         attention_weights=None,
                         attention_output=None,
                         mlp_in=None,
                         mlp_out=None,
                         ln_values=None,
                         residual_in_norm=0.0,
-                        residual_out_norm=0.0,
+                        residual_out_norm=res_norm,
                         attention_entropy=[],
                         mlp_activation_mag=0.0,
-                        top1_token=top1_id,
-                        top1_prob=top1_prob,
+                        top1_token=(
+                            fwd.top_tokens[0].token_id
+                            if fwd.top_tokens else 0
+                        ),
+                        top1_prob=(
+                            fwd.top_tokens[0].prob
+                            if fwd.top_tokens else 0.0
+                        ),
                     )
                     layer_snapshots.append(snap)
 
@@ -166,9 +182,9 @@ def trace(
                     prompt=p,
                     token_ids=[],
                     tokens=[],
-                    num_layers=trace_result_data["num_layers"],
+                    num_layers=fwd.num_layers,
                     num_heads=0,
-                    hidden_size=0,
+                    hidden_size=fwd.hidden_dim,
                     param_count=0,
                     device="remote",
                     dtype="remote",
@@ -568,9 +584,9 @@ def predict(
 
     # Load model for lm_head projection and tokenizer
     if remote is not None:
-        from neurotrace.remote import RemoteWorker
+        from neurotrace.remote import WorkerClient
 
-        worker = RemoteWorker(remote)
+        worker = WorkerClient(remote)
         health = worker.health()
         model_name = health["model"]
     else:
@@ -742,9 +758,9 @@ def decode(model, tokens, from_trace, db, remote):
         raise click.UsageError("Must provide --model (local mode) or --remote.")
 
     if remote is not None:
-        from neurotrace.remote import RemoteWorker
+        from neurotrace.remote import WorkerClient
 
-        worker = RemoteWorker(remote)
+        worker = WorkerClient(remote)
         health = worker.health()
         model = health["model"]
 
@@ -828,9 +844,9 @@ def compare(
         raise click.UsageError("Must provide --model (local mode) or --remote.")
 
     if remote is not None:
-        from neurotrace.remote import RemoteWorker
+        from neurotrace.remote import WorkerClient
 
-        worker = RemoteWorker(remote)
+        worker = WorkerClient(remote)
         health = worker.health()
         model = health["model"]
         err_console.print(

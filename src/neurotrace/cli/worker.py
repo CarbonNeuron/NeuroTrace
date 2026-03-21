@@ -14,9 +14,9 @@ def worker():
 @click.option("--remote", required=True, help="Worker URL (e.g. http://172.30.0.1:8877)")
 def version(remote: str):
     """Show GPU worker version and status."""
-    from neurotrace.remote import RemoteWorker
+    from neurotrace.remote import WorkerClient
 
-    w = RemoteWorker(remote)
+    w = WorkerClient(remote)
     info = w.worker_version()
 
     dirty = " [dirty]" if info.get("dirty") else ""
@@ -47,9 +47,9 @@ def reload(remote: str, model: str | None, dtype: str | None):
     if model is None and dtype is None:
         raise click.UsageError("Must provide --model and/or --dtype.")
 
-    from neurotrace.remote import RemoteWorker
+    from neurotrace.remote import WorkerClient
 
-    w = RemoteWorker(remote, timeout=600.0)
+    w = WorkerClient(remote, timeout=600.0)
 
     for event in w.reload_stream(model=model, dtype=dtype):
         status = event.get("status", "")
@@ -75,9 +75,9 @@ def reload(remote: str, model: str | None, dtype: str | None):
 @click.option("--remote", required=True, help="Worker URL (e.g. http://172.30.0.1:8877)")
 def update(remote: str):
     """Pull latest code and restart the GPU worker."""
-    from neurotrace.remote import RemoteWorker
+    from neurotrace.remote import WorkerClient
 
-    w = RemoteWorker(remote)
+    w = WorkerClient(remote)
 
     with err_console.status("Updating worker..."):
         for event in w.worker_update_stream():

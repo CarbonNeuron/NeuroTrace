@@ -236,10 +236,10 @@ def _discover_remote(
         ensure_discoveries_table,
         insert_discovery,
     )
-    from neurotrace.remote import RemoteWorker
+    from neurotrace.remote import WorkerClient
     from neurotrace.repair import build_repair_result_from_remote
 
-    worker = RemoteWorker(remote_url, timeout=600.0)
+    worker = WorkerClient(remote_url, timeout=600.0)
     health = worker.health()
     model_name = health["model"]
     err_console.print(f"GPU: {health.get('device_name', 'unknown')} via {remote_url}")

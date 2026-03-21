@@ -399,10 +399,10 @@ def run_bench_remote(
     from datetime import datetime, timezone
 
     from neurotrace.datasets import get_builtin_dataset
-    from neurotrace.remote import RemoteWorker
+    from neurotrace.remote import WorkerClient
     from neurotrace.repair import build_repair_result_from_remote
 
-    worker = RemoteWorker(remote_url, timeout=600.0)
+    worker = WorkerClient(remote_url, timeout=600.0)
     health = worker.health()
     model_name = health["model"]
 

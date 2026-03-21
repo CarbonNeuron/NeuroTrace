@@ -118,9 +118,9 @@ def fingerprint(
         all_fingerprints = _fingerprint_remote(
             remote, prompts, seed, dataset_name,
         )
-        from neurotrace.remote import RemoteWorker
+        from neurotrace.remote import WorkerClient
 
-        worker = RemoteWorker(remote)
+        worker = WorkerClient(remote)
         health = worker.health()
         model_name = health["model"]
     else:
@@ -271,9 +271,9 @@ def fingerprint(
 def _fingerprint_remote(remote_url, prompts, seed, dataset_name):
     """Run fingerprinting via remote GPU worker."""
     from neurotrace.fingerprint import build_fingerprint_from_remote
-    from neurotrace.remote import RemoteWorker
+    from neurotrace.remote import WorkerClient
 
-    worker = RemoteWorker(remote_url)
+    worker = WorkerClient(remote_url)
     health = worker.health()
     device_name = health.get("device_name", health.get("device", "unknown"))
     err_console.print(f"GPU: {device_name} via {remote_url}")
@@ -400,9 +400,9 @@ def repair(
     if undo:
         if remote is None:
             raise click.UsageError("--undo requires --remote.")
-        from neurotrace.remote import RemoteWorker
+        from neurotrace.remote import WorkerClient
 
-        worker = RemoteWorker(remote)
+        worker = WorkerClient(remote)
         result = worker.repair_undo()
         console.print(f"[green]Undo: {result}[/green]")
         return
@@ -411,9 +411,9 @@ def repair(
     if save_path is not None:
         if remote is None:
             raise click.UsageError("--save requires --remote.")
-        from neurotrace.remote import RemoteWorker
+        from neurotrace.remote import WorkerClient
 
-        worker = RemoteWorker(remote)
+        worker = WorkerClient(remote)
         result = worker.repair_save(save_path)
         console.print(f"[green]Saved: {result}[/green]")
         return
@@ -468,9 +468,9 @@ def repair(
             remote, prompts, competitor, target_layer, target_component,
             target_margin, verify_prompts, seed,
         )
-        from neurotrace.remote import RemoteWorker
+        from neurotrace.remote import WorkerClient
 
-        worker = RemoteWorker(remote)
+        worker = WorkerClient(remote)
         health = worker.health()
         model_name = health["model"]
     else:
@@ -762,10 +762,10 @@ def repair(
 def _repair_remote(remote_url, prompts, competitor, target_layer, target_component,
                    target_margin, verify_prompts, seed):
     """Run repair via remote GPU worker."""
-    from neurotrace.remote import RemoteWorker
+    from neurotrace.remote import WorkerClient
     from neurotrace.repair import build_repair_result_from_remote
 
-    worker = RemoteWorker(remote_url)
+    worker = WorkerClient(remote_url)
     health = worker.health()
     device_name = health.get("device_name", health.get("device", "unknown"))
 

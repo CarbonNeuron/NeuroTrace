@@ -725,9 +725,9 @@ def _attention_trace_remote(
 
     from neurotrace.attention_trace import run_attention_trace_remote
     from neurotrace.models import get_lm_head_and_norm, load_model
-    from neurotrace.remote import RemoteWorker
+    from neurotrace.remote import WorkerClient
 
-    worker = RemoteWorker(remote_url)
+    worker = WorkerClient(remote_url)
     health = worker.health()
     device_name = health.get("device_name", health.get("device", "unknown"))
     model_name = health["model"]
@@ -813,10 +813,10 @@ def _token_trace_remote(
     import numpy as np
 
     from neurotrace.models import get_lm_head_and_norm, load_model
-    from neurotrace.remote import RemoteWorker
+    from neurotrace.remote import WorkerClient
     from neurotrace.token_trace import run_token_trace_remote
 
-    worker = RemoteWorker(remote_url)
+    worker = WorkerClient(remote_url)
     health = worker.health()
     device_name = health.get("device_name", health.get("device", "unknown"))
     model_name = health["model"]
@@ -1317,10 +1317,10 @@ def _diagnose_remote(
 
     from neurotrace.attention_trace import run_attention_trace_remote
     from neurotrace.models import get_lm_head_and_norm, load_model
-    from neurotrace.remote import RemoteWorker
+    from neurotrace.remote import WorkerClient
     from neurotrace.token_trace import run_token_trace_remote
 
-    worker = RemoteWorker(remote_url)
+    worker = WorkerClient(remote_url)
     health = worker.health()
     device_name = health.get("device_name", health.get("device", "unknown"))
     model_name = health["model"]
@@ -1545,9 +1545,9 @@ def decompose(
         all_results = _decompose_remote(
             remote, prompts, competitor_list, seed, raw=raw,
         )
-        from neurotrace.remote import RemoteWorker
+        from neurotrace.remote import WorkerClient
 
-        worker = RemoteWorker(remote)
+        worker = WorkerClient(remote)
         health = worker.health()
         model_name = health["model"]
     else:
@@ -1722,9 +1722,9 @@ def decompose(
 def _decompose_remote(remote_url, prompts, competitor_list, seed, raw=True):
     """Run decompose via remote GPU worker."""
     from neurotrace.decompose import run_decompose_remote
-    from neurotrace.remote import RemoteWorker
+    from neurotrace.remote import WorkerClient
 
-    worker = RemoteWorker(remote_url)
+    worker = WorkerClient(remote_url)
     health = worker.health()
     device_name = health.get("device_name", health.get("device", "unknown"))
 

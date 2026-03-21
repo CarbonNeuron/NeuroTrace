@@ -92,7 +92,7 @@ def test_worker_version_cli():
     """Test the worker version CLI command with mocked remote."""
     runner = CliRunner()
 
-    with patch("neurotrace.remote.RemoteWorker") as mock_cls:
+    with patch("neurotrace.remote.WorkerClient") as mock_cls:
         mock_worker = mock_cls.return_value
         mock_worker.worker_version.return_value = {
             "commit": "a1b2c3d",
@@ -121,7 +121,7 @@ def test_worker_version_cli_dirty():
     """Test dirty flag display."""
     runner = CliRunner()
 
-    with patch("neurotrace.remote.RemoteWorker") as mock_cls:
+    with patch("neurotrace.remote.WorkerClient") as mock_cls:
         mock_worker = mock_cls.return_value
         mock_worker.worker_version.return_value = {
             "commit": "xyz",
@@ -150,7 +150,7 @@ def test_worker_update_cli_no_change():
     """Test update CLI when no changes detected."""
     runner = CliRunner()
 
-    with patch("neurotrace.remote.RemoteWorker") as mock_cls:
+    with patch("neurotrace.remote.WorkerClient") as mock_cls:
         mock_worker = mock_cls.return_value
         mock_worker.worker_update_stream.return_value = iter([
             {"status": "pulling", "message": "Pulling latest from origin/main..."},
@@ -168,7 +168,7 @@ def test_worker_update_cli_with_change():
     """Test update CLI when changes are pulled."""
     runner = CliRunner()
 
-    with patch("neurotrace.remote.RemoteWorker") as mock_cls:
+    with patch("neurotrace.remote.WorkerClient") as mock_cls:
         mock_worker = mock_cls.return_value
         mock_worker.worker_update_stream.return_value = iter([
             {"status": "pulling", "message": "Pulling latest from origin/main..."},
