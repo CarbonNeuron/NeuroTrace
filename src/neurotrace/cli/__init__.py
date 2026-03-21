@@ -130,3 +130,7 @@ cli.add_command(report)
 from neurotrace.cli.worker import worker  # noqa: E402
 
 cli.add_command(worker)
+
+from neurotrace.cli.heal import heal  # noqa: E402
+
+cli.add_command(heal)
