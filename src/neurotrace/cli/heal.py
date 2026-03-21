@@ -284,13 +284,14 @@ def _heal_remote(
             )
             # Whitespace-skip: if top-1 is whitespace (e.g. " "),
             # append it and re-run to get the actual answer token.
+            effective_prompt = entry["prompt"]
             if (
                 result.top_tokens
                 and result.top_tokens[0].token.strip().lstrip("\u2581\u0120") == ""
             ):
-                ws_token = result.top_tokens[0].token
+                effective_prompt = entry["prompt"] + result.top_tokens[0].token
                 result = worker.forward(
-                    entry["prompt"] + ws_token, raw=True, top_k=5,
+                    effective_prompt, raw=True, top_k=5,
                     layer_predictions=False, seed=seed,
                 )
             # Check if top-1 token matches answer
@@ -302,6 +303,20 @@ def _heal_remote(
                 final_clean == answer_clean
                 or (len(final_clean) >= 2 and answer_clean.startswith(final_clean))
             )
+            # Multi-token verification: if top-1 is a prefix of the
+            # answer but not a complete match, use generate() to check.
+            if not is_correct and final_clean and answer_clean.startswith(final_clean):
+                gen = worker.generate(
+                    effective_prompt, raw=True,
+                    max_tokens=len(entry["answer"]) + 2,
+                    temperature=0.0, seed=seed,
+                )
+                generated = "".join(
+                    t.token.replace("\u2581", "").replace("\u0120", "")
+                    for t in gen.tokens
+                ).strip().lower()
+                if generated.startswith(answer_clean) or answer_clean in generated:
+                    is_correct = True
             margin = prob if is_correct else -prob
             status = "correct" if is_correct else "wrong"
             baseline_results.append({

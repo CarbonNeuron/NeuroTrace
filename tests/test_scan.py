@@ -828,6 +828,155 @@ def test_scan_remote_whitespace_skip_single_char_answer():
     assert worker.forward.call_count == 2
 
 
+# --- Multi-token answer verification tests ---
+
+
+def test_is_answer_prefix():
+    """_is_answer_prefix detects partial but not complete matches."""
+    from neurotrace.cli.analysis import _is_answer_prefix
+
+    assert _is_answer_prefix("7", "79")
+    assert _is_answer_prefix(" 7", "79")
+    assert _is_answer_prefix("\u25817", "79")
+    assert _is_answer_prefix("10", "100")
+    assert _is_answer_prefix("-2", "-273")
+    assert not _is_answer_prefix("79", "79")     # complete match, not prefix
+    assert not _is_answer_prefix(" B", "B")       # complete match
+    assert not _is_answer_prefix("", "79")        # empty
+    assert not _is_answer_prefix(" Paris", "79")  # not a prefix
+
+
+def test_verify_via_generate():
+    """_verify_via_generate concatenates generated tokens and checks match."""
+    from unittest.mock import MagicMock
+
+    from neurotrace.cli.analysis import _verify_via_generate
+    from neurotrace.remote import GenerateResult, TokenPrediction
+
+    worker = MagicMock()
+    worker.generate.return_value = GenerateResult(
+        text="79",
+        tokens=[
+            TokenPrediction(token="7", token_id=55, logit=4.0, prob=0.9),
+            TokenPrediction(token="9", token_id=57, logit=3.5, prob=0.8),
+        ],
+        num_tokens=2,
+    )
+
+    is_match, prob = _verify_via_generate(
+        worker, "The atomic number of gold is ", "79", 0.9,
+    )
+    assert is_match
+    assert prob == pytest.approx(0.9)
+
+
+def test_verify_via_generate_no_match():
+    """_verify_via_generate returns False when generated text doesn't match."""
+    from unittest.mock import MagicMock
+
+    from neurotrace.cli.analysis import _verify_via_generate
+    from neurotrace.remote import GenerateResult, TokenPrediction
+
+    worker = MagicMock()
+    worker.generate.return_value = GenerateResult(
+        text="78",
+        tokens=[
+            TokenPrediction(token="7", token_id=55, logit=4.0, prob=0.9),
+            TokenPrediction(token="8", token_id=56, logit=3.5, prob=0.8),
+        ],
+        num_tokens=2,
+    )
+
+    is_match, prob = _verify_via_generate(
+        worker, "prompt", "79", 0.9,
+    )
+    assert not is_match
+
+
+def test_scan_remote_multitoken_generate_verify():
+    """When top-1 is a prefix of the answer, generate() should verify."""
+    from unittest.mock import MagicMock, patch
+
+    from neurotrace.remote import (
+        ForwardResult,
+        GenerateResult,
+        LayerPrediction,
+        TokenPrediction,
+    )
+
+    worker = MagicMock()
+    worker.health.return_value = {"model": "test-model", "device": "cpu"}
+
+    # First forward: whitespace top-1
+    ws_result = ForwardResult(
+        top_tokens=[
+            TokenPrediction(token=" ", token_id=220, logit=6.0, prob=0.96),
+        ],
+        residuals=None,
+        num_layers=2,
+        vocab_size=100,
+        hidden_dim=64,
+        layer_predictions=[
+            LayerPrediction(layer=0, top_tokens=[
+                TokenPrediction(token=" The", token_id=10, logit=1.0, prob=0.1),
+            ]),
+            LayerPrediction(layer=1, top_tokens=[
+                TokenPrediction(token=" ", token_id=220, logit=6.0, prob=0.96),
+            ]),
+        ],
+    )
+
+    # Second forward (after whitespace skip): top-1 is "7" (prefix of "79")
+    prefix_result = ForwardResult(
+        top_tokens=[
+            TokenPrediction(token="7", token_id=55, logit=5.0, prob=0.85),
+            TokenPrediction(token="8", token_id=56, logit=2.0, prob=0.05),
+        ],
+        residuals=None,
+        num_layers=2,
+        vocab_size=100,
+        hidden_dim=64,
+        layer_predictions=[
+            LayerPrediction(layer=0, top_tokens=[
+                TokenPrediction(token=" The", token_id=10, logit=1.0, prob=0.1),
+            ]),
+            LayerPrediction(layer=1, top_tokens=[
+                TokenPrediction(token="7", token_id=55, logit=5.0, prob=0.85),
+            ]),
+        ],
+    )
+
+    worker.forward.side_effect = [ws_result, prefix_result]
+
+    # generate() returns "79" — the full answer
+    worker.generate.return_value = GenerateResult(
+        text="79",
+        tokens=[
+            TokenPrediction(token="7", token_id=55, logit=5.0, prob=0.85),
+            TokenPrediction(token="9", token_id=57, logit=4.5, prob=0.80),
+        ],
+        num_tokens=2,
+    )
+
+    dataset = [{"prompt": "The atomic number of gold is", "answer": "79"}]
+    with patch("neurotrace.remote.WorkerClient", return_value=worker):
+        from neurotrace.cli.analysis import _scan_remote
+
+        result = _scan_remote(
+            "http://fake:8877", dataset, "test", 42,
+            0.5, 0.3, False, False, False, False, None,
+        )
+
+    pr = result.prompt_results[0]
+    # Should have called forward twice (original + whitespace-skip)
+    # and generate once (multi-token verify)
+    assert worker.forward.call_count == 2
+    assert worker.generate.call_count == 1
+    # Should be marked correct via generate verification
+    assert pr.final_rank == 1
+    assert pr.final_prob == pytest.approx(0.85)
+
+
 # --- CLI tests ---
 
 

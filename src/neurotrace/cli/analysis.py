@@ -665,6 +665,39 @@ def _token_matches_answer(token_text: str, answer: str) -> bool:
     return answer_clean.startswith(clean)
 
 
+def _is_answer_prefix(token_text: str, answer: str) -> bool:
+    """Check if token is a prefix of the answer but NOT a complete match.
+
+    Used to detect multi-token answers (e.g. "7" is a prefix of "79")
+    that need generate() to verify the full sequence.
+    """
+    clean = _clean_token(token_text)
+    answer_clean = answer.strip().lower()
+    if not clean or clean == answer_clean:
+        return False
+    return answer_clean.startswith(clean)
+
+
+def _verify_via_generate(worker, prompt, answer, first_prob, *, raw=True, seed=42):
+    """Use generate() to verify a multi-token answer.
+
+    Returns (is_match, prob) where prob is the first meaningful token's
+    probability.
+    """
+    gen = worker.generate(
+        prompt, raw=raw, max_tokens=len(answer) + 2,
+        temperature=0.0, seed=seed,
+    )
+    # Concatenate generated tokens, stripping BPE markers
+    generated = "".join(
+        t.token.replace("\u2581", "").replace("\u0120", "")
+        for t in gen.tokens
+    ).strip().lower()
+    answer_clean = answer.strip().lower()
+    is_match = generated.startswith(answer_clean) or answer_clean in generated
+    return is_match, first_prob
+
+
 def _scan_remote(
     remote_url, dataset, dataset_name, seed,
     sabotage_threshold, final_threshold,
@@ -709,13 +742,14 @@ def _scan_remote(
             # append it to the prompt and re-run to get the actual
             # answer token.  This handles numeric/single-char answers
             # where the model produces a leading space first.
+            effective_prompt = entry["prompt"]
             if (
                 result.top_tokens
                 and _is_whitespace_token(result.top_tokens[0].token)
             ):
-                ws_token = result.top_tokens[0].token
+                effective_prompt = entry["prompt"] + result.top_tokens[0].token
                 result = worker.forward(
-                    entry["prompt"] + ws_token,
+                    effective_prompt,
                     raw=raw,
                     top_k=10,
                     layer_predictions=True,
@@ -724,6 +758,22 @@ def _scan_remote(
                 )
 
             answer = entry["answer"]
+
+            # Multi-token answer verification: if top-1 is a prefix of
+            # the answer but not a complete match (e.g. "7" for "79"),
+            # use generate() to check the full sequence.
+            gen_verified = False
+            gen_prob = 0.0
+            if result.top_tokens and _is_answer_prefix(
+                result.top_tokens[0].token, answer,
+            ):
+                gen_match, gen_prob = _verify_via_generate(
+                    worker, effective_prompt,
+                    answer, result.top_tokens[0].prob,
+                    raw=raw, seed=seed,
+                )
+                gen_verified = gen_match
+
             ranks = []
             probs_list = []
 
@@ -751,6 +801,11 @@ def _scan_remote(
                     final_rank = rank_idx + 1
                     final_prob = tt.prob
                     break
+
+            # If generate() verified the multi-token answer, override
+            if gen_verified and final_rank != 1:
+                final_rank = 1
+                final_prob = gen_prob
 
             # Use shared detect_sabotage for consistent classification
             sab = detect_sabotage(
